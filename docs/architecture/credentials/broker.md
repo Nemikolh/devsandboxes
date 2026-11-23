@@ -507,14 +507,18 @@ Format reference: [credentials CLI](../../reference/credentials-cli.md#accesslog
 runs the whole path with a real `sentry` (a pinned release in the test
 image): the sentry fixture's claim (`tests/fixtures/features/sentry/`,
 the claim `features/sentry` ships), `sentry-work` logged in through
-`commands::login::login_at`, `run` wiring the instance, and a `Service`
+`commands::login::login_at` with `--org o` (checked against the mock),
+`run` wiring the instance, and a `Service`
 with the test CA's roots behind the instance's bridge
 (`devsbd::bridge::spawn_brokered`) calling two mocks over TLS:
 `sentry.io` (the claim's one private upstream, `Service::with_authority`)
 and `us.sentry.io` (`Service::with_private_host`). `sentry issue list`
 resolves the org on sentry.io and lists its issues on the region host the
 org names; `sentry project delete` is refused at its `never` DELETE,
-which reaches neither mock. The mocks see only the real token, as
+which reaches neither mock. The org fence: `o` named by its id passes
+(the home learning the id from the mock), the account's other org is
+refused before either mock sees it, and `sentry org list` shows only `o`
+of the two the mock lists. The mocks see only the real token, as
 `Bearer`, and `access.log` neither token nor phantom.
 `commands::run::tests::gh_through_the_broker_end_to_end_with_docker` does
 the same for gh and its repo fence; base-URL mode's listeners, env and

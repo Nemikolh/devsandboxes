@@ -345,12 +345,13 @@ is frozen: no new work on it.
   sentry claim takes any token prefix (its device-flow tokens have none),
   so an org token is stored unchecked.
   → [broker](architecture/credentials/broker.md)
-- The sentry claim has no org fence: its `{org}` routes take any org, and
-  both its logins (a pasted user auth token, `sntryu_…`, or the device
-  flow) span every org the account is in, so a sandbox granted a scope
-  holds it in each of them; the org-less routes (`GET /api/0/projects/`,
-  `/api/0/organizations/`) list them all.
-  → [plan](plans/active/github-and-sentry-access.md#sentry)
+- The org fence's ids are learned per call and cached in the daemon's
+  memory, never pinned: an org renamed upstream stops matching until its
+  new slug is edited into `credentials.toml` by hand.
+  → [broker](architecture/credentials/broker.md#the-org-fence); `broker::orgs::Cache`
+- `login --org` names the orgs of a new credential only: an existing
+  one's `orgs` is edited by hand in `credentials.toml`.
+  → [credentials CLI](reference/credentials-cli.md#credentialstoml); `commands::login::login_at`
 - The broker speaks HTTP/1.1 only: intercept mode's ALPN offers only
   `http/1.1` (a client offering only `h2`, as gRPC does, fails the
   handshake), an `Upgrade` (WebSockets, `h2c`) is refused, and upstreams

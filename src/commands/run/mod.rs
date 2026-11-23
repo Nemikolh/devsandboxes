@@ -2366,32 +2366,39 @@ mod tests {
     /// release in a debian image, the sentry fixture's claim with
     /// `sentry.io` private and `us.sentry.io` let through by the test
     /// service, each dialed at a loopback mock of its own; `sentry-work`
-    /// logged in by the `login` code path. `sentry issue list` resolves the
+    /// logged in by the `login` code path with `--org o`, checked against
+    /// the mock. `sentry issue list` resolves the
     /// org on sentry.io, then lists its issues on the region host the org
     /// names (us.sentry.io); `sentry project delete` is refused at its
-    /// `never` DELETE, which reaches neither mock. The mocks see only the
-    /// real token as `Bearer`.
+    /// `never` DELETE, which reaches neither mock. The org fence: `o` named
+    /// by its id passes, `beta-corp` (the account's other org) is refused
+    /// before either mock, and `sentry org list` shows only `o`. The mocks
+    /// see only the real token as `Bearer`.
     #[cfg(unix)]
     #[test_utils::docker_test(helper)]
     fn sentry_through_the_broker_end_to_end_with_docker() -> Result<(), String> {
         isolated("sentry_e2e_child")
     }
 
-    /// The fake Sentry: org `o` in region us.sentry.io, its project `p`
-    /// without issues.
+    /// The fake Sentry: orgs `o` (id 1) and `beta-corp` (id 9) in region
+    /// us.sentry.io, `o`'s project `p` without issues.
     #[cfg(unix)]
     fn fake_sentry_api(head: &str, _body: &[u8]) -> Vec<u8> {
         let line = head.lines().next().unwrap_or_default();
         let mut parts = line.split(' ');
         let (method, target) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
         let path = target.split('?').next().unwrap_or_default();
+        let with_links = |id: &str, slug: &str| {
+            serde_json::json!({
+                "id": id, "slug": slug, "name": slug.to_uppercase(),
+                "links": { "organizationUrl": format!("https://{slug}.sentry.io"), "regionUrl": "https://us.sentry.io" },
+            })
+        };
         let org = serde_json::json!({ "id": "1", "slug": "o", "name": "O" });
         let (status, json) = match (method, path) {
-            ("GET", "/api/0/organizations/o/") => {
-                let mut org = org;
-                org["links"] = serde_json::json!({ "organizationUrl": "https://o.sentry.io", "regionUrl": "https://us.sentry.io" });
-                (200, org)
-            }
+            ("GET", "/api/0/organizations/o/" | "/api/0/organizations/1/") => (200, with_links("1", "o")),
+            ("GET", "/api/0/organizations/beta-corp/" | "/api/0/organizations/9/") => (200, with_links("9", "beta-corp")),
+            ("GET", "/api/0/organizations/") => (200, serde_json::json!([with_links("1", "o"), with_links("9", "beta-corp")])),
             ("GET", "/api/0/projects/o/p/") => {
                 (200, serde_json::json!({ "id": "2", "slug": "p", "name": "P", "platform": "node", "organization": org }))
             }
@@ -2463,14 +2470,20 @@ mod tests {
             client_id: None,
             owner: None,
             broad: false,
-            orgs: Vec::new(),
+            orgs: vec!["o".into()],
         };
-        let mut term = crate::commands::login::tests::Script::new(false, &[], Some(TOKEN));
-        let mut flows = crate::commands::login::tests::offline();
-        crate::commands::login::login_at(&data, &args, Some(claims), &mut term, &mut flows).unwrap();
-
         let (main_port, main_seen) = crate::broker::serve::tests::upstream_server(fake_sentry_api);
         let (region_port, region_seen) = crate::broker::serve::tests::upstream_server(fake_sentry_api);
+        let mut term = crate::commands::login::tests::Script::new(false, &[], Some(TOKEN));
+        let mut flows = crate::commands::login::tests::offline();
+        flows.http = Box::new(|| Ok(crate::credentials::oauth::tests::http()));
+        flows.authority = Box::new(move |_| format!("127.0.0.1:{main_port}"));
+        crate::commands::login::login_at(&data, &args, Some(claims), &mut term, &mut flows).unwrap();
+        assert!(!term.shown.contains("cannot check org"), "{}", term.shown);
+        let home = crate::credentials::home::load(&crate::credentials::home::path(&data)).unwrap();
+        assert_eq!(home["sentry-work"].orgs, ["o"]);
+        // The mocks' log starts with the sandbox's calls.
+        main_seen.lock().unwrap().clear();
 
         let project = services::project_id(&cfg).unwrap();
         let container = format!("{NAME_PREFIX}{name}");
@@ -2503,7 +2516,11 @@ mod tests {
             // The helper answers 503 itself until it has seen the bridge's caps.
             let script = "cd /tmp; for i in $(seq 50); do sentry api organizations/o/ >/dev/null 2>&1 && break; sleep 0.2; done; \
                  sentry issue list o/p 2>&1; echo issues=$?; \
-                 sentry project delete o/p --yes 2>&1; echo delete=$?";
+                 sentry project delete o/p --yes 2>&1; echo delete=$?; \
+                 sentry api organizations/1/ >/dev/null 2>&1; echo by-id=$?; \
+                 sentry api organizations/beta-corp/ 2>&1; echo other-api=$?; \
+                 sentry issue list beta-corp/p 2>&1; echo other-issues=$?; \
+                 echo '<orgs>'; sentry org list --json 2>/dev/null; echo '</orgs>'";
             let argv =
                 crate::commands::exec::exec_argv_with(info, false, false, &["sh".into(), "-c".into(), script.into()], false);
             let out = backend().output_quiet(&argv.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
@@ -2511,12 +2528,24 @@ mod tests {
             assert!(lines.contains(&"issues=0"), "{out}");
             // sentry words a 403 its own way; the access log has the broker's reason.
             assert!(!lines.contains(&"delete=0"), "{out}");
+            assert!(lines.contains(&"by-id=0"), "{out}");
+            assert!(!lines.contains(&"other-api=0") && !lines.contains(&"other-issues=0"), "{out}");
+            let orgs = out.split_once("<orgs>").and_then(|(_, rest)| rest.split_once("</orgs>")).expect("org list").0;
+            let orgs: String = orgs.split_whitespace().collect();
+            assert!(orgs.contains(r#""slug":"o""#) && !orgs.contains("beta-corp"), "{out}");
 
             let (main, region) = (main_seen.lock().unwrap().clone(), region_seen.lock().unwrap().clone());
             let asked = |seen: &[(String, Vec<u8>)], want: &str| seen.iter().any(|(head, _)| head.starts_with(want));
             assert!(asked(&main, "GET /api/0/organizations/o/ "), "{main:#?}");
             assert!(asked(&region, "GET /api/0/organizations/o/issues/"), "{region:#?}");
             assert!(!asked(&main, "DELETE ") && !asked(&region, "DELETE "), "the refused DELETE reached Sentry");
+            assert!(asked(&main, "GET /api/0/organizations/?"), "{main:#?}");
+            let by_id = |seen: &[(String, Vec<u8>)]| asked(seen, "GET /api/0/organizations/1/ ");
+            assert!(by_id(&main) || by_id(&region), "{main:#?}\n{region:#?}");
+            let other = |seen: &[(String, Vec<u8>)]| {
+                seen.iter().any(|(head, _)| head.lines().next().is_some_and(|l| l.contains("beta-corp") || l.contains("/9/")))
+            };
+            assert!(!other(&main) && !other(&region), "the other org reached Sentry: {main:#?}\n{region:#?}");
             let seen: Vec<_> = main.into_iter().chain(region).collect();
             let contains = |hay: &[u8], needle: &str| hay.windows(needle.len()).any(|w| w == needle.as_bytes());
             for (head, body) in &seen {

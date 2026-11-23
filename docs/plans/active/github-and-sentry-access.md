@@ -372,11 +372,10 @@ only a note when the repo is public (a reference clone in `folders`).
   feature updates gh (a read-only `sentry-bin` dir).
 - **Scopes**: routes under `/api/0/organizations/{org}/…` and
   `/api/0/projects/{org}/{project}/…`, plus a few with no org in the
-  path: `GET /api/0/`, `/auth/`, `/users/me/`, `/users/me/regions/`,
-  `/organizations/`, `/projects/` (`org.read`) and the
-  `sentry-app-installations/{uuid}/…` routes (`issues.read`,
-  `issues.write`). The claim names no `fence`, so an `{org}` route takes
-  any org.
+  path, none holding an org's data: `GET /api/0/`, `/auth/`,
+  `/users/me/`, `/users/me/regions/` and `/organizations/` (`org.read`).
+  The claim names no repo `fence`; its `orgs` fences `{org}` to the
+  credential's orgs (*Sentry's org fence*).
 - **Credential**: a user auth token (`sntryu_…`, pasted) or the CLI's
   OAuth device flow (its public client id); `check` is `GET
   /api/0/users/me/`, showing the account's email. Either spans every org
@@ -555,6 +554,14 @@ organization, as data any tool's claim can use:
    list filter; `login --org` and `access ls`; `features/sentry` 1.3.0
    with the field, its org-less cross-org routes dropped, checked end to
    end.
+   Built: all of it; `features/sentry` 1.3.0 is in the features repo,
+   its claim mirrored by the sentry test fixture, and `sentry` 0.50.0
+   run end to end against the mocks with `login --org`: the org by id
+   passes, another org is refused before Sentry, `sentry org list` shows
+   only the fence
+   ([broker](../../architecture/credentials/broker.md#end-to-end)).
+   Deferred, each a [status](../../status.md#credentials) limitation:
+   pinning org ids, `login --org` on an existing credential.
 3. Parked: most users work in orgs where they can't install an app
    ([status](../../status.md#parked)). `devsandbox login github --app`
    (manifest and install), installation tokens per instance and

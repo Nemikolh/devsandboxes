@@ -873,7 +873,7 @@ mod tests {
              sentry-oss: sentry, source file\n  token     none stored: `devsandbox login sentry-oss`\n  \
              profiles  oss\n  max       every scope\n  approved  none\n  instances\n    named  {}  not approved\n\n\
              sentry-work: sentry, source file\n  token     static\n  profiles  work\n  max       every scope\n  \
-             approved  {} (unused), {} (latest)\n  pending   {} (unused)\n  instances none here\n",
+             orgs      none (org routes refused)\n  approved  {} (unused), {} (latest)\n  pending   {} (unused)\n  instances none here\n",
             &v1[..12],
             &v0[..12],
             &v1[..12],
@@ -958,7 +958,7 @@ mod tests {
         assert_eq!(json["approved"][1], serde_json::json!({"version": trimmed(1).version(), "latest": true, "unused": false}));
         assert_eq!(json["instances"][1], serde_json::json!({"instance": "w0", "version": trimmed(0).version(), "approved": true}));
         assert!(json["instances"][0]["unknown"].as_str().unwrap().contains("cannot read its config"));
-        assert!(!text.contains("orgs"), "no org fence: {text}");
+        assert!(text.contains("\n  orgs      none (org routes refused)\n"), "{text}");
         let _ = std::fs::remove_dir_all(&data);
     }
 

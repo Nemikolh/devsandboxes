@@ -897,7 +897,7 @@ pub(crate) mod tests {
         let mut term = Script::new(false, &[], Some("tok-2"));
         let done = login_at(&data, &args("sentry-work"), Some(vec![sentry()]), &mut term).unwrap();
         assert!(done.ends_with("secret replaced"), "{done}");
-        assert_eq!(term.shown, "warning: cannot check the token, stored unchecked: no network in this test\n");
+        assert!(term.shown.starts_with("warning: cannot check the token, stored unchecked: no network in this test\nnote: `sentry-work` names no orgs"), "{}", term.shown);
         // And without one, which clears a broken mark.
         let at = home::Broken { at: "2026-11-21T10:00:00Z".into(), reason: "refused".into() };
         home::mark_broken(&home::path(&data), "sentry-work", at).unwrap();
@@ -1438,6 +1438,13 @@ pub(crate) mod tests {
         (f, seen)
     }
 
+    /// [`sentry`] without its org fence.
+    fn unfenced() -> Claim {
+        let mut c = sentry();
+        c.pinned.orgs = None;
+        c
+    }
+
     fn with_orgs(name: &str, orgs: &[&str]) -> Args {
         Args { yes: true, orgs: orgs.iter().map(|s| s.to_string()).collect(), ..args(name) }
     }
@@ -1520,7 +1527,7 @@ pub(crate) mod tests {
     fn org_refusals_change_nothing() {
         use crate::broker::policy::tests::org_fenced;
         let data = temp("orgs-refuse");
-        let err = login_at(&data, &with_orgs("s", &["acme"]), Some(vec![sentry()]), &mut Script::new(false, &[], Some("t"))).unwrap_err();
+        let err = login_at(&data, &with_orgs("s", &["acme"]), Some(vec![unfenced()]), &mut Script::new(false, &[], Some("t"))).unwrap_err();
         assert_eq!(err.to_string(), "the `sentry` claim has no org fence: --org changes nothing");
         let err = login_at(&data, &with_orgs("s", &["a/b"]), Some(vec![org_fenced()]), &mut Script::new(false, &[], Some("t"))).unwrap_err();
         assert!(err.to_string().starts_with("--org `a/b`"), "{err}");
@@ -1561,7 +1568,7 @@ pub(crate) mod tests {
         login_at(&data, &args("s"), None, &mut term).unwrap();
         assert!(!term.shown.contains("note"), "orgs set by hand: {}", term.shown);
         let mut term = Script::new(false, &[], Some("t"));
-        login_at(&data, &Args { yes: true, ..args("plain") }, Some(vec![sentry()]), &mut term).unwrap();
+        login_at(&data, &Args { yes: true, ..args("plain") }, Some(vec![unfenced()]), &mut term).unwrap();
         assert!(!term.shown.contains("note"), "no org fence: {}", term.shown);
         let _ = std::fs::remove_dir_all(&data);
     }

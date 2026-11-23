@@ -263,7 +263,7 @@ mod tests {
         assert_eq!(v.kind, "sentry");
         let s = v.summary();
         assert!(s.starts_with("claim `sentry` (intercept)\n  upstreams: de.sentry.io, sentry.io, us.sentry.io\n"), "{s}");
-        assert!(s.contains("    issues.read (14 routes)\n    issues.write (6 routes)\n"), "{s}");
+        assert!(s.contains("    issues.read (13 routes)\n    issues.write (5 routes)\n"), "{s}");
         assert!(s.contains("    seer (1 route)\n"), "{s}");
         assert!(s.contains("  never (no ask or rule opens them):\n    DELETE /api/0/organizations/{org}/\n"), "{s}");
     }
@@ -355,7 +355,8 @@ mod tests {
 
     #[test]
     fn the_org_fence_is_a_change() {
-        let old_json = sentry_json();
+        let mut old_json = sentry_json();
+        old_json.as_object_mut().unwrap().remove("orgs");
         let mut c = old_json.clone();
         c["orgs"] = json!({
             "var": "{org}",

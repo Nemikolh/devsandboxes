@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Changed
+
+- **Sentry credentials reach only the orgs they name.** A Sentry token spans every org its account is in; now a `sentry` credential names the orgs sandboxes may use, with `devsandbox login --org <slug>` (repeatable, each checked with the token), and the broker refuses calls naming any other org, by slug or id. The org list sentry gets shows only those orgs, and `access.sentry.orgs` in a sandbox's config narrows it further. A credential naming none has every org call refused, so an existing `sentry` credential needs its orgs: log in a new one under a new name (`devsandbox login sentry-my-org --feature ghcr.io/devsandboxes/features/sentry:1 --org my-org`) or add `orgs = ["my-org"]` to its entry in `credentials.toml`. Needs the sentry feature 1.3.0, which also drops the routes that listed other orgs' projects and app installations.
+
+  ```toml
+  [sandbox.web.access.sentry]
+  orgs = ["my-org"]
+  ```
+
 ### Fixed
 
 - **A misspelled top-level table is an error**: `[sandboxx.web]` used to load

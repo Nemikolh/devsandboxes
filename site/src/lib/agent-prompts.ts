@@ -72,7 +72,7 @@ export const AGENT_PROMPTS = {
     goal: 'Give the devsandbox sandbox of the repo you are in gh, git push and sentry, with the tokens kept on my host.',
     steps: [
       'Add the features `ghcr.io/devsandboxes/features/gh:1` and `ghcr.io/devsandboxes/features/sentry:1` to that sandbox. Add no token, env var or mount for them.',
-      'Do not run `devsandbox login` yourself: ask me to run `devsandbox login github --feature ghcr.io/devsandboxes/features/gh:1` and `devsandbox login sentry --feature ghcr.io/devsandboxes/features/sentry:1` on the host, adding `--profile` with the sandbox\'s profile if it has `profiles`, and wait until I have.',
+      'Do not run `devsandbox login` yourself: ask me to run `devsandbox login github --feature ghcr.io/devsandboxes/features/gh:1` and `devsandbox login sentry --feature ghcr.io/devsandboxes/features/sentry:1 --org <slug>` on the host (with the Sentry org slug the repo uses, else ask me for it), adding `--profile` with the sandbox\'s profile if it has `profiles`, and wait until I have.',
     ],
     verify: [
       'Start an instance with `devsandbox run`; if it asks to approve a claim, let me answer. Check `gh pr list` and `sentry issue list` work in it through `devsandbox exec`. Push only when I ask.',

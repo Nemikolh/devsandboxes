@@ -1,6 +1,6 @@
 {
   "id": "sentry",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "name": "sentry, brokered (test fixture)",
   "description": "Test fixture mirroring github.com/devsandboxes/features' src/sentry: the same metadata and claim, keep them in step. Its install.sh installs nothing.",
   "options": {
@@ -77,6 +77,17 @@
             "shape": "json",
             "field": "detail"
           },
+          "orgs": {
+            "var": "{org}",
+            "resolve": "GET /api/0/organizations/{org}/",
+            "id": "id",
+            "lists": {
+              "GET /api/0/organizations/": [
+                "slug",
+                "id"
+              ]
+            }
+          },
           "scopes": {
             "org.read": {
               "routes": [
@@ -94,7 +105,6 @@
                 "GET /api/0/organizations/{org}/sentry-app-components/",
                 "GET /api/0/organizations/{org}/sentry-app-installations/",
                 "GET /api/0/organizations/{org}/dsn-lookup/",
-                "GET /api/0/projects/",
                 "GET /api/0/projects/{org}/{project}/",
                 "GET /api/0/projects/{org}/{project}/environments/",
                 "GET /api/0/projects/{org}/{project}/teams/",
@@ -130,8 +140,7 @@
                 "GET /api/0/organizations/{org}/eventids/{event_id}/",
                 "GET /api/0/organizations/{org}/shared/issues/{share_id}/",
                 "GET /api/0/projects/{org}/{project}/events/{event_id}/",
-                "GET /api/0/projects/{org}/{project}/events/{event_id}/attachments/",
-                "GET /api/0/sentry-app-installations/{uuid}/external-requests/"
+                "GET /api/0/projects/{org}/{project}/events/{event_id}/attachments/"
               ],
               "permissions": {
                 "event": "read"
@@ -164,8 +173,7 @@
                 "PUT /api/0/organizations/{org}/issues/{issue_id}/",
                 "PUT /api/0/organizations/{org}/issues/{issue_id}/integrations/{integration_id}/",
                 "DELETE /api/0/organizations/{org}/issues/{issue_id}/integrations/{integration_id}/",
-                "DELETE /api/0/organizations/{org}/issues/{issue_id}/external-issues/{external_issue_id}/",
-                "POST /api/0/sentry-app-installations/{uuid}/external-issue-actions/"
+                "DELETE /api/0/organizations/{org}/issues/{issue_id}/external-issues/{external_issue_id}/"
               ],
               "permissions": {
                 "event": "write"
