@@ -12,7 +12,6 @@ export const EXAMPLE_ICONS = [
   'hard-drive',
   'key-round',
   'plug',
-  'git-pull-request',
   'file-code',
   'globe-lock',
 ] as const;

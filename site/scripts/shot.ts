@@ -4,7 +4,7 @@
 // runs), or uses `--base`; then writes one PNG per matching element per
 // width (`--full`: the whole page instead) and prints the paths.
 //
-//   pnpm build && pnpm shot /architecture/bridge /examples/babysit-pr --width 1440,420
+//   pnpm build && pnpm shot /architecture/bridge /examples/credentials --width 1440,420
 //
 // Options: `--width 1440,1024,420` (default 1440,420), `--selector figure`
 // (default; no match falls back to the full page), `--full`, `--out <dir>`

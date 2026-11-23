@@ -1,6 +1,6 @@
 /*
  * `StacksDiagram.astro`. Same colours as the landing diagram
- * (`how-it-works.css`) and the babysit one: cyan containers, green worktrees,
+ * (`how-it-works.css`): cyan containers, green worktrees,
  * lime you and your agent, purple devsandbox's own requests; yellow is
  * notify, dashed means planned. Desktop is a 4-column grid inside the host
  * box: links are CSS arrows in their own cells, so they always meet the

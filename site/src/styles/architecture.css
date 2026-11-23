@@ -1,6 +1,5 @@
 /*
- * `components/architecture/*`. The landing diagrams' palette
- * (`babysit-diagram.css`): purple the host daemon, cyan the container side,
+ * `components/architecture/*`. The landing diagrams' palette: purple the host daemon, cyan the container side,
  * lime you and the CLI, green the ssh-agent, yellow notify. Each tone sets
  * `--c` (lines) and `--label` (text) so one rule per tone covers lanes,
  * arrows and chips.

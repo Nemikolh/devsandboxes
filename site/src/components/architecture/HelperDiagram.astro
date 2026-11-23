@@ -3,8 +3,8 @@
  * Host ↔ helper overview: the host daemon reaches every running instance
  * through one `exec -i … devsbd bridge` pipe, the bridge attaches to the
  * in-container `devsbd daemon` over `devsbd.ctl`, and the daemon owns the
- * sockets in-container tools use and answers the host's RPC calls. In the landing diagrams' language
- * (`BabysitDiagram.astro`): purple the host daemon, cyan the container side,
+ * sockets in-container tools use and answers the host's RPC calls. In the landing diagrams' language:
+ * purple the host daemon, cyan the container side,
  * lime you, green the ssh-agent, yellow notify. Desktop is one grid with
  * fixed rows (`--row`) so the arrows meet the cards; narrow screens stack it
  * and turn the arrows vertical.
