@@ -1023,8 +1023,6 @@ is frozen: no new work on it.
 - A thread action waiting on a detached start (`after_start`) never fires
   if the start fails after it was registered.
   → [inbox tab](architecture/dashboard/inbox-tab.md); `start_answered`
-- `d` on an instance ignores modifiers: ctrl-d removes it without a prompt.
-  → [tabs](architecture/dashboard/tabs-and-actions.md); `dispatch_key`
 - Service terminal tabs run `<runtime> exec -i -t` directly, not
   `devsandbox exec` (two terminal paths). `TERM=xterm-256color` reaches
   only the host-side child. → [terminal](architecture/dashboard/terminal.md); `term_argv`

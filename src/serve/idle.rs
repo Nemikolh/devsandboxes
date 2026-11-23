@@ -17,7 +17,8 @@ pub struct Holders {
     pub clients: usize,
     /// Live port forwards, ad-hoc and configured (`forwards::Registry`).
     pub forwards: usize,
-    /// Running instances declaring `dispatcher` or `inbox = true`, as of the
+    /// Running instances with a credential claim (the broker serves their
+    /// calls) or declaring `dispatcher` or `inbox = true`, as of the
     /// daemon's last container poll.
     pub live_instances: usize,
     /// In-flight control requests.

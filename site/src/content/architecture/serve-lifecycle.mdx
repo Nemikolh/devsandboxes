@@ -38,7 +38,7 @@ export const states = [
     notes: [
       'On each container event (`docker events`), else a timer (2 s while a root is watched, 60 s while events flow and bridges are settled, 5 s otherwise): list the containers, reconcile one bridge per running instance and the configured `forwardPorts`.',
       'Once at start: the autostart pass for every config root in `state.toml`. At start and then hourly: the feature updates that are due.',
-      'Each tick counts holders: connections (not attach-only ones), running `dispatcher` / `inbox = true` instances, in-flight control requests, verbs, live forwards, the links to registered machines, the autostart pass, an update pass.',
+      'Each tick counts holders: connections (not attach-only ones), running instances with a credential claim or declaring `dispatcher` / `inbox = true`, in-flight control requests, verbs, live forwards, the links to registered machines, the autostart pass, an update pass.',
     ],
     side: ['newer client hello → handoff', 'shutdown request', '10 min with no holder → idle (off with --keep-alive or as a fleet control plane)'],
     next: 'any of the three: stop accepting, remove serve.sock',
