@@ -2463,6 +2463,7 @@ mod tests {
             client_id: None,
             owner: None,
             broad: false,
+            orgs: Vec::new(),
         };
         let mut term = crate::commands::login::tests::Script::new(false, &[], Some(TOKEN));
         let mut flows = crate::commands::login::tests::offline();
@@ -2625,6 +2626,7 @@ mod tests {
             client_id: None,
             owner: None,
             broad: false,
+            orgs: Vec::new(),
         };
         let mut term = crate::commands::login::tests::Script::new(false, &[], Some(TOKEN));
         let mut flows = crate::commands::login::tests::offline();
@@ -2995,6 +2997,7 @@ mod tests {
             client_id: None,
             owner: None,
             broad: false,
+            orgs: Vec::new(),
         };
         let mut term = crate::commands::login::tests::Script::new(false, &[], Some(&token));
         let mut flows = crate::commands::login::tests::offline();
@@ -3243,6 +3246,7 @@ mod tests {
             client_id: None,
             owner: None,
             broad: false,
+            orgs: Vec::new(),
         };
         let mut term = crate::commands::login::tests::Script::new(false, &[], Some(&token));
         let mut flows = crate::commands::login::tests::offline();

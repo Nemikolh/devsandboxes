@@ -488,6 +488,11 @@ enum Command {
         /// the claim's broad logins or paste
         #[arg(long)]
         broad: bool,
+        /// An org a new credential reaches, by slug, checked with the token
+        /// (repeatable; for a claim with an org fence, whose org routes a
+        /// credential naming none refuses)
+        #[arg(long = "org", value_name = "SLUG")]
+        orgs: Vec<String>,
         /// The login method, one the claim lists (default: the first listed
         /// of device, browser, paste on a terminal; paste, device, browser
         /// off one; browser only where a browser opens)
@@ -1217,8 +1222,8 @@ fn main() -> Result<()> {
             MachineCommand::Allow { allow } => commands::machine::allow(allow.change()),
         },
         #[cfg(unix)]
-        Command::Login { credential, feature, kind, profiles, yes, method, client_id, owner, broad } => {
-            commands::login::login(commands::login::Args { credential, feature, kind, profiles, yes, method, client_id, owner, broad })
+        Command::Login { credential, feature, kind, profiles, yes, method, client_id, owner, broad, orgs } => {
+            commands::login::login(commands::login::Args { credential, feature, kind, profiles, yes, method, client_id, owner, broad, orgs })
         }
         #[cfg(unix)]
         Command::Access { cmd: AccessCommand::Approve { credential, version, yes } } => {

@@ -174,6 +174,10 @@ struct Credential {
     #[serde(rename = "as", skip_serializing_if = "Vec::is_empty")]
     as_: Vec<String>,
     broad: bool,
+    orgs: Vec<String>,
+    /// The latest approved claim has an org fence: with no `orgs`, its org
+    /// routes are refused.
+    org_fence: bool,
     approved: Vec<VersionRow>,
     pending: Vec<VersionRow>,
     broken: Option<Broken>,
@@ -306,6 +310,11 @@ fn credential(name: &str, entry: &Entry, record: Result<Option<Record>>, uses: V
         delegate: entry.delegate.clone(),
         as_: entry.as_.clone(),
         broad: entry.broad,
+        orgs: entry.orgs.clone(),
+        org_fence: entry
+            .latest_approved()
+            .and_then(|v| crate::credentials::claim::from_canonical(&v.claim).ok())
+            .is_some_and(|(_, pinned)| pinned.orgs.is_some()),
         approved: entry.approved.iter().map(row).collect(),
         pending: entry.pending.iter().map(row).collect(),
         broken: entry.broken.clone(),
@@ -391,6 +400,11 @@ fn render(list: &[Credential], now: u64) -> String {
         }
         if c.broad {
             line(&mut out, "broad", "its token may reach every repo the account can access (login --broad)");
+        }
+        if !c.orgs.is_empty() {
+            line(&mut out, "orgs", &c.orgs.join(", "));
+        } else if c.org_fence {
+            line(&mut out, "orgs", "none (org routes refused)");
         }
         line(&mut out, "approved", &render_versions(&c.approved));
         if !c.pending.is_empty() {
@@ -567,8 +581,12 @@ pub(crate) fn approve_at(data: &Path, name: &str, version: Option<&str>, yes: bo
     let (pending, text) = review_pending(&path, name, version)?;
     term.show(&text);
     approve_or_refuse(term, yes, &format!("Approve this claim version for `{name}`?"))?;
-    approve_pending(&path, name, &pending)?;
-    Ok(format!("approved claim version {} for `{name}`", pending.short()))
+    let note = approve_pending(&path, name, &pending)?;
+    let done = format!("approved claim version {} for `{name}`", pending.short());
+    Ok(match note {
+        Some(n) => format!("{done}\nnote: {n}"),
+        None => done,
+    })
 }
 
 /// `run`'s question (`run::claims`, the verb client): `name`'s pending
@@ -581,8 +599,11 @@ pub(crate) fn ask_approve(path: &Path, name: &str, version: Option<&str>, term: 
     if !term.confirm(&format!("Approve this claim for `{name}`?"))? {
         return Ok(false);
     }
-    approve_pending(path, name, &pending)?;
+    let note = approve_pending(path, name, &pending)?;
     term.show(&format!("approved claim version {} for `{name}`\n", pending.short()));
+    if let Some(n) = note {
+        term.show(&format!("note: {n}\n"));
+    }
     Ok(true)
 }
 
@@ -605,15 +626,19 @@ fn review_pending(path: &Path, name: &str, version: Option<&str>) -> Result<(Ver
     Ok((pending, text))
 }
 
-fn approve_pending(path: &Path, name: &str, pending: &Version) -> Result<()> {
-    home::update(path, |h| {
+/// The note to show when the version brings an org fence to a credential
+/// naming no orgs: its org routes start being refused.
+fn approve_pending(path: &Path, name: &str, pending: &Version) -> Result<Option<String>> {
+    let no_orgs = home::update(path, |h| {
         let entry = h.get_mut(name).with_context(|| format!("credential `{name}` is gone"))?;
         if !entry.pending.iter().any(|p| p.version == pending.version) {
             bail!("claim version {} of `{name}` is no longer pending", pending.short());
         }
-        Ok(entry.approve(pending.clone()))
+        entry.approve(pending.clone());
+        Ok(entry.orgs.is_empty())
     })?;
-    Ok(())
+    let fenced = crate::credentials::claim::from_canonical(&pending.claim).is_ok_and(|(_, p)| p.orgs.is_some());
+    Ok((no_orgs && fenced).then(|| crate::commands::login::no_orgs_note(name, path)))
 }
 
 /// `version` (a prefix of one), else the only one.
@@ -681,6 +706,33 @@ mod tests {
         assert_eq!(e.latest_approved().unwrap().version, newer.version());
         assert_eq!(e.approved.len(), 2, "the older version stays for instances pinned to it");
         assert_eq!(Store::in_data(&data).token_now("s").unwrap().unwrap().expose(), "keep");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn approving_an_org_fence_for_a_credential_naming_no_orgs_notes_it() {
+        let data = temp("approve-orgs");
+        let path = home::path(&data);
+        let fenced = crate::broker::policy::tests::org_fenced();
+        home::update(&path, |h| {
+            let mut e = Entry::new("sentry", None);
+            e.approve(Version::of(&sentry()));
+            h.insert("s".into(), e);
+            home::record_pending(h, "s", &fenced.canonical())
+        })
+        .unwrap();
+        let done = approve_at(&data, "s", None, true, &mut Script::new(true, &[], None)).unwrap();
+        assert!(done.contains("\nnote: `s` names no orgs"), "{done}");
+
+        home::update(&path, |h| {
+            let mut e = Entry::new("sentry", None);
+            e.orgs = vec!["acme".into()];
+            h.insert("t".into(), e);
+            home::record_pending(h, "t", &fenced.canonical())
+        })
+        .unwrap();
+        let done = approve_at(&data, "t", None, true, &mut Script::new(true, &[], None)).unwrap();
+        assert!(!done.contains("note"), "{done}");
         let _ = std::fs::remove_dir_all(&data);
     }
 
@@ -876,6 +928,7 @@ mod tests {
                 "token": {"type": "oauth", "expires_at": 1_800_000_000u64, "refresh_expires_at": 1_900_000_000u64,
                           "refreshable": true, "scope": null},
                 "profiles": null, "max": ["repo.read"], "approvers": ["laptop"], "broad": true,
+                "orgs": [], "org_fence": false,
                 "approved": [], "pending": [], "broken": null,
                 "expires": {"at": 1_900_000_000u64, "days": 21990, "expired": false, "warn": false},
                 "instances": [],
@@ -905,6 +958,38 @@ mod tests {
         assert_eq!(json["approved"][1], serde_json::json!({"version": trimmed(1).version(), "latest": true, "unused": false}));
         assert_eq!(json["instances"][1], serde_json::json!({"instance": "w0", "version": trimmed(0).version(), "approved": true}));
         assert!(json["instances"][0]["unknown"].as_str().unwrap().contains("cannot read its config"));
+        assert!(!text.contains("orgs"), "no org fence: {text}");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn orgs_show_and_an_org_fence_with_none_is_flagged() {
+        let data = data_fixture("ls-orgs");
+        let fenced = Version::of(&crate::broker::policy::tests::org_fenced());
+        home::update(&home::path(&data), |h| {
+            h.get_mut("sentry-oss").unwrap().approve(fenced.clone());
+            let work = h.get_mut("sentry-work").unwrap();
+            work.approve(fenced.clone());
+            work.orgs = vec!["acme".into(), "beta".into()];
+            Ok(())
+        })
+        .unwrap();
+        let list = list_at(&data, &State::default(), None, &mut access_fixture, 0).unwrap();
+        let json = serde_json::to_value(&list).unwrap();
+        let orgs: Vec<_> = json.as_array().unwrap().iter().map(|c| (c["orgs"].clone(), c["org_fence"].clone())).collect();
+        assert_eq!(
+            orgs,
+            [
+                (serde_json::json!([]), serde_json::json!(false)),
+                (serde_json::json!([]), serde_json::json!(true)),
+                (serde_json::json!(["acme", "beta"]), serde_json::json!(true)),
+            ]
+        );
+        let text = render(&list, 0);
+        let blocks: Vec<&str> = text.split("\n\n").collect();
+        assert!(!blocks[0].contains("orgs"), "{text}");
+        assert!(blocks[1].contains("\n  orgs      none (org routes refused)\n"), "{text}");
+        assert!(blocks[2].contains("\n  orgs      acme, beta\n"), "{text}");
         let _ = std::fs::remove_dir_all(&data);
     }
 

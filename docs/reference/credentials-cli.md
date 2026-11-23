@@ -24,6 +24,7 @@ logins: [login](../architecture/credentials/login.md)), `src/credentials/review.
 ```
 devsandbox login <credential> [--feature <ref>] [--kind <kind>] [--profile <p>]... [--yes]
                  [--method paste|device|browser] [--client-id <id>] [--owner <user|org>] [--broad]
+                 [--org <slug>]...
 devsandbox access approve <credential> [--version <v>] [--yes]
 devsandbox access ls [<credential>] [--json]
 devsandbox access revoke <credential> [--version <v>] [--yes]
@@ -58,7 +59,8 @@ The claim to approve (`login_at`):
 An existing credential keeps its kind (another kind is refused) and its
 grant: `--profile` is refused on it (edit `profiles` in the file), and so
 is `--broad` on one that isn't broad, or a login without `--broad` on
-one that is (edit `broad` in the file). A
+one that is (edit `broad` in the file), and `--org` (edit `orgs` in the
+file). A
 claim version already approved for the credential is not asked about
 again.
 
@@ -67,6 +69,17 @@ claim's `tokens.broad` prefixes (the github claim's `gho_`, gh's own
 OAuth app's), which reach every repo the account can access. The broker
 still refuses writes outside an instance's repo fence, but GraphQL reads
 aren't fenced. Refused when the claim declares no `tokens.broad`.
+
+`--org <slug>` (repeatable) names an org a new credential reaches, for a
+claim with an org fence (its `orgs` field): stored as the entry's
+`orgs`. Each is one segment of letters, digits, `_` and `-`, not all
+digits (that's an id, and the fence names orgs by slug), deduped
+case-insensitively, the first spelling kept (`org_slugs`). Refused when
+the claim (the version being approved, else the latest approved) has no
+`orgs`. A login of such a claim leaving the credential with no `orgs`
+is stored anyway, with a note that its org routes are refused until
+`orgs` is set (`no_orgs_note`); `access approve` (and `run`'s question)
+shows the same note when the version it approves brings the fence.
 
 The login method is one of the claim's `login` (`choose`, over the
 version being approved, else the latest approved): `--method` names one
@@ -175,9 +188,22 @@ address override only for a `private` upstream). The answer
 - Anything else, or no answer (offline, a 403, a 5xx): a warning, the secret
   stored unchecked.
 
+Then each `--org` is checked with the secret (`check_org`): the claim's
+`orgs.resolve` for its slug (`orgs::resolve_path`), sent as the check is
+(`credentialed`: first upstream, first slot, `Flows.http`), whether or
+not the claim has a `check`. The answer (`read_org`):
+
+- 2xx naming an id in the claim's `orgs.id` field (`orgs::parse_id`):
+  reachable.
+- 403 or 404: `org <slug> isn't reachable with this token (<status>)`,
+  nothing written.
+- 401: refused, as the check's 401.
+- Anything else (no answer, a 5xx, a 2xx naming no id): a warning, the
+  org stored unchecked.
+
 The record goes into the store first (an approved claim with no secret
 serves nothing), replacing any earlier one whole; then the entry (created
-with `--profile`s as `profiles`, none: unset) and the approved version
+with `--profile`s as `profiles`, none: unset, and `--org`s as `orgs`) and the approved version
 into `credentials.toml`. A re-login touches the record only, but for
 clearing `broken` and setting `expires_at` to the check's (else unset).
 It prints `logged in …` with `as <whose>` when the check showed it
@@ -241,6 +267,8 @@ sentry-work: sentry, source file
 - `profiles`, `max` (unset: every profile, every scope), then
   `members`, `approvers`, `delegate`, `as` when set, and `broad` for a
   broad credential.
+- `orgs`: the credential's orgs when set; `none (org routes refused)`
+  when unset and its latest approved claim has an org fence.
 - `approved` (in approval order) and `pending` claim versions, by
   `Version::short`. The last approved is `latest`; a version that isn't
   and that no instance here pins is `unused` (`access revoke --version`
@@ -280,12 +308,12 @@ GitHub repo fences (each folder's remotes at its first run):
 [{"instance", "stale"}]}]}}`, each credential
 `{"name", "kind", "source", "token": {"type": "static" | "oauth" |
 "missing" | "unreadable", …}, "profiles", "max", "members"?,
-"approvers"?, "delegate"?, "as"?, "broad", "approved": [{"version", "latest",
+"approvers"?, "delegate"?, "as"?, "broad", "orgs", "org_fence", "approved": [{"version", "latest",
 "unused"}], "pending": […], "broken", "expires"?: {"at", "days",
 "expired", "warn"}, "instances": [{"instance", "version", "approved",
 "unknown"?}]}` (full version hashes; `oauth` carries `expires_at`,
 `refresh_expires_at`, `refreshable`, `scope`; `expires.at` is unix
-seconds).
+seconds; `org_fence`: the latest approved claim has an `orgs` field).
 
 ## `access revoke`
 

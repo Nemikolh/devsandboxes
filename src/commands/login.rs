@@ -36,6 +36,9 @@ pub struct Args {
     /// A broad credential: its token may be one of the claim's
     /// `tokens.broad`, reaching every repo the account can.
     pub broad: bool,
+    /// The orgs a new credential reaches, by slug, for a claim with an org
+    /// fence.
+    pub orgs: Vec<String>,
 }
 
 /// What the OAuth logins reach beyond the terminal, a seam for tests.
@@ -331,6 +334,26 @@ fn check_owner(owner: &str) -> Result<()> {
     Ok(())
 }
 
+/// `--org`'s slugs, deduped case-insensitively (the fence matches them so),
+/// the first spelling kept. An all-digit value is refused: the fence reads
+/// one as an id, never a slug.
+fn org_slugs(flags: &[String]) -> Result<Vec<String>> {
+    let mut slugs: Vec<String> = Vec::new();
+    for slug in flags {
+        let segment = !slug.is_empty() && slug.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
+        if !segment {
+            bail!("--org `{}`: a slug is one segment of letters, digits, `_` and `-`", crate::open::printable(slug));
+        }
+        if crate::broker::orgs::is_id(slug) {
+            bail!("--org `{slug}`: that's an org id; name the org by its slug");
+        }
+        if !slugs.iter().any(|s| s.eq_ignore_ascii_case(slug)) {
+            slugs.push(slug.clone());
+        }
+    }
+    Ok(slugs)
+}
+
 /// GitHub's cap on a token's name.
 const TOKEN_NAME_MAX: usize = 40;
 
@@ -444,9 +467,17 @@ enum Checked {
 /// check, or no slot.
 fn check_request(pinned: &Pinned, token: &str, authority: &dyn Fn(&str) -> String) -> Option<(&'static str, String, Vec<Header>, bool)> {
     let Some(Route::Http { method, path }) = &pinned.check else { return None };
+    let (url, headers, private) = credentialed(pinned, path, token, authority)?;
+    Some((method.as_str(), url, headers, private))
+}
+
+/// A call to `path` on the claim's first upstream at `authority` with
+/// `token` in its first slot: URL, headers, whether that upstream is
+/// private. `None`: no slot or no upstream.
+fn credentialed(pinned: &Pinned, path: &str, token: &str, authority: &dyn Fn(&str) -> String) -> Option<(String, Vec<Header>, bool)> {
     let slot = pinned.inject.first()?;
     let upstream = pinned.upstreams.first()?;
-    let mut path = path.clone();
+    let mut path = path.to_string();
     let mut headers = Vec::new();
     match slot {
         Slot::Header { name, .. } => headers.push(Header { name: name.clone(), value: Vec::new() }),
@@ -459,7 +490,7 @@ fn check_request(pinned: &Pinned, token: &str, authority: &dyn Fn(&str) -> Strin
     }
     crate::broker::policy::inject(&mut headers, &mut path, slot, token);
     let url = format!("https://{}{path}", authority(&upstream.host));
-    Some((method.as_str(), url, headers, upstream.private))
+    Some((url, headers, upstream.private))
 }
 
 /// The check's answer. A 2xx's body is read for `checkShows` only; a
@@ -490,6 +521,43 @@ fn check_token(pinned: &Pinned, token: &str, flows: &Flows) -> Option<Checked> {
     })
 }
 
+/// What the claim's `orgs.resolve` said of an org with the token.
+#[derive(Debug, PartialEq)]
+enum OrgChecked {
+    Reachable,
+    /// A 403 or 404: the account isn't in it, or the token doesn't reach it.
+    Unreachable(u16),
+    /// A 401, as [`Checked::Refused`].
+    Refused,
+    Unknown(String),
+}
+
+/// A 2xx counts only with an id in `orgs.id`: that's what the broker's
+/// fence later learns from the same route.
+fn read_org(orgs: &claim::Orgs, status: u16, body: &[u8]) -> OrgChecked {
+    match status {
+        401 => OrgChecked::Refused,
+        403 | 404 => OrgChecked::Unreachable(status),
+        200..=299 if crate::broker::orgs::parse_id(body, &orgs.id).is_some() => OrgChecked::Reachable,
+        200..=299 => OrgChecked::Unknown(format!("its answer names no `{}`", orgs.id)),
+        _ => OrgChecked::Unknown(format!("it answered {status}")),
+    }
+}
+
+/// `orgs.resolve` for `slug`, sent as [`check_token`] sends the check.
+fn check_org(pinned: &Pinned, orgs: &claim::Orgs, slug: &str, token: &str, flows: &Flows) -> OrgChecked {
+    let Some(path) = crate::broker::orgs::resolve_path(orgs, slug) else {
+        unreachable!("org_slugs keeps only one-segment slugs")
+    };
+    let Some((url, headers, private)) = credentialed(pinned, &path, token, &*flows.authority) else {
+        return OrgChecked::Unknown("the claim has no upstream or `inject` slot".into());
+    };
+    match (flows.http)().and_then(|http| http.fetch("GET", &url, &headers, private)) {
+        Ok((status, _, body)) => read_org(orgs, status, &body),
+        Err(e) => OrgChecked::Unknown(format!("{e:#}")),
+    }
+}
+
 /// Returns the line to print.
 pub(crate) fn login_at(
     data: &Path,
@@ -507,6 +575,10 @@ pub(crate) fn login_at(
     let existing = home::load(&path)?.remove(name);
     if existing.is_some() && !args.profiles.is_empty() {
         bail!("credential `{name}` exists: its profiles are `profiles` in {}", path.display());
+    }
+    let orgs = org_slugs(&args.orgs)?;
+    if existing.is_some() && !orgs.is_empty() {
+        bail!("credential `{name}` exists: its orgs are `orgs` in {}", path.display());
     }
     match &existing {
         Some(e) if e.broad && !args.broad => bail!(
@@ -551,6 +623,9 @@ pub(crate) fn login_at(
     let (_, pinned) = claim::from_canonical(&deciding.claim)?;
     if args.broad && pinned.tokens.as_ref().is_none_or(|t| t.broad.is_empty()) {
         bail!("the `{kind}` claim takes no broad token (no `tokens.broad`): --broad changes nothing");
+    }
+    if !orgs.is_empty() && pinned.orgs.is_none() {
+        bail!("the `{kind}` claim has no org fence: --org changes nothing");
     }
     let login =
         choose(&pinned.login, args.method.as_deref(), args.client_id.is_some(), args.broad, term.tty(), flows.browser, &kind)?;
@@ -597,12 +672,10 @@ pub(crate) fn login_at(
 
     let record = obtain(login, name, page.as_deref(), args, term, flows)?;
     crate::credentials::tokens::check_accepted(pinned.tokens.as_ref(), record.access_token().expose(), &kind, args.broad)?;
+    let host = pinned.upstreams.first().map_or("", |u| u.host.as_str());
     let (whose, expires_at) = match check_token(&pinned, record.access_token().expose(), flows) {
         None => (None, None),
-        Some(Checked::Refused) => {
-            let host = pinned.upstreams.first().map_or("", |u| u.host.as_str());
-            bail!("the token was refused by {host} (401): nothing changed");
-        }
+        Some(Checked::Refused) => bail!("the token was refused by {host} (401): nothing changed"),
         // A home may be offline.
         Some(Checked::Unknown(why)) => {
             term.show(&format!("warning: cannot check the token, stored unchecked: {}\n", crate::open::printable(&why)));
@@ -611,11 +684,26 @@ pub(crate) fn login_at(
         // An OAuth record carries its own expiry.
         Some(Checked::Valid { shows, expires_at }) => (shows, expires_at.filter(|_| matches!(record, Record::Static { .. }))),
     };
+    // A slug the token can't reach would only ever be refused upstream.
+    if let Some(fence) = &pinned.orgs {
+        for slug in &orgs {
+            match check_org(&pinned, fence, slug, record.access_token().expose(), flows) {
+                OrgChecked::Reachable => {}
+                OrgChecked::Unreachable(status) => bail!("org `{slug}` isn't reachable with this token ({status}): nothing changed"),
+                OrgChecked::Refused => bail!("the token was refused by {host} (401): nothing changed"),
+                OrgChecked::Unknown(why) => term.show(&format!(
+                    "warning: cannot check org `{slug}`, stored unchecked: {}\n",
+                    crate::open::printable(&why)
+                )),
+            }
+        }
+    }
     // The secret first: a claim approved without one serves nothing.
     Store::in_data(data).put(name, &record)?;
     let profiles = (!args.profiles.is_empty()).then(|| args.profiles.clone());
     let approved = home::update(&path, |h: &mut Home| {
-        let entry = h.entry(name.to_string()).or_insert_with(|| Entry { broad: args.broad, ..Entry::new(&kind, profiles) });
+        let entry =
+            h.entry(name.to_string()).or_insert_with(|| Entry { broad: args.broad, orgs: orgs.clone(), ..Entry::new(&kind, profiles) });
         if entry.kind != kind {
             bail!("credential `{name}` is a `{}` credential, not `{kind}`", entry.kind);
         }
@@ -623,11 +711,24 @@ pub(crate) fn login_at(
         entry.expires_at = expires_at.map(crate::inbox::rfc3339);
         Ok(approving.cloned().map(|c| entry.approve(c)).unwrap_or(false))
     })?;
+    if existing.as_ref().is_none_or(|e| e.orgs.is_empty()) && orgs.is_empty() && pinned.orgs.is_some() {
+        term.show(&format!("note: {}\n", no_orgs_note(name, &path)));
+    }
     let whose = whose.map(|w| format!(" as {}", crate::open::printable(&w))).unwrap_or_default();
     Ok(match (approved, approving) {
         (true, Some(c)) => format!("logged in `{name}` ({kind}){whose}; claim version {} approved", c.short()),
         _ => format!("logged in `{name}` ({kind}){whose}: secret replaced"),
     })
+}
+
+/// Shown wherever a credential under an org fence ends up naming no orgs:
+/// the broker refuses its org routes from then on.
+pub(crate) fn no_orgs_note(name: &str, path: &Path) -> String {
+    format!(
+        "`{name}` names no orgs, so the broker refuses its org routes until `orgs` is set in {} \
+         (or log in again as a new credential with --org)",
+        path.display()
+    )
 }
 
 /// The pending version `login` without `--feature` approves; `None` when
@@ -739,6 +840,7 @@ pub(crate) mod tests {
             client_id: None,
             owner: None,
             broad: false,
+            orgs: Vec::new(),
         }
     }
 
@@ -1318,6 +1420,150 @@ pub(crate) mod tests {
         let mut quiet = p.clone();
         quiet.check_shows = None;
         assert_eq!(read_check(&quiet, 200, &[], br#"{"login":"alice"}"#), valid(None, None));
+    }
+
+    /// Flows whose claim upstream answers the check with `{}` and each
+    /// `orgs.resolve` of `/api/0/organizations/<slug>/` as `orgs` says.
+    fn orgs_answered(orgs: &'static [(&'static str, u16, &'static str)]) -> (Flows, crate::broker::serve::tests::Seen) {
+        let (port, seen) = crate::broker::serve::tests::upstream_server(move |head, _| {
+            let org = orgs.iter().find(|(slug, ..)| head.starts_with(&format!("GET /api/0/organizations/{slug}/ ")));
+            match org {
+                Some((_, status, body)) => user(*status, body),
+                None => user(200, "{}"),
+            }
+        });
+        let mut f = offline();
+        f.http = Box::new(|| Ok(crate::credentials::oauth::tests::http()));
+        f.authority = Box::new(move |_| format!("127.0.0.1:{port}"));
+        (f, seen)
+    }
+
+    fn with_orgs(name: &str, orgs: &[&str]) -> Args {
+        Args { yes: true, orgs: orgs.iter().map(|s| s.to_string()).collect(), ..args(name) }
+    }
+
+    #[test]
+    fn org_slugs_are_one_segment_not_an_id_and_deduped() {
+        let flags = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(org_slugs(&flags(&["acme", "Beta-2", "ACME", "b_c"])).unwrap(), ["acme", "Beta-2", "b_c"]);
+        assert_eq!(org_slugs(&[]).unwrap(), Vec::<String>::new());
+        assert_eq!(org_slugs(&flags(&["1a"])).unwrap(), ["1a"], "digits and a letter: a slug");
+        for bad in ["", "a/b", "a b", "a.b", "é"] {
+            let err = org_slugs(&flags(&[bad])).unwrap_err().to_string();
+            assert!(err.ends_with("a slug is one segment of letters, digits, `_` and `-`"), "{bad}: {err}");
+        }
+        let err = org_slugs(&flags(&["acme", "12"])).unwrap_err().to_string();
+        assert_eq!(err, "--org `12`: that's an org id; name the org by its slug");
+    }
+
+    #[test]
+    fn login_stores_the_orgs_each_checked_with_the_token() {
+        use crate::broker::policy::tests::org_fenced;
+        let data = temp("orgs");
+        let (mut f, seen) = orgs_answered(&[("acme", 200, r#"{"id":"7","slug":"acme"}"#), ("beta", 200, r#"{"id":8}"#)]);
+        let mut term = Script::new(false, &[], Some("sntryu_1"));
+        let a = with_orgs("s", &["acme", "beta", "Acme"]);
+        let done = super::login_at(&data, &a, Some(vec![org_fenced()]), &mut term, &mut f).unwrap();
+        assert!(done.contains("approved"), "{done}");
+        assert!(!term.shown.contains("warning") && !term.shown.contains("note"), "{}", term.shown);
+        assert_eq!(home::load(&home::path(&data)).unwrap()["s"].orgs, ["acme", "beta"]);
+        let heads: Vec<String> = seen.lock().unwrap().iter().map(|(h, _)| h.clone()).collect();
+        assert_eq!(heads.len(), 3, "the check, then one per org: {heads:?}");
+        assert!(heads[1].starts_with("GET /api/0/organizations/acme/ HTTP/1.1\r\n"), "{}", heads[1]);
+        assert!(heads[1].contains("\r\nauthorization: Bearer sntryu_1\r\n"), "{}", heads[1]);
+        assert!(heads[2].starts_with("GET /api/0/organizations/beta/ "), "{}", heads[2]);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn an_org_the_token_cant_reach_changes_nothing() {
+        use crate::broker::policy::tests::org_fenced;
+        let data = temp("orgs-out");
+        for (status, err) in [
+            (404, "org `beta` isn't reachable with this token (404): nothing changed"),
+            (403, "org `beta` isn't reachable with this token (403): nothing changed"),
+            (401, "the token was refused by sentry.io (401): nothing changed"),
+        ] {
+            let answers: &'static [(&str, u16, &str)] = match status {
+                404 => &[("acme", 200, r#"{"id":"7"}"#), ("beta", 404, "{}")],
+                403 => &[("acme", 200, r#"{"id":"7"}"#), ("beta", 403, "{}")],
+                _ => &[("acme", 200, r#"{"id":"7"}"#), ("beta", 401, "{}")],
+            };
+            let (mut f, _) = orgs_answered(answers);
+            let mut term = Script::new(false, &[], Some("sntryu_1"));
+            let a = with_orgs("s", &["acme", "beta"]);
+            let got = super::login_at(&data, &a, Some(vec![org_fenced()]), &mut term, &mut f).unwrap_err().to_string();
+            assert_eq!(got, err);
+            assert!(!home::path(&data).exists() && !Store::in_data(&data).path().exists());
+        }
+    }
+
+    #[test]
+    fn an_unchecked_org_is_stored_with_a_warning() {
+        use crate::broker::policy::tests::org_fenced;
+        let data = temp("orgs-unknown");
+        let mut term = Script::new(false, &[], Some("sntryu_1"));
+        let a = with_orgs("s", &["acme"]);
+        login_at(&data, &a, Some(vec![org_fenced()]), &mut term).unwrap();
+        assert!(term.shown.ends_with("warning: cannot check org `acme`, stored unchecked: no network in this test\n"), "{}", term.shown);
+        assert_eq!(home::load(&home::path(&data)).unwrap()["s"].orgs, ["acme"]);
+        let _ = std::fs::remove_dir_all(&data);
+
+        let (mut f, _) = orgs_answered(&[("acme", 200, r#"{"slug":"acme"}"#)]);
+        let mut term = Script::new(false, &[], Some("sntryu_1"));
+        super::login_at(&data, &a, Some(vec![org_fenced()]), &mut term, &mut f).unwrap();
+        assert!(term.shown.ends_with("cannot check org `acme`, stored unchecked: its answer names no `id`\n"), "{}", term.shown);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn org_refusals_change_nothing() {
+        use crate::broker::policy::tests::org_fenced;
+        let data = temp("orgs-refuse");
+        let err = login_at(&data, &with_orgs("s", &["acme"]), Some(vec![sentry()]), &mut Script::new(false, &[], Some("t"))).unwrap_err();
+        assert_eq!(err.to_string(), "the `sentry` claim has no org fence: --org changes nothing");
+        let err = login_at(&data, &with_orgs("s", &["a/b"]), Some(vec![org_fenced()]), &mut Script::new(false, &[], Some("t"))).unwrap_err();
+        assert!(err.to_string().starts_with("--org `a/b`"), "{err}");
+        assert!(!home::path(&data).exists() && !Store::in_data(&data).path().exists());
+
+        login_at(&data, &with_orgs("s", &["acme"]), Some(vec![org_fenced()]), &mut Script::new(false, &[], Some("t"))).unwrap();
+        let err = login_at(&data, &with_orgs("s", &["beta"]), None, &mut Script::new(false, &[], Some("t2"))).unwrap_err();
+        let want = format!("credential `s` exists: its orgs are `orgs` in {}", home::path(&data).display());
+        assert_eq!(err.to_string(), want);
+        assert_eq!(Store::in_data(&data).token_now("s").unwrap().unwrap().expose(), "t");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn a_credential_naming_no_org_gets_a_note() {
+        use crate::broker::policy::tests::org_fenced;
+        let data = temp("orgs-note");
+        let yes = Args { yes: true, ..args("s") };
+        let mut term = Script::new(false, &[], Some("t"));
+        login_at(&data, &yes, Some(vec![org_fenced()]), &mut term).unwrap();
+        let note = format!(
+            "note: `s` names no orgs, so the broker refuses its org routes until `orgs` is set in {} \
+             (or log in again as a new credential with --org)\n",
+            home::path(&data).display()
+        );
+        assert!(term.shown.ends_with(&note), "{}", term.shown);
+        assert!(home::load(&home::path(&data)).unwrap()["s"].orgs.is_empty());
+
+        let mut term = Script::new(false, &[], Some("t2"));
+        login_at(&data, &args("s"), None, &mut term).unwrap();
+        assert!(term.shown.ends_with(&note), "a re-login, still none: {}", term.shown);
+        home::update(&home::path(&data), |h| {
+            h.get_mut("s").unwrap().orgs = vec!["acme".into()];
+            Ok(())
+        })
+        .unwrap();
+        let mut term = Script::new(false, &[], Some("t3"));
+        login_at(&data, &args("s"), None, &mut term).unwrap();
+        assert!(!term.shown.contains("note"), "orgs set by hand: {}", term.shown);
+        let mut term = Script::new(false, &[], Some("t"));
+        login_at(&data, &Args { yes: true, ..args("plain") }, Some(vec![sentry()]), &mut term).unwrap();
+        assert!(!term.shown.contains("note"), "no org fence: {}", term.shown);
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]

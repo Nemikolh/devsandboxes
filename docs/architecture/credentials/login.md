@@ -17,7 +17,8 @@ Code: `src/credentials/oauth/mod.rs` (`Http`, `parse_token_reply`,
 (`login`, `authorize_url`, `callback`, `TIMEOUT`),
 `src/credentials/store.rs` (`Record`, `OAuthToken`, `Store::renew`),
 `src/commands/login.rs` (`obtain`, `create_url`, `check_request`,
-`read_check`, `check_token`, `Flows`, `login_profile`).
+`credentialed`, `read_check`, `check_token`, `org_slugs`, `check_org`,
+`read_org`, `Flows`, `login_profile`).
 
 ## The endpoints
 
@@ -114,6 +115,26 @@ be a rate limit or an org policy); a 2xx gives whose the token is (the claim's `
 and a pasted token's expiry (`tokens::captured`); anything else, or a
 failed call, is a warning and the secret is stored unchecked, so a home
 that is offline can still log in.
+
+## The org check
+
+A new credential's `--org`s (`org_slugs`: one segment, not all digits,
+deduped case-insensitively) are for a claim with an org fence
+([broker](broker.md#the-org-fence)); a claim without `orgs`, or an
+existing credential (its `orgs` are edited in `credentials.toml`),
+refuses them. After the token check, each is sent to the claim's
+`orgs.resolve` route (`check_org`): the path from `orgs::resolve_path`,
+the request from `credentialed` (the check's own builder: first
+upstream, first `inject` slot), over `Flows.http` to `Flows.authority`,
+so it reaches what the broker's fence later asks for the same slug.
+`read_org` reads the answer, pure: a 2xx with an id in `orgs.id`
+(`orgs::parse_id`) is reachable; a 403 or 404 refuses the login (the
+account isn't in the org, or the token doesn't reach it), nothing
+written; a 401 refuses it as the token check does; anything else, or a
+failed call, is a warning and the org is stored unchecked. The slugs go
+into the new entry's `orgs`. A login of a fenced claim that leaves the
+credential with no `orgs` is stored with a note (`no_orgs_note`): the
+broker refuses its org routes until `orgs` is set.
 
 ## The record
 
