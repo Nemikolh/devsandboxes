@@ -112,6 +112,7 @@ Sandboxes can use gh, git and Sentry's CLI without ever holding your tokens: dev
 
 <details><summary>Commits</summary>
 
+- 0709b75 fix(update): write the image label's $ as \u0024, since podman expands it and lost the shared dir
 - 4283a0d docs(serve): instances with credential claims hold the daemon, and drop the stale ctrl-d limitation
 - dcae3ea docs(site): bring every page up to the credential broker and feature updates
 - d35ce80 docs(config): condense the config reference to what each property needs, checked against the code
