@@ -1,3 +1,7 @@
+> Archived 2026-11-23. Historical, may be wrong; do not use as a reference.
+> Current: [images and features](../../architecture/instances/images-and-features.md),
+> [daemon/updates.md](../../architecture/daemon/updates.md)
+
 # Update mounts are read-only by declaration
 
 Status: agreed; building.
