@@ -40,7 +40,14 @@
 //!    by its body's `operation`, [`Call::lfs`]); a `{repo}` naming an
 //!    entry's old name is sent to its current one; a route without either
 //!    is repo-less;
-//! 10. the scope must be granted (`max`, unset: every scope) and requested
+//! 10. the org fence, for a claim with `orgs` ([`check_org`]): a route
+//!     holding `orgs.var` names an org of the credential's `orgs`,
+//!     narrowed by `access.<kind>.orgs` when it names any, by slug in any
+//!     case or by the id one resolves to ([`orgs::place`]), else is
+//!     refused, reads too; a credential naming no orgs refuses every such
+//!     route. An `orgs.lists` route's answer is filtered to them
+//!     ([`Injection::orgs`]);
+//! 11. the scope must be granted (`max`, unset: every scope) and requested
 //!     (`access.<kind>.scopes`, empty: every scope), and one in
 //!     `access.<kind>.ask` is refused as an ask: asks wait for permission
 //!     requests (credential-broker step 4), and a repo-less route is never
@@ -59,6 +66,7 @@ use anyhow::Result;
 use super::github::{self, Place};
 use super::graphql;
 use super::head::{RequestHead, header_indices};
+use super::orgs;
 use super::redact;
 use super::refusal::Refusal;
 use super::route::{self, Scoped};
@@ -82,6 +90,11 @@ pub trait Sources {
     /// What resolves the fence to GitHub's ids; `None`: entries match by
     /// name only.
     fn github(&self) -> Option<&dyn github::Lookup> {
+        None
+    }
+    /// What resolves an org's slug to its id; `None`: orgs match by slug
+    /// only.
+    fn orgs(&self) -> Option<&dyn orgs::Lookup> {
         None
     }
 }
@@ -165,6 +178,16 @@ pub struct Injection {
     /// the current name of the repository that name was pinned to, so a
     /// later owner of the old name never gets the credential.
     pub path: Option<String>,
+    /// An `orgs.lists` route's: its answer keeps only the fence's orgs.
+    pub orgs: Option<OrgList>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgList {
+    /// The list elements' top-level fields naming an org.
+    pub fields: Vec<String>,
+    /// The allowed slugs ([`orgs::allowed`]).
+    pub allowed: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -321,6 +344,7 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
 
     let call_route = format!("{} {}", head.method, route::path_only(path));
     let mut renamed = None;
+    let mut org_list = None;
     let needed = if approved.graphql() && route::graphql(&head.method, path) {
         let Some(op) = call.graphql else {
             return Err(internal("a GraphQL request reached policy with its document unread"));
@@ -351,6 +375,10 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
             }
             None => scope,
         };
+        let route_path = match &matched.route {
+            Some(claim::Route::Http { path, .. }) => Some(path.as_str()),
+            _ => None,
+        };
         let mut repo_less = false;
         if approved.fenced() {
             let mut fence = fence_for(inst, &access, state, sources, &approved, name);
@@ -378,10 +406,6 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
                 Placed::RepoLess => repo_less = true,
                 Placed::Repo(repo) => match fence.place_name(&repo) {
                     Place::In { current } => {
-                        let route_path = match &matched.route {
-                            Some(claim::Route::Http { path, .. }) => Some(path.as_str()),
-                            _ => None,
-                        };
                         renamed = current.zip(route_path).and_then(|(c, rp)| route::with_repo(rp, path, &c));
                     }
                     Place::Out => return outside(repo, true, cx),
@@ -392,6 +416,23 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
                         Some(repo) => outside(repo, true, cx),
                         None => outside(format!("repository {id}"), false, cx),
                     };
+                }
+            }
+        }
+        if let (Some(org_fence), Some(rp)) = (&approved.orgs, route_path) {
+            let allowed = orgs::allowed(&entry.orgs, &access.orgs);
+            match route::var_value(rp, path, &org_fence.var) {
+                Some(value) => {
+                    let via = orgs::Via { credential: name, upstream, private: up.private, slot: &slot };
+                    let id_of = |slug: &str| sources.orgs().and_then(|l| l.id_of(&via, org_fence, slug));
+                    check_org(&value, &entry.orgs, &allowed, &id_of, name, kind, &call_route)?;
+                }
+                None => {
+                    org_list = matched
+                        .route
+                        .as_ref()
+                        .and_then(|r| org_fence.lists.get(r))
+                        .map(|fields| OrgList { fields: fields.clone(), allowed });
                 }
             }
         }
@@ -430,7 +471,37 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
         lfs,
         expires_at: entry.expires(),
         path: renamed,
+        orgs: org_list,
     })))
+}
+
+/// `value`, the org a route's `orgs.var` took, against the fence.
+fn check_org(
+    value: &str,
+    credential: &[String],
+    allowed: &[String],
+    id_of: &dyn Fn(&str) -> Option<String>,
+    name: &str,
+    kind: &str,
+    call_route: &str,
+) -> Result<(), Refusal> {
+    if credential.is_empty() {
+        return Err(Refusal::refused(format!("`{call_route}` names an org, and credential `{name}` names no orgs"))
+            .todo(format!("add the orgs it may reach to `orgs` of [{name}] in credentials.toml")));
+    }
+    match orgs::place(value, credential, allowed, id_of) {
+        orgs::Place::In => Ok(()),
+        orgs::Place::NotInConfig(org) => Err(Refusal::refused(format!("org `{org}` isn't in `access.{kind}.orgs`"))
+            .todo(format!("add `{org}` to `access.{kind}.orgs` in the sandbox's config"))),
+        orgs::Place::Out if orgs::is_id(value) => Err(Refusal::refused(format!(
+            "org id `{value}` is none of the orgs credential `{name}` may reach"
+        ))
+        .todo(format!("add the org's slug to `orgs` of [{name}] in credentials.toml"))),
+        orgs::Place::Out => {
+            Err(Refusal::refused(format!("org `{value}` is outside the orgs credential `{name}` may reach"))
+                .todo(format!("add `{value}` to `orgs` of [{name}] in credentials.toml")))
+        }
+    }
 }
 
 /// A GraphQL call's scopes, each with whether it's reached repo-less: a

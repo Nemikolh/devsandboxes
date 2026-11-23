@@ -21,6 +21,9 @@ Code: `src/credentials/fence.rs` (`parse`, `github_repo`, `normalize`,
 `Instance::github_repos`, `State::github_ids`, `GithubPin`), `src/commands/access.rs` (`forget_at`,
 `fences`, `render_fences`).
 
+Sentry's org fence, a claim's `orgs`, is the broker's:
+[broker](broker.md#the-org-fence).
+
 ## Why once
 
 From its first container on, a folder's `.git/config` is writable from

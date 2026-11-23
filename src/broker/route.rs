@@ -112,6 +112,19 @@ pub fn with_repo(route_path: &str, path: &str, full_name: &str) -> Option<String
     })
 }
 
+/// The segment `path` gave `var` (a whole `{name}`) in `route_path`, which
+/// [`matches`] it: raw, or past `{repo}` as `matches` decoded it. `None`
+/// when the route doesn't hold `var`.
+pub fn var_value(route_path: &str, path: &str, var: &str) -> Option<String> {
+    let want: Vec<&str> = path_only(route_path).split('/').collect();
+    let got: Vec<&str> = path_only(path).split('/').collect();
+    let i = want.iter().position(|w| *w == var)?;
+    match want.iter().position(|w| *w == REPO) {
+        Some(at) if at < i => decoded_rest(got.get(at + 2..)?).ok()?.get(i - at - 1).cloned(),
+        _ => got.get(i).map(|s| s.to_string()),
+    }
+}
+
 fn segments_match(want: &[&str], got: &[&str]) -> bool {
     want.len() == got.len()
         && want.iter().zip(got).all(|(w, g)| match w.strip_prefix('{').and_then(|v| v.strip_suffix('}')) {
@@ -365,6 +378,16 @@ mod tests {
             assert!(matches!(matches(contents, bad), Match::Refused(_)), "{bad}");
         }
         assert_eq!(matches(contents, "/repos/o/r/contents/a%25b"), Match::Yes(Some("o/r".into())), "a lone `%25`");
+    }
+
+    #[test]
+    fn a_variables_segment() {
+        let v = |route: &str, path: &str| var_value(route, path, "{org}");
+        assert_eq!(v("/api/0/organizations/{org}/", "/api/0/organizations/AcMe/?x=1").as_deref(), Some("AcMe"));
+        assert_eq!(v("/api/0/projects/{org}/{project}/", "/api/0/projects/a%62c/p/").as_deref(), Some("a%62c"), "raw");
+        assert_eq!(v("/api/0/organizations/", "/api/0/organizations/"), None);
+        assert_eq!(v("/x/{repo}/{org}/{y}", "/x/o/r/acme%2Fz").as_deref(), Some("acme"), "past `{{repo}}`, decoded");
+        assert_eq!(v("/x/{org}/{repo}", "/x/acme/o/r").as_deref(), Some("acme"));
     }
 
     #[test]

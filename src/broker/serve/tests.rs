@@ -1194,7 +1194,7 @@ fn response(length: Length, headers: &[(&str, &str)], body: &'static [u8]) -> Re
 }
 
 fn respond<'a>(listeners: &'a [(String, u16)], fields: Option<&'a [String]>, max: usize, http10: bool) -> Respond<'a> {
-    Respond { http10, keep: true, outside: false, secrets: None, listeners, fields, lfs: None, max_rewrite: max }
+    Respond { http10, keep: true, outside: false, secrets: None, listeners, fields, lfs: None, orgs: None, max_rewrite: max }
 }
 
 #[test]
@@ -1243,4 +1243,100 @@ fn unframed_to_http10_closes() {
     let text = String::from_utf8(out).unwrap();
     assert!(!keep.unwrap());
     assert!(text.contains("Connection: close\r\n\r\nto the end"), "{text}");
+}
+
+fn org_filter<'a>(id_of: &'a dyn Fn(&str) -> Option<String>, fields: &'a [String], allowed: &'a [String]) -> OrgFilter<'a> {
+    OrgFilter {
+        fields,
+        allowed,
+        id_of,
+        shape: None,
+        too_large: Refusal::new(502, "refused", "too large to filter"),
+        not_a_list: Refusal::new(502, "refused", "nothing to filter"),
+    }
+}
+
+#[test]
+fn an_org_list_is_cut_to_the_fence_or_refused_past_the_bound() {
+    let fields = vec!["id".to_string(), "slug".to_string()];
+    let allowed = vec!["acme".to_string()];
+    let id_of = |slug: &str| (slug == "acme").then(|| "11".to_string());
+    let write = |body: &'static [u8], max: usize, line: &mut Line| {
+        let respond = Respond { orgs: Some(org_filter(&id_of, &fields, &allowed)), ..respond(&[], None, max, false) };
+        let mut out = Vec::new();
+        let keep = respond.write(response(Length::Exact(body.len() as u64), &[], body), &mut out, line).unwrap();
+        (keep, String::from_utf8(out).unwrap())
+    };
+    let list: &'static [u8] = br#"[{"slug":"ACME","id":"11"},{"slug":"other","id":"33"},{"id":11},{"id":"33"}]"#;
+    let mut line = Line::default();
+    let (keep, text) = write(list, 1024, &mut line);
+    assert!(keep);
+    assert!(text.ends_with("\r\n\r\n[{\"id\":\"11\",\"slug\":\"ACME\"},{\"id\":11}]"), "{text}");
+    assert_eq!(line.reason, None);
+
+    let mut line = Line::default();
+    let (keep, text) = write(br#"{"orgs":[{"slug":"other"}]}"#, 1024, &mut line);
+    assert!(keep && text.starts_with("HTTP/1.1 502 ") && text.contains("nothing to filter") && !text.contains("other"), "{text}");
+    assert_eq!((line.verdict.as_str(), line.status), ("refused", 502));
+
+    let mut line = Line::default();
+    let (keep, text) = write(list, 8, &mut line);
+    assert!(keep);
+    assert!(text.starts_with("HTTP/1.1 502 ") && text.contains("too large to filter") && !text.contains("other"), "{text}");
+    assert_eq!((line.verdict.as_str(), line.status), ("refused", 502));
+}
+
+/// [`Rig::new`] with [`org_fenced`], `sentry-work` reaching `orgs`.
+fn org_rig(tag: &str, port: u16, orgs: &[&str]) -> Rig {
+    let claim = private(crate::broker::policy::tests::org_fenced());
+    let mut home = home_with(&claim);
+    home.get_mut("sentry-work").unwrap().orgs = orgs.iter().map(|s| s.to_string()).collect();
+    Rig::with(tag, port, state_with(claim.clone()), home, "sentry-work", &claim)
+}
+
+/// A mock Sentry: `acme` is org 11; `/api/0/organizations/` lists acme and
+/// `other` (a 500 when asked with `X-Fail`); anything else an empty list.
+fn mock_sentry(head: &str, _: &[u8]) -> Vec<u8> {
+    let ok = |body: &str| format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes();
+    let line = head.lines().next().unwrap_or_default();
+    match line {
+        "GET /api/0/organizations/acme/ HTTP/1.1" => ok(r#"{"id":"11","slug":"acme"}"#),
+        "GET /api/0/organizations/ HTTP/1.1" => {
+            let body = r#"[{"id":"11","slug":"acme"},{"id":"33","slug":"other"}]"#;
+            match head.contains("X-Fail: 1") {
+                true => format!("HTTP/1.1 500 Oops\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes(),
+                false => ok(body),
+            }
+        }
+        _ => ok("[]"),
+    }
+}
+
+#[test]
+fn an_org_named_by_id_is_resolved_with_the_credential_on_the_calls_upstream() {
+    let (port, seen) = upstream_server(mock_sentry);
+    let rig = org_rig("org-id", port, &["acme"]);
+    let mut c = rig.connect("us.sentry.io");
+    let a = c.call("GET", "/api/0/organizations/11/releases/", &bearer(OWN), b"");
+    assert_eq!(a.status, 200, "{a:?}");
+    let a = c.call("GET", "/api/0/organizations/33/releases/", &bearer(OWN), b"");
+    assert_eq!(a.status, 403, "{a:?}");
+    assert!(a.json()["detail"].as_str().unwrap().contains("org id `33` is none of the orgs"), "{a:?}");
+    let seen = seen.lock().unwrap();
+    let heads: Vec<&str> = seen.iter().map(|(h, _)| h.lines().next().unwrap()).collect();
+    assert_eq!(heads, ["GET /api/0/organizations/acme/ HTTP/1.1", "GET /api/0/organizations/11/releases/ HTTP/1.1"], "one lookup, cached");
+    assert!(seen[0].0.to_ascii_lowercase().contains(&format!("authorization: bearer {}\r\n", TOKEN.to_ascii_lowercase())), "{}", seen[0].0);
+    assert!(seen[0].0.contains(&format!("Host: localhost:{port}\r\n")), "{}", seen[0].0);
+}
+
+#[test]
+fn an_org_list_reaches_the_tool_cut_to_the_fence() {
+    let (port, _) = upstream_server(mock_sentry);
+    let rig = org_rig("org-list", port, &["acme"]);
+    let mut c = rig.connect("sentry.io");
+    let a = c.call("GET", "/api/0/organizations/", &bearer(OWN), b"");
+    assert_eq!((a.status, a.json()), (200, serde_json::json!([{ "id": "11", "slug": "acme" }])), "{a:?}");
+    let a = c.call("GET", "/api/0/organizations/", &format!("{}X-Fail: 1\r\n", bearer(OWN)), b"");
+    assert_eq!(a.status, 500, "{a:?}");
+    assert_eq!(a.json().as_array().unwrap().len(), 2, "an error passes as it came");
 }

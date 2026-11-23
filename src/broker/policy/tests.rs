@@ -898,3 +898,140 @@ fn graphql_ids_without_a_lookup_match_pins_only() {
     injected(&gql(&state, &fenced_src(None), pr("R_42")));
     refused(&gql(&state, &fenced_src(None), pr("R_7")), "doesn't resolve to a repository");
 }
+
+/// [`sentry`] with an org fence on `{org}`, `GET /api/0/organizations/`
+/// filtered by `slug` and `id`.
+pub(crate) fn org_fenced() -> claim::Claim {
+    let mut c = sentry();
+    let get = |path: &str| claim::Route::Http { method: claim::Method::Get, path: path.into() };
+    c.pinned.orgs = Some(claim::Orgs {
+        var: "{org}".into(),
+        resolve: get("/api/0/organizations/{org}/"),
+        id: "id".into(),
+        lists: [(get("/api/0/organizations/"), vec!["id".to_string(), "slug".to_string()])].into(),
+    });
+    c
+}
+
+/// [`Src`] for [`org_fenced`], `sentry-work` naming `orgs`, ids answered
+/// from `ids` (slug, id).
+struct OrgSrc {
+    src: Src,
+    ids: Vec<(&'static str, &'static str)>,
+    asked: std::cell::RefCell<Vec<(String, String)>>,
+}
+
+impl OrgSrc {
+    fn new(orgs: &[&str], config: &[&str], ids: &[(&'static str, &'static str)]) -> OrgSrc {
+        let mut home = home_with(&org_fenced());
+        home.get_mut("sentry-work").unwrap().orgs = orgs.iter().map(|s| s.to_string()).collect();
+        let access = Access { orgs: config.iter().map(|s| s.to_string()).collect(), ..Access::default() };
+        OrgSrc { src: Src { home, access: Some(access) }, ids: ids.to_vec(), asked: Default::default() }
+    }
+}
+
+impl Sources for OrgSrc {
+    fn home(&self) -> Result<Home> {
+        self.src.home()
+    }
+    fn access(&self, inst: &Instance, kind: &str) -> Result<Option<Access>> {
+        self.src.access(inst, kind)
+    }
+    fn orgs(&self) -> Option<&dyn orgs::Lookup> {
+        Some(self)
+    }
+}
+
+impl orgs::Lookup for OrgSrc {
+    fn id_of(&self, via: &orgs::Via<'_>, fence: &claim::Orgs, slug: &str) -> Option<String> {
+        assert_eq!((via.credential, fence.id.as_str()), ("sentry-work", "id"));
+        self.asked.borrow_mut().push((via.upstream.to_string(), slug.to_string()));
+        self.ids.iter().find(|(s, _)| *s == slug).map(|(_, id)| id.to_string())
+    }
+}
+
+fn org_call(src: &dyn Sources, method: &str, path: &str) -> Outcome {
+    let state = state_with(org_fenced());
+    let port = port(&state, "us.sentry.io");
+    let head = parse_head(format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{}\r\n", bearer(OWN)).as_bytes())
+        .unwrap();
+    let header = ProxyHeader::BaseUrl { upstream: "us.sentry.io".into(), listener: port };
+    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None }, &state, src)
+}
+
+#[test]
+fn the_org_fence_takes_the_credentials_slugs_in_any_case() {
+    let src = OrgSrc::new(&["acme"], &[], &[]);
+    let o = org_call(&src, "GET", "/api/0/organizations/AcMe/releases/");
+    assert_eq!((injected(&o).orgs.as_ref(), o.context.scope.as_deref()), (None, Some("releases.read")));
+    injected(&org_call(&src, "GET", "/api/0/projects/acme/web/issues/"));
+    for (method, path) in [("GET", "/api/0/organizations/other/releases/"), ("POST", "/api/0/organizations/other/releases/")] {
+        let r = refused(&org_call(&src, method, path), "org `other` is outside the orgs credential `sentry-work` may reach");
+        assert_eq!(r.todo.as_deref(), Some("add `other` to `orgs` of [sentry-work] in credentials.toml"));
+        assert_eq!((r.status, r.credential.as_deref(), r.scope.is_some()), (403, Some("sentry-work"), true));
+    }
+    refused(&org_call(&src, "GET", "/api/0/organizations/ac%6De/releases/"), "org `ac%6De` is outside");
+    assert!(src.asked.borrow().is_empty(), "slugs need no lookup");
+    // Routes without `{org}` aren't fenced.
+    injected(&org_call(&src, "GET", "/api/0/issues/1/"));
+}
+
+#[test]
+fn the_config_narrows_the_credentials_orgs() {
+    let src = OrgSrc::new(&["acme", "Beta"], &["ACME"], &[]);
+    injected(&org_call(&src, "GET", "/api/0/organizations/acme/releases/"));
+    let r = refused(&org_call(&src, "GET", "/api/0/organizations/beta/releases/"), "org `Beta` isn't in `access.sentry.orgs`");
+    assert_eq!(r.todo.as_deref(), Some("add `Beta` to `access.sentry.orgs` in the sandbox's config"));
+    let r = refused(&org_call(&src, "GET", "/api/0/organizations/gamma/"), "outside the orgs credential");
+    assert_eq!(r.todo.as_deref(), Some("add `gamma` to `orgs` of [sentry-work] in credentials.toml"));
+    // A config org the credential doesn't name opens nothing.
+    let src = OrgSrc::new(&["acme"], &["gamma"], &[]);
+    refused(&org_call(&src, "GET", "/api/0/organizations/gamma/"), "outside the orgs credential");
+    refused(&org_call(&src, "GET", "/api/0/organizations/acme/"), "org `acme` isn't in `access.sentry.orgs`");
+}
+
+#[test]
+fn a_credential_naming_no_orgs_reaches_none() {
+    let src = OrgSrc::new(&[], &["acme"], &[]);
+    let r = refused(
+        &org_call(&src, "GET", "/api/0/organizations/acme/releases/"),
+        "`GET /api/0/organizations/acme/releases/` names an org, and credential `sentry-work` names no orgs",
+    );
+    assert_eq!(r.todo.as_deref(), Some("add the orgs it may reach to `orgs` of [sentry-work] in credentials.toml"));
+    injected(&org_call(&src, "GET", "/api/0/"));
+    // A claim without `orgs` fences nothing.
+    let c = Case::new();
+    injected(&c.get("/api/0/organizations/anything/releases/", &bearer(OWN)));
+}
+
+#[test]
+fn an_org_named_by_id_is_placed_by_its_resolved_slug() {
+    let src = OrgSrc::new(&["acme", "beta"], &["acme"], &[("acme", "11"), ("beta", "22")]);
+    injected(&org_call(&src, "GET", "/api/0/organizations/11/releases/"));
+    assert_eq!(*src.asked.borrow(), [("us.sentry.io".to_string(), "acme".to_string())], "the call's upstream");
+    let r = refused(&org_call(&src, "GET", "/api/0/organizations/22/releases/"), "org `beta` isn't in `access.sentry.orgs`");
+    assert_eq!(r.todo.as_deref(), Some("add `beta` to `access.sentry.orgs` in the sandbox's config"));
+    let r = refused(
+        &org_call(&src, "GET", "/api/0/organizations/33/releases/"),
+        "org id `33` is none of the orgs credential `sentry-work` may reach",
+    );
+    assert_eq!(r.todo.as_deref(), Some("add the org's slug to `orgs` of [sentry-work] in credentials.toml"));
+    // A failed lookup, or none, places nothing.
+    let failing = OrgSrc::new(&["acme"], &[], &[]);
+    refused(&org_call(&failing, "GET", "/api/0/organizations/11/releases/"), "org id `11` is none");
+    let mut bare = Src { home: failing.src.home.clone(), access: None };
+    refused(&org_call(&bare, "GET", "/api/0/organizations/11/releases/"), "org id `11` is none");
+    bare.home.get_mut("sentry-work").unwrap().orgs = vec!["acme".into()];
+    injected(&org_call(&bare, "GET", "/api/0/organizations/acme/releases/"));
+}
+
+#[test]
+fn an_org_list_route_hands_serve_the_fence() {
+    let src = OrgSrc::new(&["acme", "beta"], &["beta"], &[]);
+    let o = org_call(&src, "GET", "/api/0/organizations/");
+    let want = OrgList { fields: vec!["id".into(), "slug".into()], allowed: vec!["beta".into()] };
+    assert_eq!(injected(&o).orgs.as_ref(), Some(&want));
+    assert_eq!(injected(&org_call(&src, "GET", "/api/0/users/me/regions/")).orgs, None);
+    let none = OrgSrc::new(&[], &[], &[]);
+    assert_eq!(injected(&org_call(&none, "GET", "/api/0/organizations/")).orgs.as_ref().unwrap().allowed, Vec::<String>::new());
+}

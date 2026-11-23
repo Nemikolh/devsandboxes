@@ -7,6 +7,9 @@
 //! Only `https://<host>[:443]` URLs whose host has a listener on the
 //! instance are touched; anything else (relative, another host, another
 //! port or scheme) passes as is.
+//!
+//! Also the org fence's lists ([`org_list`]): an `orgs.lists` route's
+//! answer cut to the orgs the call may reach, in either mode.
 
 use serde_json::Value;
 
@@ -50,6 +53,40 @@ pub fn json_fields(body: &[u8], fields: &[String], listeners: &[(String, u16)]) 
         changed |= rewrite_at(&mut doc, &path, listeners);
     }
     changed.then(|| serde_json::to_vec(&doc).expect("a parsed JSON value serializes"))
+}
+
+/// `body`, a JSON array, keeping only the elements one of whose top-level
+/// `fields` holds an `allowed` slug (any case) or the id of one: `id_of`
+/// resolves the slugs once, and only for an element whose fields hold all
+/// digits and no slug. `None` when the body isn't a JSON array: the
+/// caller refuses it rather than pass a list it couldn't cut.
+pub fn org_list(body: &[u8], fields: &[String], allowed: &[String], id_of: &dyn Fn(&str) -> Option<String>) -> Option<Vec<u8>> {
+    let Value::Array(items) = serde_json::from_slice(body).ok()? else { return None };
+    let mut ids: Option<Vec<String>> = None;
+    let kept: Vec<Value> = items
+        .into_iter()
+        .filter(|item| {
+            let values: Vec<String> = fields
+                .iter()
+                .filter_map(|f| match item.get(f)? {
+                    Value::String(s) => Some(s.clone()),
+                    Value::Number(n) => n.as_u64().map(|n| n.to_string()),
+                    _ => None,
+                })
+                .collect();
+            if values.iter().any(|v| allowed.iter().any(|a| a.eq_ignore_ascii_case(v))) {
+                return true;
+            }
+            let digits: Vec<&String> =
+                values.iter().filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())).collect();
+            if digits.is_empty() {
+                return false;
+            }
+            let ids = ids.get_or_insert_with(|| allowed.iter().filter_map(|s| id_of(s)).collect());
+            digits.iter().any(|d| ids.contains(d))
+        })
+        .collect();
+    Some(serde_json::to_vec(&Value::Array(kept)).expect("a parsed JSON value serializes"))
 }
 
 fn rewrite_at(v: &mut Value, path: &[&str], listeners: &[(String, u16)]) -> bool {
@@ -128,6 +165,41 @@ mod tests {
         assert_eq!(v["regions"][0]["url"], "http://127.0.0.1:29002/");
         assert_eq!(v["regions"][1]["url"], "https://de.sentry.io", "no listener: untouched");
         assert_eq!(v["regions"][2]["url"], 3);
+    }
+
+    #[test]
+    fn org_lists_keep_the_fences_orgs() {
+        let fields = vec!["slug".to_string(), "id".to_string()];
+        let allowed = vec!["acme".to_string(), "beta".to_string()];
+        let asked = std::cell::Cell::new(0);
+        let id_of = |slug: &str| {
+            asked.set(asked.get() + 1);
+            (slug == "beta").then(|| "22".to_string())
+        };
+        let filter = |v: Value| {
+            let out = org_list(&serde_json::to_vec(&v).unwrap(), &fields, &allowed, &id_of)?;
+            Some(serde_json::from_slice::<Value>(&out).unwrap())
+        };
+        let list = json!([
+            { "slug": "ACME", "id": "11", "name": "Acme" },
+            { "slug": "other", "id": "33" },
+            { "name": "no fields" },
+            "not an object",
+        ]);
+        assert_eq!(filter(list), Some(json!([{ "slug": "ACME", "id": "11", "name": "Acme" }])));
+        assert_eq!(asked.get(), 2, "`other`'s id resolved the allowed slugs once");
+        asked.set(0);
+        let by_id = json!([{ "id": "22" }, { "id": 22 }, { "id": "11" }, { "slug": "x" }, { "slug": "acme" }]);
+        assert_eq!(filter(by_id), Some(json!([{ "id": "22" }, { "id": 22 }, { "slug": "acme" }])));
+        assert_eq!(asked.get(), 2, "once per body");
+        asked.set(0);
+        assert_eq!(filter(json!([{ "slug": "acme" }, { "slug": "x" }])), Some(json!([{ "slug": "acme" }])));
+        assert_eq!(asked.get(), 0, "no digits, no lookup");
+        assert_eq!(filter(json!([])), Some(json!([])));
+        assert_eq!(filter(json!({ "detail": "x" })), None, "not an array");
+        assert_eq!(org_list(b"nope", &fields, &allowed, &id_of), None);
+        let none: Vec<String> = Vec::new();
+        assert_eq!(org_list(br#"[{"slug":"acme"}]"#, &fields, &none, &id_of).as_deref(), Some(&b"[]"[..]));
     }
 
     #[test]

@@ -18,8 +18,12 @@
 //! too: each request's handle forwarded to its stored `href` with its
 //! stored header. Every request leaves one `access.log` line.
 //!
+//! An `orgs.lists` route's answer is cut to the org fence's orgs
+//! ([`rewrite::org_list`]), refused when it's past the rewrite bound or
+//! isn't a JSON array.
+//!
 //! Nothing is cached but GitHub's answers about the repo fence's names
-//! ([`github::Cache`]): `state.toml` per request, `credentials.toml`, the
+//! ([`github::Cache`]) and orgs' ids ([`orgs::Cache`]): `state.toml` per request, `credentials.toml`, the
 //! store and the instance's config only for a call carrying its phantom,
 //! so an edit to any of them applies to the next call.
 
@@ -39,7 +43,7 @@ use super::policy::{self, Action, Call, Context, Injection, Sources};
 use super::redact::Secrets;
 use super::refusal::{Refusal, reason_phrase};
 use super::upstream::{self, Body, Length, Request, Response, Upstream, UpstreamError};
-use super::{github, graphql, guard, intercept, lfs, rewrite, route};
+use super::{github, graphql, guard, intercept, lfs, orgs, rewrite, route};
 use crate::config::{Access, Config};
 use crate::credentials::ca::{Leaf, MemberCa};
 use crate::credentials::claim::{self, Refusal as Shape, Slot};
@@ -85,6 +89,8 @@ pub struct Service {
     lfs: Mutex<lfs::Store>,
     /// What GitHub answered for the fence's names and ids, per credential.
     github: Mutex<github::Cache>,
+    /// What upstreams answered for the org fence's slugs, per credential.
+    orgs: Mutex<orgs::Cache>,
     /// Loaded at the first intercepted connection, so a host that
     /// intercepts nothing never makes a CA key; a failed load is retried.
     ca: Mutex<Option<Arc<RwLock<MemberCa>>>>,
@@ -158,6 +164,7 @@ impl Service {
             lfs: Mutex::new(lfs::Store::new(lfs::MAX_PER_INSTANCE)),
             ca: Mutex::default(),
             github: Mutex::default(),
+            orgs: Mutex::default(),
             log: |_| {},
             notices: Mutex::default(),
             notify: Box::new(|body| {
@@ -375,7 +382,9 @@ impl Service {
             state: &self.state,
             now: Instance::now(),
         });
-        let outcome = policy::decide(&call, &state, &Files { data: &self.data, github: live });
+        let org_https = self.upstream.as_ref().ok().map(|upstream| self.org_https(upstream, &token));
+        let org_live = org_https.as_ref().map(|t| orgs::Live { cache: &self.orgs, transport: t, now: Instance::now() });
+        let outcome = policy::decide(&call, &state, &Files { data: &self.data, github: live, orgs: org_live });
         let pre = batch.map(|(body, _)| body).or(gql.map(|(body, _)| body));
         let cx = outcome.context;
         line.incarnation = cx.incarnation.clone();
@@ -431,6 +440,14 @@ impl Service {
                 }
             }
         }
+    }
+
+    fn org_https<'a>(
+        &'a self,
+        upstream: &'a Upstream,
+        token: &'a dyn Fn(&str) -> Option<crate::credentials::store::Secret>,
+    ) -> orgs::Https<'a> {
+        orgs::Https { upstream, authorities: &self.authorities, private_hosts: &self.private_hosts, token }
     }
 
     fn refuse(
@@ -594,6 +611,37 @@ impl Service {
             kind: cx.kind.as_deref(),
             credential: cx.credential.as_deref(),
         });
+        let list_token = |_: &str| token.clone();
+        let org_https = self.org_https(upstream, &list_token);
+        let org_live = orgs::Live { cache: &self.orgs, transport: &org_https, now: Instance::now() };
+        let org_list = inj.and_then(|i| i.orgs.as_ref().zip(i.claim.orgs.as_ref()).map(|o| (i, o)));
+        let org_list = org_list.filter(|_| (200..300).contains(&resp.status));
+        let org_ids = |slug: &str| {
+            let (inj, (_, fence)) = org_list?;
+            let private = inj.private;
+            let via = orgs::Via { credential: &inj.credential, upstream: upstream_host, private, slot: &inj.slot };
+            orgs::Lookup::id_of(&org_live, &via, fence, slug)
+        };
+        let org_filter = org_list.map(|(inj, (list, _))| OrgFilter {
+            fields: &list.fields,
+            allowed: &list.allowed,
+            id_of: &org_ids,
+            shape: cx.shape.as_ref(),
+            too_large: Refusal {
+                credential: Some(inj.credential.clone()),
+                scope: cx.scope.clone(),
+                ..Refusal::new(
+                    502,
+                    "refused",
+                    format!("`{upstream_host}`'s list of orgs is over {} bytes: too large to filter", rewrite::MAX_REWRITE),
+                )
+            },
+            not_a_list: Refusal {
+                credential: Some(inj.credential.clone()),
+                scope: cx.scope.clone(),
+                ..Refusal::new(502, "refused", format!("`{upstream_host}`'s list of orgs isn't a JSON array: nothing to filter"))
+            },
+        });
         line.status = resp.status;
         let respond = Respond {
             http10: head.version == Version::Http10,
@@ -603,6 +651,7 @@ impl Service {
             listeners: &cx.listeners,
             fields: fields.as_deref(),
             lfs,
+            orgs: org_filter,
             max_rewrite: rewrite::MAX_REWRITE,
         };
         let result = respond.write(resp, w, line);
@@ -825,6 +874,7 @@ impl Service {
             listeners: &[],
             fields: None,
             lfs: None,
+            orgs: None,
             max_rewrite: 0,
         };
         let result = respond.write(resp, w, line);
@@ -1109,7 +1159,31 @@ struct Respond<'a> {
     fields: Option<&'a [String]>,
     /// An injected LFS batch's 200: its actions go behind handles.
     lfs: Option<LfsRewrite<'a>>,
+    /// An `orgs.lists` route's 2xx: cut to the fence's orgs.
+    orgs: Option<OrgFilter<'a>>,
     max_rewrite: usize,
+}
+
+/// An org list's filter ([`rewrite::org_list`]), and the refusals answered
+/// instead of a list too large to read or not a JSON array: passed whole,
+/// it would reach every org the account is in.
+struct OrgFilter<'a> {
+    fields: &'a [String],
+    allowed: &'a [String],
+    id_of: &'a dyn Fn(&str) -> Option<String>,
+    shape: Option<&'a Shape>,
+    too_large: Refusal,
+    not_a_list: Refusal,
+}
+
+impl OrgFilter<'_> {
+    fn refuse(&self, r: &Refusal, w: &mut dyn Write, line: &mut Line, keep: bool) -> io::Result<bool> {
+        line.verdict = r.verdict.to_string();
+        line.reason = Some(r.reason.clone());
+        line.status = r.status;
+        w.write_all(&r.response(self.shape, !keep))?;
+        Ok(keep)
+    }
 }
 
 impl Respond<'_> {
@@ -1153,8 +1227,13 @@ impl Respond<'_> {
 
         let mut body = resp.body;
         let mut prefix = Vec::new();
-        if (self.fields.is_some() || self.lfs.is_some()) && resp.length != Length::Empty {
+        if (self.fields.is_some() || self.lfs.is_some() || self.orgs.is_some()) && resp.length != Length::Empty {
             (&mut body).take(self.max_rewrite as u64 + 1).read_to_end(&mut prefix)?;
+            if let Some(o) = &self.orgs
+                && prefix.len() > self.max_rewrite
+            {
+                return o.refuse(&o.too_large, w, line, keep);
+            }
             if prefix.len() <= self.max_rewrite {
                 // Before masking: the stored header is what goes upstream.
                 let mut out = match &self.lfs {
@@ -1163,6 +1242,12 @@ impl Respond<'_> {
                 };
                 if let Some(s) = self.secrets {
                     s.mask(&mut out);
+                }
+                if let Some(o) = &self.orgs {
+                    match rewrite::org_list(&out, o.fields, o.allowed, o.id_of) {
+                        Some(kept) => out = kept,
+                        None => return o.refuse(&o.not_a_list, w, line, keep),
+                    }
                 }
                 let out = match self.fields {
                     Some(fields) => rewrite::json_fields(&out, fields, self.listeners).unwrap_or(out),
@@ -1265,6 +1350,7 @@ fn pump(
 struct Files<'a> {
     data: &'a Path,
     github: Option<github::Live<'a>>,
+    orgs: Option<orgs::Live<'a>>,
 }
 
 impl Sources for Files<'_> {
@@ -1282,6 +1368,10 @@ impl Sources for Files<'_> {
 
     fn github(&self) -> Option<&dyn github::Lookup> {
         self.github.as_ref().map(|l| l as &dyn github::Lookup)
+    }
+
+    fn orgs(&self) -> Option<&dyn orgs::Lookup> {
+        self.orgs.as_ref().map(|l| l as &dyn orgs::Lookup)
     }
 }
 

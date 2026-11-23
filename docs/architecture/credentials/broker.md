@@ -10,20 +10,22 @@ a call is refused. The design it implements is
 "The broker", "Phantoms", "Policy", "Refusals", "Audit") and
 [github-and-sentry-access](../../plans/active/github-and-sentry-access.md)
 (*The claim contract*, *gh*'s *The repo fence*, *Matching*, *Outside the
-fence*, *sentry*) and [git-gateway](../../plans/active/git-gateway.md)
+fence*, *sentry*, *Sentry's org fence*) and [git-gateway](../../plans/active/git-gateway.md)
 (*The gateway*, "The broker"). What isn't built yet:
 [status](../../status.md#credentials).
 
 Code: `src/broker/serve.rs` (`Service`, `Respond`, `Files`, `pump`),
 `src/broker/policy.rs` (`decide`, `admit_intercept`, `intercept_claim`,
 `Sources`, `Outcome`, `Action`, `Injection`, `Phantom`, `inject`,
-`strip`, `fence_of`, `fence_for`, `graphql_scopes`, `secrets`), `src/broker/github.rs`
-(`Fence`, `Live`), `src/broker/graphql.rs` (`decode`, `parse`,
+`strip`, `fence_of`, `fence_for`, `graphql_scopes`, `check_org`,
+`OrgList`, `secrets`), `src/broker/github.rs`
+(`Fence`, `Live`), `src/broker/orgs.rs` (`place`, `allowed`, `Lookup`,
+`Live`, `Cache`, `Https`), `src/broker/graphql.rs` (`decode`, `parse`,
 `Operation`, `inputs`), `src/broker/intercept.rs`
 (`server_config`, `fold`, `ALPN`), `src/credentials/ca.rs` (`MemberCa`),
 `src/broker/route.rs` (`check_path`, `matches`, `Match`, `scope_of`,
-`Matched`, `git_service`, `is_write`), `src/broker/rewrite.rs`
-(`loopback_url`, `location`, `json_fields`, `MAX_REWRITE`),
+`Matched`, `var_value`, `git_service`, `is_write`), `src/broker/rewrite.rs`
+(`loopback_url`, `location`, `json_fields`, `org_list`, `MAX_REWRITE`),
 `src/broker/refusal.rs` (`Refusal`), `src/broker/audit.rs` (`Audit`,
 `Line`), `src/broker/head.rs`, `src/broker/body.rs`, `src/broker/guard.rs`,
 `src/broker/redact.rs`, `src/broker/upstream/` (`Upstream`),
@@ -85,7 +87,8 @@ request had none. `Expect: 100-continue` is answered only once policy let
 the call through; a refused one gets the refusal instead, and the body is
 never read.
 
-Nothing is cached: `state.toml` per request, and for a call carrying the
+Nothing is cached but the ids the fences resolve ([fence](fence.md#ids),
+[The org fence](#the-org-fence)): `state.toml` per request, and for a call carrying the
 phantom `credentials.toml`, the file store and the instance's config
 (`Config::load` of `Instance::config_dir`, `resolve_sandbox`), so an edit
 to a grant, a secret or `access.<kind>` applies to the next call, no
@@ -136,13 +139,16 @@ only for a call carrying the phantom). First refusal answers:
    refused as an ask; a path past `{repo}` that decodes badly is a `400`.
    `POST /graphql` to a claim with GraphQL routes is decided by its
    operation instead, its mutation inputs placed in the fence here too
-   ([GraphQL](#graphql)), each scope it needs then taking step 10.
+   ([GraphQL](#graphql)), each scope it needs then taking step 11.
 9. **Repo fence**, for a fenced claim ([below](#the-repo-fence)): the
    matched route is placed on a repo or a repository id, repo-less, or
    refused; a repo outside the fence goes upstream stripped, or is
    refused for a write; a renamed repo's old name is sent to its current
    one.
-10. **Scope**: it must be granted (`max`; unset: every scope) and not in
+10. **Org fence**, for a claim with `orgs` ([below](#the-org-fence)): a
+   route holding `orgs.var` must name one of the credential's orgs the
+   config allows, by slug or id, else it's refused, reads included.
+11. **Scope**: it must be granted (`max`; unset: every scope) and not in
    `access.<kind>.ask` (refused: permission requests aren't supported yet; on a
    repo-less route of a fenced claim, refused as never asked, since an
    answer couldn't name a repo), and requested (`access.<kind>.scopes`;
@@ -212,6 +218,41 @@ the query parameter), its response marked `devsandbox-fence: outside`
 the broker's `403` naming `access.<kind>.repos`, so git never falls back
 to a credential prompt and gh never to its login.
 
+### The org fence
+
+A claim's `orgs` (`claim::Orgs`) fences one path variable, `var`
+(Sentry's `{org}`), to the credential's `orgs` in `credentials.toml`
+(`Entry::orgs`), narrowed by the config's `access.<kind>.orgs` when it
+names any (`orgs::allowed`, case-insensitive). It's independent of the
+repo fence and checked after it, on the matched HTTP route only.
+
+A route holding `var` (`route::var_value`: the segment it took, raw, so
+an encoded slug matches nothing) is placed by `policy::check_org` over
+`orgs::place`:
+
+- a credential naming no orgs refuses it, naming `orgs` of the
+  credential in `credentials.toml`;
+- an allowed slug in any case is in;
+- all ASCII digits is an org id (Sentry's slugs never are; the `sentry`
+  CLI names an org by the id in a DSN): in when it's the id of an
+  allowed slug. Ids are learned from `orgs.resolve` with `var` replaced
+  by each of the credential's slugs (allowed ones first; a slug that
+  isn't letters, digits, `_` and `-` is never sent), called with the
+  credential in the claim's slot on the call's own upstream (a region
+  answers for its orgs), its answer's top-level `orgs.id` field (a
+  string or a number). The id the sandbox named is never looked up
+  itself. `orgs::Live` caches each answer per (credential, upstream,
+  slug) for `github::TTL`, a failure or a non-`200` for
+  `github::FAILED_TTL`, which places nothing; `orgs::Https` is the
+  transport over the broker's upstream client;
+- else it's refused, reads too (Sentry has no anonymous reads to send
+  it to instead): an org of the credential's the config leaves out
+  names `access.<kind>.orgs`, any other names `orgs` of the credential.
+
+A route that doesn't hold `var` is unfenced. One listed in `orgs.lists`
+hands `serve` the allowed slugs and the fields (`Injection::orgs`) for
+its answer ([The call](#the-call)).
+
 ### GraphQL
 
 A claim with any `graphql query` or `graphql mutation <name>` route
@@ -256,7 +297,7 @@ The bytes as sent go upstream, `Content-Encoding` and all (and are what a
   whose inputs are all absent is repo-less (never asked); a block
   string, an enum or an object where an input is read is a `400`.
 
-Every scope the fields need must pass step 10; the log line's `scope`
+Every scope the fields need must pass step 11; the log line's `scope`
 lists them, comma-separated.
 
 ## The call
@@ -313,6 +354,17 @@ back through the broker this way.
 An injected LFS batch's `200` is read the same way, but its actions are
 put behind handles before masking (`lfs::rewrite_batch`, [git](git.md#lfs)):
 the header they carry is what goes upstream later.
+
+An injected call to an `orgs.lists` route ([The org fence](#the-org-fence))
+with a `2xx` answer, in either mode, has its body read the same way,
+masked, then cut to the fence (`rewrite::org_list`): a JSON array keeps
+the elements one of whose listed top-level fields holds an allowed slug
+(any case), or the id of one, resolved as the fence does only when an
+element's fields hold all digits and no slug. A body that isn't a JSON
+array, or is past `MAX_REWRITE`, is answered with the broker's `502`
+(verdict `refused`) instead, since passed whole it could list every org
+the account is in. Any other
+status passes unfiltered.
 
 An upstream `401` to an injected call never reaches the tool, which would
 start its own login. A renewable token not renewed for this call is
