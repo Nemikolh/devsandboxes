@@ -1,7 +1,7 @@
 # Credential broker
 
-Status: agreed; building steps 1-3 (with github-and-sentry-access steps
-1-2 and git-gateway step 1), the rest after. The core the other credential plans build on:
+Status: agreed; steps 1-3 built (with github-and-sentry-access steps
+1-2 and git-gateway step 1), building step 4, the rest after. The core the other credential plans build on:
 [github-and-sentry-access](github-and-sentry-access.md),
 [git-gateway](git-gateway.md), [agent-credentials](../explore/agent-credentials.md).
 The whole design, with diagrams, is the site's
@@ -605,9 +605,20 @@ All clients negotiated HTTP/2 with the proxy (*Open questions*).
    `webpki-root-certs` (`webpki-roots` has trust anchors, not whole
    certificates). Hosts a claim's `git` field names stay off the shared
    port: git-gateway step 1 gave them git's own.
-4. Permission requests: API, CLI, dashboard modal; remembered answers;
-   `approvers` (a headless home's asks answered from a laptop); a
-   sandbox's config edit confirmed on the host.
+4. Permission requests: the hold, remembered answers, API, CLI,
+   dashboard modal and desktop popup, `devsbd access wait`, `presence`
+   on REST routes and GraphQL mutations. A request's id is `R-` and 12
+   uppercase base32 characters (no credential name has an uppercase
+   letter, so `access approve|deny|revoke` tell the two apart; unguessable
+   to another instance). *Always* answers are rules on the credential in
+   `credentials.toml` (`[[<credential>.rules]]`), hand-editable beside
+   `max` and `profiles`; *this instance* and deny answers are in
+   `access.json`. Asks open when a daemon drains are lost with the held
+   call (*Open questions*, handoff).
+4b. `presence` on git pushes (the receive-pack commands, with
+   git-gateway step 2's parsing), `approvers` (a headless home's asks
+   answered from a laptop, with step 5's links), a sandbox's config edit
+   confirmed on the host (with agent-credentials).
 5. `CRED` over links and routes; claims signed by the instance's host;
    homes in the membership log. Until then each host is its own
    credentials' home; once the log names one, the other hosts' copies go
