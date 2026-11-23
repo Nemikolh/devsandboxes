@@ -414,7 +414,7 @@ mod tests {
         std::fs::write(
             feature.join("devcontainer-feature.json"),
             r#"{"id": "upd",
-                "mounts": [{"type": "bind", "source": "${sharedVolumes}/upd-bin", "target": "/opt/upd", "readonly": true}],
+                "mounts": [{"type": "bind", "source": "${sharedVolumes}/upd-bin", "target": "/opt/upd"}],
                 "customizations": {"devsandbox": {"updates": [
                     {"name": "upd", "mount": "/opt/upd", "command": ["/bin/false"]}
                 ]}}}"#,

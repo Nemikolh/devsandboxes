@@ -21,8 +21,7 @@
     {
       "type": "bind",
       "source": "${sharedVolumes}/sentry-bin",
-      "target": "/var/lib/devsandbox/sentry/bin",
-      "readonly": true
+      "target": "/var/lib/devsandbox/sentry/bin"
     }
   ],
   "customizations": {

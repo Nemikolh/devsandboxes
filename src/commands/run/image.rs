@@ -105,7 +105,12 @@ pub(super) fn feature_container_opts(
         }
         opts.claims.extend(feature.metadata.credentials.iter().map(|c| (reference.clone(), c.clone())));
         for mount in &feature.metadata.mounts {
-            let resolved = mount.resolve(ctx)?;
+            let mut resolved = mount.resolve(ctx)?;
+            // The feature schema's mounts can't say `readonly`; an update's
+            // dir is written by the update alone, never by a sandbox.
+            if feature.metadata.updates.iter().any(|u| u.mount == resolved.target) {
+                resolved.readonly = true;
+            }
             if let Some(source) = resolved.source.as_deref() {
                 if creatable_feature_source(&resolved.kind, source, ctx.shared_volumes) {
                     guard_create(policy, Path::new(source))?;
@@ -926,6 +931,56 @@ chmod +x ./devcontainer-features-install.sh && \
         Ok(())
     }
 
+    #[test]
+    fn update_mount_is_read_only_though_the_feature_does_not_say_so() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("devsandbox-update-ro-{stamp}"));
+        let feat = dir.join("cfg/features/upd");
+        std::fs::create_dir_all(&feat).unwrap();
+        std::fs::write(
+            feat.join("devcontainer-feature.json"),
+            r#"{"id": "upd",
+            "mounts": [
+                {"type": "bind", "source": "${sharedVolumes}/upd-bin", "target": "/opt/upd"},
+                {"type": "bind", "source": "${sharedVolumes}/upd-rw", "target": "/opt/rw"}
+            ],
+            "customizations": {"devsandbox": {"updates": [
+                {"name": "upd", "mount": "/opt/upd", "command": ["/bin/up"]}
+            ]}}}"#,
+        )
+        .unwrap();
+        let config_dir = dir.join("cfg");
+        let shared = dir.join("shared");
+        let ctx = MountContext {
+            config_dir: config_dir.to_str().unwrap(),
+            workspace_folder: "/host/app",
+            workspace_folder_basename: "app",
+            shared_volumes: shared.to_str().unwrap(),
+            instance: "app",
+            container_env: None,
+        };
+        let props = SandboxProperties {
+            features: Some(BTreeMap::from([(
+                "./features/upd".to_string(),
+                FeatureOptions::Options(BTreeMap::new()),
+            )])),
+            ..Default::default()
+        };
+        let opts = feature_container_opts(&props, &ctx, &[], "/workspaces/app", None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let shared = shared.to_str().unwrap();
+        assert_eq!(
+            opts.unwrap().mounts,
+            [
+                format!("type=bind,source={shared}/upd-bin,target=/opt/upd,readonly"),
+                format!("type=bind,source={shared}/upd-rw,target=/opt/rw"),
+            ]
+        );
+    }
+
     /// Docker-gated: the real derived-image build with a local-folder feature
     /// (`./features/marker` in a temp config dir, not the cwd): resolved in
     /// place, copied into the context as-is (a nested helper file included),
@@ -945,7 +1000,7 @@ chmod +x ./devcontainer-features-install.sh && \
                 "myopt": {"type": "string", "default": "fallback"},
                 "other": {"type": "string", "default": "dflt"}
             },
-            "mounts": [{"type": "bind", "source": "${sharedVolumes}/marker", "target": "/opt/m", "readonly": true}],
+            "mounts": [{"type": "bind", "source": "${sharedVolumes}/marker", "target": "/opt/m"}],
             "customizations": {"devsandbox": {"updates": [
                 {"name": "marker", "mount": "/opt/m", "command": ["/bin/up"], "every": "1d"}
             ]}}}"#,

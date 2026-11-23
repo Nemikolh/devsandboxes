@@ -122,7 +122,8 @@ Order (install order) and the lack of arguments are the same.
   created like a config mount's (`creatable_feature_source`: devsandbox's own
   state, e.g. a feature's per-instance dirs). Skipped with a warning: unknown
   variable, any other missing bind source, a file bind on a runtime without
-  file binds.
+  file binds. The target of one of the feature's own updates is mounted
+  read-only.
 - `privileged`: OR-ed with the sandbox's `privileged` (`false` can't veto a
   feature). Skipped with a warning where the runtime has no `--privileged`.
 
@@ -135,9 +136,11 @@ Order (install order) and the lack of arguments are the same.
   `[a-z0-9][a-z0-9-]*`, at most 32 bytes, the key the config's `updates`
   table and the CLI use, so one namespace across a sandbox's features
   (an image whose label lists a name twice runs neither). `mount` is the target of one of the feature's
-  own `mounts`, which must be a read-only bind of a dir under
-  `${sharedVolumes}/` (no `..`): the one dir the update writes, read-only
-  in every sandbox. `command` is an argv run in the feature's image,
+  own `mounts`, which must be a bind of a dir under `${sharedVolumes}/`
+  (no `..`, no `${instance}` or `${devcontainerId}`): the one dir the
+  update writes. Every sandbox mounts it
+  read-only whatever the mount says (`feature_container_opts`): the
+  feature schema's mounts have no `readonly`. `command` is an argv run in the feature's image,
   `command[0]` an absolute path. `every` is `<n>h`, `<n>d` or `<n>w`
   (`updates::parse_duration`), default `7d` (`updates::DEFAULT_EVERY`).
   Unknown fields, a bad entry or a name declared twice fail the feature's

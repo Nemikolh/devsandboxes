@@ -1226,7 +1226,7 @@ mod tests {
     fn metadata_reads_updates() {
         let json = r#"{
             "id": "gh",
-            "mounts": [{"type": "bind", "source": "${sharedVolumes}/gh-bin", "target": "/var/lib/gh/bin", "readonly": true}],
+            "mounts": [{"type": "bind", "source": "${sharedVolumes}/gh-bin", "target": "/var/lib/gh/bin"}],
             "customizations": {"devsandbox": {"updates": [
                 {"name": "gh", "mount": "/var/lib/gh/bin", "command": ["/usr/local/lib/gh/gh-update"]}
             ]}}

@@ -171,26 +171,25 @@ fn mount_source(target: &str, mounts: &[Mount]) -> Option<String> {
     })
 }
 
-/// `target` must be one of the feature's `mounts`, a read-only bind of a dir
-/// under `${sharedVolumes}`: the only dir the update writes, and one no
-/// sandbox can write.
+/// `target` must be one of the feature's `mounts`, a bind of a dir under
+/// `${sharedVolumes}`: the only dir the update writes. Sandboxes get it
+/// read-only whatever the mount says (`feature_container_opts`).
 fn check_mount(target: &str, mounts: &[Mount]) -> Result<()> {
     let found = mounts.iter().find_map(|m| {
-        let (kind, source, t, readonly) = match m {
-            Mount::Shorthand(s) => parse_shorthand(s).ok()?,
-            Mount::Object(o) => (o.kind.clone(), o.source.clone(), o.target.clone(), o.readonly.unwrap_or(false)),
+        let (kind, source, t) = match m {
+            Mount::Shorthand(s) => parse_shorthand(s).map(|(kind, source, t, _)| (kind, source, t)).ok()?,
+            Mount::Object(o) => (o.kind.clone(), o.source.clone(), o.target.clone()),
         };
-        (t == target).then_some((kind, source, readonly))
+        (t == target).then_some((kind, source))
     });
-    let Some((kind, source, readonly)) = found else {
+    let Some((kind, source)) = found else {
         bail!("`{}` isn't the target of one of the feature's `mounts`", target.escape_debug());
     };
-    let shared = source.as_deref().is_some_and(under_shared_volumes);
+    let shared = source
+        .as_deref()
+        .is_some_and(|s| under_shared_volumes(s) && !INSTANCE_VARS.iter().any(|v| s.contains(v)));
     if kind.as_deref().unwrap_or("bind") != "bind" || !shared {
-        bail!("`{}` must be a bind of a dir under `${{sharedVolumes}}`", target.escape_debug());
-    }
-    if !readonly {
-        bail!("`{}` must be mounted read-only", target.escape_debug());
+        bail!("`{}` must be a bind of a dir under `${{sharedVolumes}}` every instance shares", target.escape_debug());
     }
     Ok(())
 }
@@ -289,12 +288,13 @@ mod tests {
 
     fn mounts() -> Vec<Mount> {
         serde_json::from_value(json!([
-            {"type": "bind", "source": "${sharedVolumes}/gh-bin", "target": "/var/lib/gh/bin", "readonly": true},
-            "type=bind,source=${sharedVolumes}/tool,target=/opt/tool,readonly",
-            {"type": "bind", "source": "${sharedVolumes}/rw", "target": "/rw"},
+            {"type": "bind", "source": "${sharedVolumes}/gh-bin", "target": "/var/lib/gh/bin"},
+            "type=bind,source=${sharedVolumes}/tool,target=/opt/tool",
+            {"type": "bind", "source": "${sharedVolumes}/ro", "target": "/ro", "readonly": true},
             {"type": "bind", "source": "/etc/hosts", "target": "/host"},
-            {"type": "volume", "source": "${sharedVolumes}/v", "target": "/vol", "readonly": true},
-            {"type": "bind", "source": "${sharedVolumes}/../x", "target": "/up", "readonly": true},
+            {"type": "volume", "source": "${sharedVolumes}/v", "target": "/vol"},
+            {"type": "bind", "source": "${sharedVolumes}/../x", "target": "/up"},
+            {"type": "bind", "source": "${sharedVolumes}/x/${instance}", "target": "/each"},
         ]))
         .unwrap()
     }
@@ -375,6 +375,8 @@ mod tests {
     fn refusals() {
         let e = format!("{:#}", from_customizations("gh", Some(&custom(json!({}))), &[]).unwrap_err());
         assert!(e.contains("must be a list"), "{e}");
+        // A mount that says `readonly` is as good as one that doesn't.
+        parse_one(json!({"name": "ro", "mount": "/ro", "command": ["/bin/up"]})).unwrap();
 
         let ok = |extra: Value| {
             let mut v = json!({"name": "gh", "mount": "/var/lib/gh/bin", "command": ["/bin/up"]});
@@ -390,10 +392,10 @@ mod tests {
             (ok(json!({"every": "0d"})), "`every`"),
             (ok(json!({"every": "never"})), "`every`"),
             (ok(json!({"mount": "/nope"})), "isn't the target of one of the feature's `mounts`"),
-            (ok(json!({"mount": "/rw"})), "must be mounted read-only"),
             (ok(json!({"mount": "/host"})), "must be a bind of a dir under `${sharedVolumes}`"),
             (ok(json!({"mount": "/vol"})), "must be a bind of a dir under `${sharedVolumes}`"),
             (ok(json!({"mount": "/up"})), "must be a bind of a dir under `${sharedVolumes}`"),
+            (ok(json!({"mount": "/each"})), "every instance shares"),
         ];
         for (update, want) in cases {
             let e = err(update.clone());

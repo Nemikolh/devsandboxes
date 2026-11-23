@@ -20,8 +20,7 @@
     {
       "type": "bind",
       "source": "${sharedVolumes}/gh-bin",
-      "target": "/var/lib/devsandbox/gh/bin",
-      "readonly": true
+      "target": "/var/lib/devsandbox/gh/bin"
     }
   ],
   "customizations": {
