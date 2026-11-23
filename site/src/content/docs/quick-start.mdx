@@ -30,16 +30,7 @@ Or copy the repo's `skills/` folder to wherever your agent reads skills from.
 
 A config root is a folder outside your repos with one `devsandboxes.toml`. Each sandbox points at a repo with `folder`, relative to it.
 
-<AgentPrompt
-  goal="Create a devsandbox config dir at ~/code/sandboxes with a devsandboxes.toml holding a sandbox for my repo at ~/code/web, plus a postgres service it can use."
-  steps={[
-    'Look at ~/code/web to pick the base image, devcontainer Features and `postCreateCommand` it needs. If it has a `.devcontainer/devcontainer.json`, port that instead.',
-    'Put the shared parts in a `[template.base]` the sandbox `extends`, and add a `[services.database]` on `postgres:16` with `scope = "global"`, listed in the sandbox\'s `services`.',
-  ]}
-  verify={[
-    'Run `devsandbox -C <config dir> run <sandbox name>`, then `devsandbox -C <config dir> exec <instance> <the repo\'s test command>`, and report what happened.',
-  ]}
-/>
+<AgentPrompt prompt="quick-start" />
 
 Or write it yourself, in `~/code/sandboxes/devsandboxes.toml`:
 

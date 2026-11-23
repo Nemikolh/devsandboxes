@@ -42,13 +42,4 @@ const browser = await chromium.launch({
 
 ## Agent instructions
 
-<AgentPrompt
-  goal="Make the browser tests of my repo at <repo path> keep Chromium's sandbox wherever my devsandbox sandbox <sandbox name> supports it."
-  steps={[
-    'Find where the repo launches a browser. For Playwright, pass `chromiumSandbox: !!process.env.DEVSANDBOX_BROWSER_SANDBOX` and `executablePath: process.env.DEVSANDBOX_CHROME`.',
-    'Remove any hand-added `--no-sandbox` flag. Do not change the sandbox\'s `userns`.',
-  ]}
-  verify={[
-    'Run `devsandbox -C <config dir> run <sandbox name>`, report its `browser sandbox:` line, then run the browser tests in the instance and report what happened.',
-  ]}
-/>
+<AgentPrompt prompt="browsers" />

@@ -61,13 +61,4 @@ devsandbox service ls
 
 ## Agent instructions
 
-<AgentPrompt
-  goal="Give my devsandbox sandboxes one shared Postgres, and every instance its own private Redis."
-  steps={[
-    'Add `[services.postgres]` with the Postgres version the repo targets, `scope = "global"` and `POSTGRES_PASSWORD` in `env`. Add `[services.redis]` without a `scope`.',
-    'List both in `services` of a template every sandbox extends, with `containerEnv` pointing the variables the repo reads at hosts `postgres` and `redis`.',
-  ]}
-  verify={[
-    'Start two instances with `devsandbox -C <config dir> run <sandbox> --name <task>` and check `devsandbox -C <config dir> service ls` shows one postgres and a redis per instance.',
-  ]}
-/>
+<AgentPrompt prompt="services" />

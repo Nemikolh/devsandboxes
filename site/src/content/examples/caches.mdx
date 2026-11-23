@@ -43,12 +43,4 @@ devsandbox run web --name fix-login    # served from the cache
 
 ## Agent instructions
 
-<AgentPrompt
-  goal="Share package caches across my devsandbox sandboxes so new instances stop re-downloading dependencies."
-  steps={[
-    'Find which package managers my sandboxes use and add them to `caches`, in a template every sandbox `extends` if there is one.',
-  ]}
-  verify={[
-    'Existing instances now drift: list them with `devsandbox -C <config dir> ps -a` and ask me before running `devsandbox -C <config dir> rebuild <instance>` on each.',
-  ]}
-/>
+<AgentPrompt prompt="caches" />

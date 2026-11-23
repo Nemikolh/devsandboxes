@@ -1,14 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import {
-  buildAgentPrompt,
-  exampleNumber,
-  type ExampleMeta,
-  promptParts,
-  promptRuns,
-  promptWords,
-  resolveRelated,
-  sortExamples,
-} from './examples';
+import { AGENT_PROMPTS } from './agent-prompts';
+import { AGENTS, fillAgent } from './agents';
+import { buildAgentPrompt, exampleNumber, type ExampleMeta, resolveRelated, sortExamples } from './examples';
 
 const ex = (id: string, order: number, related?: string[]): ExampleMeta => ({
   id,
@@ -45,70 +38,28 @@ describe('resolveRelated', () => {
 });
 
 describe('buildAgentPrompt', () => {
-  it('frames the steps with the shared skill, validate and safety items', () => {
-    const prompt = buildAgentPrompt({ goal: 'Set up X.', steps: ['Edit A.', 'Edit B.'], verify: ['Run C.'] });
+  it('frames the steps with the shared skill, specifics, validate and safety items', () => {
+    const prompt = buildAgentPrompt({ summary: 'X.', goal: 'Set up X.', steps: ['Edit A.', 'Edit B.'], verify: ['Run C.'] });
     const lines = prompt.split('\n');
     expect(lines[0]).toBe('Set up X.');
     expect(lines[1]).toBe('');
     expect(lines[2]).toMatch(/^1\. Read the devsandbox-cli and config-toml-spec skills/);
     expect(lines[2]).toContain('https://github.com/Nemikolh/devsandboxes/tree/main/skills');
-    expect(lines[3]).toMatch(/^2\. Find my devsandbox config dir.*ask me/);
+    expect(lines[3]).toMatch(/^2\. Work out the specifics yourself.*Ask me only for what you cannot determine\.$/);
     expect(lines[4]).toBe('3. Edit A.');
     expect(lines[5]).toBe('4. Edit B.');
-    expect(lines[6]).toMatch(/^5\. Validate with `devsandbox -C <config dir> ls`/);
+    expect(lines[6]).toMatch(/^5\. Validate with `devsandbox ls`/);
     expect(lines[7]).toBe('6. Run C.');
     expect(lines[8]).toMatch(/^7\. Ask me before anything destructive: devsandbox rm, gc, rebuild --force/);
     expect(lines).toHaveLength(9);
   });
 });
 
-describe('promptParts', () => {
-  it('splits out <placeholders>, keeping the brackets', () => {
-    expect(promptParts('cd <repo path> && ls')).toEqual([
-      { text: 'cd ', placeholder: false },
-      { text: '<repo path>', placeholder: true },
-      { text: ' && ls', placeholder: false },
-    ]);
-  });
-
-  it('leaves comparisons and non-word brackets alone', () => {
-    expect(promptParts('a < b and c > d')).toEqual([{ text: 'a < b and c > d', placeholder: false }]);
-    expect(promptParts('<config dir>')).toEqual([{ text: '<config dir>', placeholder: true }]);
-  });
-});
-
-describe('promptRuns', () => {
-  it('marks backtick runs as code and finds placeholders inside them', () => {
-    expect(promptRuns('Run `ls -C <dir>` now')).toEqual([
-      { code: false, parts: [{ text: 'Run ', placeholder: false }] },
-      {
-        code: true,
-        parts: [
-          { text: 'ls -C ', placeholder: false },
-          { text: '<dir>', placeholder: true },
-        ],
-      },
-      { code: false, parts: [{ text: ' now', placeholder: false }] },
-    ]);
-    expect(promptRuns('`a`')).toEqual([{ code: true, parts: [{ text: 'a', placeholder: false }] }]);
-  });
-});
-
-describe('promptWords', () => {
-  const p = (text: string, placeholder = false) => ({ text, placeholder });
-
-  it('splits on whitespace and glues placeholders to adjacent text', () => {
-    expect(promptWords([p('devsandbox -C '), p('<config dir>', true), p(' ls')])).toEqual([
-      { parts: [p('devsandbox')] },
-      { space: ' ' },
-      { parts: [p('-C')] },
-      { space: ' ' },
-      { parts: [p('<config dir>', true)] },
-      { space: ' ' },
-      { parts: [p('ls')] },
-    ]);
-    expect(promptWords([p('[sandbox.'), p('<sandbox name>', true), p(']')])).toEqual([
-      { parts: [p('[sandbox.'), p('<sandbox name>', true), p(']')] },
-    ]);
+describe('AGENT_PROMPTS', () => {
+  // The reader pastes a prompt as copied, so nothing in it is left to fill in.
+  it.each(Object.entries(AGENT_PROMPTS))('%s has no placeholder once copied', (_, spec) => {
+    for (const agent of AGENTS) {
+      expect(fillAgent(buildAgentPrompt(spec), agent)).not.toMatch(/<[^>\n]*>/);
+    }
   });
 });

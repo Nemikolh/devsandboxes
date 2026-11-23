@@ -57,6 +57,8 @@ export function resolveRelated<T extends ExampleMeta>(entry: T, all: T[]): T[] {
 export const SKILLS_URL = 'https://github.com/Nemikolh/devsandboxes/tree/main/skills';
 
 export interface AgentPromptSpec {
+  /** What the prompt sets up, a few words, shown on the copy button. */
+  summary: string;
   /** What to set up, one or two sentences. */
   goal: string;
   /** The use-case-specific edits, in order. */
@@ -67,79 +69,17 @@ export interface AgentPromptSpec {
 
 /**
  * The full prompt: the use-case steps framed by the parts every example
- * shares (read the skills, find the config dir, validate, ask before
+ * shares (read the skills, work out the specifics, validate, ask before
  * destructive actions), so all prompts stay consistent.
  */
-export function buildAgentPrompt(spec: AgentPromptSpec): string {
-  return [spec.goal, '', ...agentPromptItems(spec).map((s, i) => `${i + 1}. ${s}`)].join('\n');
-}
-
-/** The numbered items of `buildAgentPrompt`, for rendering them as a list. */
-export function agentPromptItems({ steps, verify }: AgentPromptSpec): string[] {
-  return [
+export function buildAgentPrompt({ goal, steps, verify }: AgentPromptSpec): string {
+  const items = [
     `Read the devsandbox-cli and config-toml-spec skills first (load them if they are installed, otherwise read them from ${SKILLS_URL}). Follow them over your own assumptions: unknown config keys are hard errors.`,
-    'Find my devsandbox config dir: the folder holding devsandboxes.toml, passed to devsandbox as `-C <config dir>`. If you cannot tell which one, ask me.',
+    "Work out the specifics yourself: the repo is the one you are running in; my devsandbox config dir is the folder holding devsandboxes.toml (devsandbox runs in it, or takes it with `-C`), usually the one whose sandboxes' `folder` points at this repo; `devsandbox ls` there lists its sandboxes and `devsandbox ps -a` the instances and services that exist. Pick names that fit the ones already there. Ask me only for what you cannot determine.",
     ...steps,
-    'Validate with `devsandbox -C <config dir> ls` and fix every error it reports before going on.',
+    'Validate with `devsandbox ls` in the config dir and fix every error it reports before going on.',
     ...verify,
     'Ask me before anything destructive: devsandbox rm, gc, rebuild --force, service rebuild, deleting files or branches.',
   ];
-}
-
-export interface PromptPart {
-  text: string;
-  placeholder: boolean;
-}
-
-/** Split prompt text into plain runs and `<placeholder>` runs (kept with brackets). */
-export function promptParts(text: string): PromptPart[] {
-  return text
-    .split(/(<[a-z][^<>\n]*>)/i)
-    .filter((t) => t !== '')
-    .map((t) => ({ text: t, placeholder: /^<[a-z][^<>\n]*>$/i.test(t) }));
-}
-
-export interface PromptRun {
-  code: boolean;
-  parts: PromptPart[];
-}
-
-export type PromptWord = { space: string } | { parts: PromptPart[] };
-
-/**
- * A code run's parts regrouped into words: whitespace between them, and each
- * word the plain text and `<placeholders>` it's glued from (`[sandbox.` +
- * `<sandbox name>` + `]` is one word). Rendered as unbreakable boxes, so a
- * line wraps between words, not after `-` in `-C` or at a placeholder's edge.
- */
-export function promptWords(parts: PromptPart[]): PromptWord[] {
-  const words: PromptWord[] = [];
-  let current: PromptPart[] = [];
-  const flush = () => {
-    if (current.length) words.push({ parts: current });
-    current = [];
-  };
-  for (const part of parts) {
-    if (part.placeholder) {
-      current.push(part);
-      continue;
-    }
-    for (const piece of part.text.split(/(\s+)/)) {
-      if (piece === '') continue;
-      if (/^\s+$/.test(piece)) {
-        flush();
-        words.push({ space: piece });
-      } else current.push({ text: piece, placeholder: false });
-    }
-  }
-  flush();
-  return words;
-}
-
-/** Backtick runs (odd ones are `code`), each split by `promptParts`. */
-export function promptRuns(text: string): PromptRun[] {
-  return text
-    .split('`')
-    .map((run, i) => ({ code: i % 2 === 1, parts: promptParts(run) }))
-    .filter((r) => r.parts.length > 0);
+  return [goal, '', ...items.map((s, i) => `${i + 1}. ${s}`)].join('\n');
 }

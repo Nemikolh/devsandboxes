@@ -75,14 +75,4 @@ Other properties carry over as they are. The full list is in the [config referen
 
 ## Agent instructions
 
-<AgentPrompt
-  goal="Port the devcontainer.json of my repo at <repo path> to a sandbox in my devsandbox devsandboxes.toml."
-  steps={[
-    'Read <repo path>/.devcontainer/devcontainer.json and any Dockerfile or docker-compose.yml it references; do not modify them.',
-    'Add a `[sandbox.<sandbox name>]` with `folder` pointing at <repo path> and copy the implemented properties over; rebase `build` paths onto the config dir.',
-    'Drop the properties the config-toml-spec lists as ignored and tell me what each did; turn compose services into `[services.*]` listed in `services`.',
-  ]}
-  verify={[
-    'Run `devsandbox -C <config dir> run <sandbox name>` and report any `warning:` lines.',
-  ]}
-/>
+<AgentPrompt prompt="port-a-devcontainer" />

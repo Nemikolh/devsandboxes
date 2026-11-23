@@ -6,11 +6,12 @@ import { close, createIndex } from 'pagefind';
 
 /**
  * Chrome that sits inside indexed regions but isn't content: code-block
- * headers (label + copy button), the agent prompt's copy button, heading `#`
- * permalinks, the decorative title period. One list here instead of
- * `data-pagefind-ignore` sprinkled over every component that renders them.
+ * headers (label + copy button), the agent prompt's copy card (the same
+ * labels on every page), heading `#` permalinks, the decorative title
+ * period. One list here instead of `data-pagefind-ignore` sprinkled over
+ * every component that renders them.
  */
-export const EXCLUDE_SELECTORS = ['.code-head', '.agent-prompt-copy', '.heading-anchor', '.title-period'];
+export const EXCLUDE_SELECTORS = ['.code-head', '.agent-prompt', '.heading-anchor', '.title-period'];
 
 /**
  * Pagefind's stock UI bundles, which `writeFiles` always emits (no option to

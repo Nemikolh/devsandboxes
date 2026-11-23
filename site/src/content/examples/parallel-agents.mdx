@@ -88,13 +88,4 @@ When a task is done, push its branch and `devsandbox rm add-profile-pic`.
 
 ## Agent instructions
 
-<AgentPrompt
-  goal="Set up devsandbox so several <agent> sessions can work on my repo at <repo path> in parallel, each in its own sandbox instance on its own git worktree and branch."
-  steps={[
-    'In devsandboxes.toml, add a `[sandbox.<sandbox name>]` whose `folder` points at <repo path>, with an `image` that has the repo\'s toolchain. Install <agent> in `postCreateCommand` and mount its host config dir into the container.',
-    'Put gitignored files every instance needs, like .env, in `worktree-link`.',
-  ]}
-  verify={[
-    'Start one instance per task with `devsandbox -C <config dir> run <sandbox name> --name <task>` for each of <task names>, and check `git status` in each shows its own branch.',
-  ]}
-/>
+<AgentPrompt prompt="parallel-agents" />
