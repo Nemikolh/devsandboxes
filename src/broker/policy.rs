@@ -62,22 +62,27 @@
 //!     or [`Sources::granted`] goes through, and the first other one is
 //!     [`Action::Ask`]: the caller holds the call for an answer and
 //!     decides again ([`super::asks`]). An `upload` LFS batch needs the
-//!     claim's `lfs.upload` scope instead of its route's.
+//!     claim's `lfs.upload` scope instead of its route's. After the scope
+//!     asks, each target of a `presence` route or mutation the call is
+//!     ([`presence`]; an id resolved by the home, else refused) is asked
+//!     the same way, keyed by route and target too, whatever its scope
+//!     allows, and no rule answers it.
 //!
 //! A git smart-HTTP request ([`route::git_service`]) is refused in git's
 //! shape whatever the claim's: git prints a text body.
 //!
 //! Not here yet: token and registration endpoints a claim marks (no claim
-//! field for them), REST body inputs in the fence, `presence` (passes
-//! until step 4).
+//! field for them), REST body inputs in the fence, `presence` `ref` entries
+//! (git pushes).
 
 use anyhow::Result;
 
-use super::asks::{self, Ask, AskKey};
+use super::asks::{self, Ask, AskKey, PresenceAt};
 use super::github::{self, Place};
 use super::graphql;
 use super::head::{RequestHead, header_indices};
 use super::orgs;
+use super::presence;
 use super::redact;
 use super::refusal::Refusal;
 use super::route::{self, Scoped};
@@ -132,6 +137,9 @@ pub struct Call<'a> {
     /// A GraphQL request's operation, read from its body before policy
     /// ([`graphql::parse`]) when the claim has GraphQL routes.
     pub graphql: Option<&'a graphql::Operation>,
+    /// A presence route's JSON body, read before policy when
+    /// [`presence::reads_body`].
+    pub body: Option<&'a serde_json::Value>,
 }
 
 /// Which phantom a call carried, for the log: never its value.
@@ -383,13 +391,17 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
     let call_route = format!("{} {}", head.method, route::path_only(path));
     let mut renamed = None;
     let mut org_list = None;
+    let mut presence_needs = Vec::new();
     let needed = if approved.graphql() && route::graphql(&head.method, path) {
         let Some(op) = call.graphql else {
             return Err(internal("a GraphQL request reached policy with its document unread"));
         };
         let mut fence = approved.fenced().then(|| fence_for(inst, &access, state, sources, &approved, name));
-        graphql_scopes(&approved, op, fence.as_mut(), kind, cx)?
+        graphql_scopes(&approved, op, fence.as_mut(), kind, cx, &mut presence_needs)?
     } else {
+        if call.body.is_none() && presence::reads_body(&approved, &head.method, path) {
+            return Err(internal("a presence call reached policy with its body unread"));
+        }
         let matched = route::scope_of(&approved, &head.method, path).map_err(|why| Refusal::new(400, "refused", why))?;
         cx.scope = Some(matched.scoped.name().to_string());
         let lfs_upload = approved.lfs.as_ref().filter(|_| call.lfs == Some(route::LfsOp::Upload));
@@ -478,6 +490,13 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
                 }
             }
         }
+        let found = presence::http(&approved, &head.method, path, call.body).map_err(|u| unnamed(&call_route, u))?;
+        presence_needs.extend(found.into_iter().map(|found| PresenceNeed {
+            scope: scope.clone(),
+            repo: repo.clone(),
+            route: call_route.clone(),
+            found,
+        }));
         vec![Need { scope, repo, repo_less, other }]
     };
     // Every refusal before any ask, so an answer is never followed by one.
@@ -497,21 +516,53 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
             "scope `{scope}` is in `access.{kind}.ask`, but `{call_route}` names no repo, so it's never asked"
         )));
     }
-    let mut open = Vec::new();
-    for n in needed.iter().filter(|n| asked(n)) {
-        let ask_key = AskKey {
-            instance_id: inst.instance_id.clone(),
-            credential: name.to_string(),
-            scope: n.scope.clone(),
-            repo: n.repo.clone(),
+    let key_of = |scope: &str, repo: &Option<String>, presence: Option<PresenceAt>| AskKey {
+        instance_id: inst.instance_id.clone(),
+        credential: name.to_string(),
+        scope: scope.to_string(),
+        repo: repo.clone(),
+        presence,
+    };
+    let mut keys: Vec<AskKey> = needed.iter().filter(|n| asked(n)).map(|n| key_of(&n.scope, &n.repo, None)).collect();
+    // Presence after the scope asks, each target resolved by the home now:
+    // one that can't be named is refused, before any ask.
+    let api = approved.upstreams.iter().find(|u| u.host == github::API);
+    let lookup = sources.github().zip(api).map(|(l, u)| (l, github::Via { credential: name, private: u.private }));
+    let own_path = route::path_only(renamed.as_deref().unwrap_or(path));
+    for p in presence_needs {
+        let target = match &p.found.named {
+            presence::Named::Target(s) => Ok(s.clone()),
+            presence::Named::Release => {
+                lookup.and_then(|(l, via)| l.release_tag(&via, own_path)).ok_or("the release doesn't resolve to its `tag_name`")
+            }
+            presence::Named::RefNode(id) => {
+                lookup.and_then(|(l, via)| l.ref_name(&via, id)).ok_or("the ref doesn't resolve to its name")
+            }
         };
+        let target = target.map_err(|why| unnamed(&p.route, presence::Unnamed { field: p.found.field, why: why.into() }))?;
+        // A ref the claim's `ref` entries don't name for this operation
+        // isn't presence: the call is any other of its scope.
+        if p.found.ref_op.is_some_and(|op| !presence::ref_asked(&approved, &target, op)) {
+            continue;
+        }
+        let key = key_of(&p.scope, &p.repo, Some(PresenceAt { route: p.route, target }));
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    let mut open = Vec::new();
+    for ask_key in keys {
         let kept = sources
             .remembered(&ask_key)
             .map_err(|e| Refusal::new(503, "error", format!("cannot read the kept answers: {e:#}")))?;
+        let ruled = || {
+            ask_key.presence.is_none()
+                && entry.rule_for(&ask_key.scope, ask_key.repo.as_deref(), &inst.sandbox, profile).is_some()
+        };
         match kept {
             Some(r) if r.answer == Kind::Deny => return Err(asks::denied(&r.id)),
             Some(_) => {}
-            None if entry.rule_for(&n.scope, n.repo.as_deref(), &inst.sandbox, profile).is_some() => {}
+            None if ruled() => {}
             None => open.push(ask_key),
         }
     }
@@ -544,6 +595,22 @@ fn steps(call: &Call<'_>, state: &State, sources: &dyn Sources, cx: &mut Context
         path: renamed,
         orgs: org_list,
     })))
+}
+
+/// A presence target of a call, before the home resolves it.
+struct PresenceNeed {
+    scope: String,
+    repo: Option<String>,
+    /// What the key names: `<METHOD> <path>` or `graphql mutation <name>`.
+    route: String,
+    found: presence::Found,
+}
+
+fn unnamed(route: &str, u: presence::Unnamed) -> Refusal {
+    Refusal::refused(format!(
+        "`{route}` is a presence call (always asked), and the broker can't name its target (`{}`: {})",
+        u.field, u.why
+    ))
 }
 
 /// `value`, the org a route's `orgs.var` took, against the fence.
@@ -586,6 +653,7 @@ fn graphql_scopes(
     mut fence: Option<&mut github::Fence<'_>>,
     kind: &str,
     cx: &mut Context,
+    presence_needs: &mut Vec<PresenceNeed>,
 ) -> Result<Vec<Need>, Refusal> {
     let scope_of = |route: &claim::Route, cx: &mut Context| {
         if claim.never.contains(route) {
@@ -635,6 +703,11 @@ fn graphql_scopes(
         }
         if repos.is_empty() {
             repos.push(None);
+        }
+        let found = presence::mutation(claim, f).map_err(|u| unnamed(&route.to_string(), u))?;
+        for (found, repo) in found.iter().flat_map(|fd| repos.iter().map(move |r| (fd, r))) {
+            let route = route.to_string();
+            presence_needs.push(PresenceNeed { scope: scope.clone(), repo: repo.clone(), route, found: found.clone() });
         }
         for repo in repos {
             match needed.iter_mut().find(|n| n.scope == scope && n.repo == repo) {

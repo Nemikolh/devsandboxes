@@ -1,7 +1,7 @@
 # Credential broker
 
-Status: agreed; steps 1-3 built (with github-and-sentry-access steps
-1-2 and git-gateway step 1), building step 4, the rest after. The core the other credential plans build on:
+Status: agreed; steps 1-4 built (with github-and-sentry-access steps
+1-2 and git-gateway step 1), step 4b and steps 5-7 after. The core the other credential plans build on:
 [github-and-sentry-access](github-and-sentry-access.md),
 [git-gateway](git-gateway.md), [agent-credentials](../explore/agent-credentials.md).
 The whole design, with diagrams, is the site's
@@ -100,7 +100,7 @@ the guarantee; `devsandbox vscode` warns, git-gateway).
   as `worker_policy` does for worker trust. A sandbox that needs the config
   gets its files read-only, one bind each (agent-credentials); an edit it
   wants to the live config is a host-side confirm (the diff shown as a
-  permission request, step 4), with ADR 0049 signing on top from step 6.
+  permission request, step 4b), with ADR 0049 signing on top from step 6.
   The config refusal holds without claims (an edit could hand a sibling or the next
   `rebuild` claims), so a config inside its own `folder` (`folder = "."`)
   stops running: move it beside the repo.
@@ -588,7 +588,7 @@ All clients negotiated HTTP/2 with the proxy (*Open questions*).
    renewal behind the phantom with the 401 replay and the `check` route
    marking a credential broken ([broker](../../architecture/credentials/broker.md)),
    `access ls|revoke`. Approvers aren't notified of a broken credential
-   until step 4.
+   until step 4b.
    No claim `scope` for them yet (GitHub Apps take none); one would join
    the pinned `login` entry and so the claim's version.
 3. The member CA (`rcgen` for leaves), intercept mode, trust installed
@@ -615,6 +615,23 @@ All clients negotiated HTTP/2 with the proxy (*Open questions*).
    `max` and `profiles`; *this instance* and deny answers are in
    `access.json`. Asks open when a daemon drains are lost with the held
    call (*Open questions*, handoff).
+   Built: all of it, for REST routes and GraphQL mutations
+   ([broker](../../architecture/credentials/broker.md#permission-requests)):
+   the hold and `asks::Registry` (joins, the caps, late `once` grants),
+   kept answers in `access.json` and rules in `credentials.toml`, the
+   `access.*` methods ([API](../../reference/api.md#access)), `access
+   pending|approve|deny|revoke <request>`
+   ([credentials CLI](../../reference/credentials-cli.md#permission-requests)),
+   the dashboard modal
+   ([dashboard](../../architecture/dashboard/tabs-and-actions.md#permission-requests)),
+   the popup, `devsbd access wait`, and `presence`
+   ([broker](../../architecture/credentials/broker.md#presence)): REST
+   path and body targets and GraphQL inputs, a release id and a ref's node
+   id resolved by the home, a release asked only when it publishes, one
+   open presence request per instance. A held call takes a broker handler
+   slot of its bridge, an `access wait` a control one. Deferred, each a
+   [status](../../status.md#credentials) limitation: requests surviving a
+   drain; presence on pushes (4b).
 4b. `presence` on git pushes (the receive-pack commands, with
    git-gateway step 2's parsing), `approvers` (a headless home's asks
    answered from a laptop, with step 5's links), a sandbox's config edit

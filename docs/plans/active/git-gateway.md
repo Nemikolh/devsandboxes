@@ -451,7 +451,7 @@ impossible: rewrite to the gateway where the host speaks HTTPS.
 2. **Push rules**: receive-pack parsing, `branches` and `tags` (git and
    REST), create and delete rules, `report-status` refusals,
    `git.push.workflows`, `presence` ref forms (passing as in step 1
-   until credential-broker step 4 asks).
+   until credential-broker step 4b asks).
 3. **Clones for repeat instances**: `checkout = "clone"` opt-in, the
    recorded-URL host fetches, `rm` asking before unpushed commits go.
    Dispatcher children stay on worktrees. The `config-toml-spec` skill

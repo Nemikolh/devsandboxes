@@ -21,6 +21,10 @@ pub(crate) struct Fake {
     pub names: BTreeMap<String, RepoRef>,
     pub ids: BTreeMap<u64, RepoRef>,
     pub nodes: BTreeMap<String, RepoRef>,
+    /// A release's path → its `tag_name`.
+    pub releases: BTreeMap<String, String>,
+    /// A ref's node id → its full name.
+    pub refs: BTreeMap<String, String>,
     pub calls: RefCell<Vec<String>>,
     pub pins: RefCell<Vec<(String, u64)>>,
 }
@@ -55,6 +59,14 @@ impl Lookup for Fake {
     }
     fn pin(&self, repo: &str, to: &RepoRef) {
         self.pins.borrow_mut().push((repo.to_string(), to.id));
+    }
+    fn release_tag(&self, _: &Via<'_>, path: &str) -> Option<String> {
+        self.calls.borrow_mut().push(format!("release {path}"));
+        self.releases.get(path).cloned()
+    }
+    fn ref_name(&self, _: &Via<'_>, node_id: &str) -> Option<String> {
+        self.calls.borrow_mut().push(format!("ref {node_id}"));
+        self.refs.get(node_id).cloned()
     }
 }
 
@@ -158,6 +170,18 @@ fn rest_and_graphql_answers() {
     let none = br#"{"data":{"node":null},"errors":[{"type":"NOT_FOUND"}]}"#;
     assert_eq!(parse_node(none), (Fetched::Missing, false));
     assert_eq!(parse_node(b"<html>"), (Fetched::Failed, false));
+
+    let tag = br#"{"data":{"node":{"__typename":"Ref","name":"v1","prefix":"refs/tags/"}}}"#;
+    assert_eq!(parse_ref(tag).as_deref(), Some("refs/tags/v1"));
+    for bad in [
+        &br#"{"data":{"node":{"__typename":"Issue","name":"v1","prefix":"refs/tags/"}}}"#[..],
+        br#"{"data":{"node":{"__typename":"Ref","name":"","prefix":"refs/tags/"}}}"#,
+        br#"{"data":{"node":{"__typename":"Ref","name":"v1","prefix":"tags"}}}"#,
+        br#"{"data":{"node":null}}"#,
+        b"<html>",
+    ] {
+        assert_eq!(parse_ref(bad), None, "{}", String::from_utf8_lossy(bad));
+    }
 }
 
 #[test]
@@ -214,10 +238,13 @@ fn github(head: &str, body: &[u8]) -> Vec<u8> {
         "/repos/twice/r" => reply(301, "Location: https://api.github.com/repos/o/r\r\n", ""),
         "/repos/n/r" => reply(200, "", REPO_42),
         "/repos/down/r" => reply(502, "", ""),
+        "/repos/o/r/releases/5" => reply(200, "", r#"{"id":5,"tag_name":"v1.2","draft":true}"#),
+        "/repos/o/r/releases/6" => reply(200, "", r#"{"id":6}"#),
         "/graphql" => {
             let q: serde_json::Value = serde_json::from_slice(body).unwrap();
             assert!(q["query"].as_str().unwrap().contains("node(id:$id)"));
             match q["variables"]["id"].as_str().unwrap() {
+                "REF_1" => reply(200, "", r#"{"data":{"node":{"__typename":"Ref","name":"v1","prefix":"refs/tags/"}}}"#),
                 "I_1" => reply(
                     200,
                     "",
@@ -335,6 +362,33 @@ fn only_repository_nodes_are_cached() {
     assert_eq!(rig.at(1000, |l| l.node(&LOCAL, "X_0")), None);
     assert_eq!(rig.at(1000, |l| l.node(&LOCAL, "X_0")), None);
     assert_eq!(seen.lock().unwrap().len(), 4, "nor a miss");
+}
+
+#[test]
+fn releases_and_refs_resolve_with_the_credential_uncached() {
+    let (port, seen) = upstream_server(github);
+    let rig = Rig::new("presence", port);
+    for _ in 0..2 {
+        assert_eq!(rig.at(1000, |l| l.release_tag(&LOCAL, "/repos/o/r/releases/5")).as_deref(), Some("v1.2"));
+    }
+    assert_eq!(rig.at(1000, |l| l.release_tag(&LOCAL, "/repos/o/r/releases/6")), None, "no tag_name");
+    assert_eq!(rig.at(1000, |l| l.release_tag(&LOCAL, "/repos/o/r/releases/7")), None, "a 404");
+    assert_eq!(rig.at(1000, |l| l.ref_name(&LOCAL, "REF_1")).as_deref(), Some("refs/tags/v1"));
+    assert_eq!(rig.at(1000, |l| l.ref_name(&LOCAL, "I_1")), None, "not a ref");
+    assert_eq!(
+        paths(&seen),
+        [
+            "GET /repos/o/r/releases/5 HTTP/1.1",
+            "GET /repos/o/r/releases/5 HTTP/1.1",
+            "GET /repos/o/r/releases/6 HTTP/1.1",
+            "GET /repos/o/r/releases/7 HTTP/1.1",
+            "POST /graphql HTTP/1.1",
+            "POST /graphql HTTP/1.1",
+        ]
+    );
+    for (head, _) in seen.lock().unwrap().iter() {
+        assert!(head.contains(&format!("\r\nAuthorization: Bearer {TOKEN}-work\r\n")), "{head}");
+    }
 }
 
 #[test]

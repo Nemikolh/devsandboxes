@@ -40,6 +40,7 @@ fn ask(scope: &str, repo: Option<&str>, hold: Duration) -> Ask {
             credential: "github-work".into(),
             scope: scope.into(),
             repo: repo.map(String::from),
+            presence: None,
         },
         instance: "web-1".into(),
         sandbox: "web".into(),
@@ -436,4 +437,46 @@ fn every_answer_marker_has_an_exit_code() {
         let code = control::access_exit_code(a.marker());
         assert_eq!(code, Some(if a.allows() { control::EXIT_OK } else { control::EXIT_ACCESS_DENY }), "{a:?}");
     }
+}
+
+fn presence_ask(target: &str) -> Ask {
+    let mut a = ask("git.push", Some("o/r"), LONG);
+    a.key.presence = Some(PresenceAt { route: format!("DELETE /repos/o/r/git/refs/tags/{target}"), target: target.into() });
+    a
+}
+
+#[test]
+fn presence_requests_dedupe_by_target_and_are_capped_at_one() {
+    let (r, clock) = manual("presence-cap");
+    let v1 = r.ask(&presence_ask("v1")).unwrap();
+    assert_eq!(r.ask(&presence_ask("v1")).unwrap().id, v1.id, "a retry joins");
+    let e = r.ask(&presence_ask("v2")).unwrap_err();
+    assert_eq!((e.status, e.verdict, e.request.as_deref()), (403, "pending", Some(v1.id())));
+    // Apart from the scope asks' cap, either way.
+    for s in ["a", "b", "c"] {
+        r.ask(&ask(s, None, LONG)).unwrap();
+    }
+    assert!(r.ask(&ask("d", None, LONG)).is_err());
+    assert_eq!(r.pending().len(), 4);
+    clock.advance(LONG);
+    r.ask(&presence_ask("v2")).unwrap();
+}
+
+#[test]
+fn a_presence_request_takes_no_always_and_keeps_its_target() {
+    let r = registry("presence-answer");
+    home::update(&home::path(&r.data), |h| Ok(h.insert("github-work".into(), home::Entry::new("github", None)))).unwrap();
+    let t = r.ask(&presence_ask("v1")).unwrap();
+    let e = r.answer(t.id(), Answer::Always).unwrap_err();
+    let not = e.downcast_ref::<NotAlways>().expect("a NotAlways");
+    assert!(not.0.contains("never always"), "{not}");
+    assert_eq!(r.pending().len(), 1, "still unanswered");
+    assert!(home::load(&home::path(&r.data)).unwrap()["github-work"].rules.is_empty(), "no rule written");
+    r.answer(t.id(), Answer::Instance).unwrap().unwrap();
+    let kept = answers::load(&answers::path(&r.data)).unwrap();
+    let found = answers::lookup(&kept, &presence_ask("v1").key).unwrap();
+    assert_eq!(found.presence.as_ref().map(|p| p.target.as_str()), Some("v1"));
+    assert!(answers::lookup(&kept, &presence_ask("v2").key).is_none(), "another target");
+    assert!(answers::lookup(&kept, &ask("git.push", Some("o/r"), LONG).key).is_none(), "nor the scope");
+    let _ = std::fs::remove_dir_all(&r.data);
 }

@@ -78,7 +78,19 @@ and org-member invitations, runner registration and JIT tokens, Actions,
 Dependabot, Codespaces and environment secret writes, and the
 installation, OAuth-token and authorization routes. `presence` names tag
 refs, ref deletions, REST `git/refs`, releases (by `tag_name` or id) and
-`createRef`/`updateRef`/`deleteRef`.
+`createRef`/`updateRef`/`deleteRef`, and its `ref` entries
+`refs/tags/*` and, on delete, `refs/heads/*`. The broker asks on every
+target, whatever the scope allows ([broker](broker.md#presence)), for
+the REST routes and mutations that move a ref those entries name: a
+tag's update or deletion (`refs/tags/<tag>`), a branch deletion
+(`refs/heads/<the path past heads/>`), `POST git/refs` by its body's
+`ref`, `createRef` by `input.name`, `updateRef` and `deleteRef` by the
+ref the home resolves `input.refId` to; a branch created or updated
+through them isn't asked. A release is asked when published at create,
+by its `tag_name` (a draft isn't asked), or by `PATCH` (`"draft":
+false`), by the `tag_name` the home reads for its id. A push's
+receive-pack commands aren't read against the `ref` entries, so a push
+takes its `git.push` scope only.
 
 `fence`: every mapped mutation lists each input naming a repository or
 an object in one (`input.repositoryId`, `input.pullRequestId`,

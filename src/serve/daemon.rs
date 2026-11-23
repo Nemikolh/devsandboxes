@@ -4593,7 +4593,7 @@ pub(crate) mod tests {
         };
         assert_eq!(crate::serve::dts::prop_type("ApiEvents", "access.changed").as_deref(), Some("{}"));
         let raised = Ask {
-            key: AskKey { instance_id: "w-id".into(), credential: "gh".into(), scope: "pr.write".into(), repo: None },
+            key: AskKey { instance_id: "w-id".into(), credential: "gh".into(), scope: "pr.write".into(), repo: None, presence: None },
             instance: "w".into(),
             sandbox: "w".into(),
             kind: "github".into(),

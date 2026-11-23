@@ -264,7 +264,9 @@ R-7Q2M9XK4TB0D  web-1     gh          pr.write     o/r   POST /repos/o/r/pulls  
 R-3JX8W1PZ6N2C  api       sentry      issues.read  -     GET /api/0/issues/     2m   no
 ```
 
-`REPO` is `-` for a scope with no repo fence; `HELD` says whether a call
+`REPO` is `-` for a scope with no repo fence; a presence request's
+`CALL` ends with its target, `DELETE /repos/o/r/git/refs/tags/v1
+(presence: refs/tags/v1)`; `HELD` says whether a call
 waits on it now (`yes (N calls)` for several); `no`: its hold ended, and
 only a late answer is left. `--json` prints `{"schema", "data":
 {"requests": [request…]}}`, each request as the API's.
@@ -277,7 +279,9 @@ request is refused, and so is `--for` with a credential; `--yes` changes
 nothing for a request, which isn't asked about (the user named it). `deny`
 takes a request id only (`deny_route`), refusing anything else with a
 pointer to `access revoke <credential> --version`. Both first show the
-request as listed, then answer it:
+request as listed, then answer it; `--for always` on a presence request
+is refused there, unsent ("request R-… is a presence request: answer it
+`--for once` or `--for instance`, never always"):
 
 ```
 request R-7Q2M9XK4TB0D: `web-1` (sandbox web) asks `gh` pr.write on o/r for POST /repos/o/r/pulls
@@ -289,7 +293,8 @@ o/r" (with no call held: "(no call waits on it: the instance's next
 matching call within 5 minutes takes it)" appended), "approved R-…
 always: a rule on `gh` lets sandbox web's pr.write on o/r through
 (`devsandbox access revoke R-…` drops it)", "denied R-…: `web-1` `gh`
-pr.write on o/r, kept until `devsandbox access revoke R-…`". A request
+pr.write on o/r, kept until `devsandbox access revoke R-…`". A presence
+request's scope reads `git.push on o/r for refs/tags/v1`. A request
 not listed, or answered between the listing and the answer
 (`not-found`): "no pending request `R-…` (answered already, or
 expired)".
@@ -352,8 +357,8 @@ sentry-work: sentry, source file
 - `rules`: the credential's `rules`, each its scope (`on <repo>` when
   set), the fields it sets and the request that wrote it, or `by hand`.
 - `answers`: the answers `access.json` keeps on it: instance (its name
-  when answered), scope (`on <repo>`), `this instance` or `deny`, the
-  request id and when.
+  when answered), scope (`on <repo>`, `for <target>` for a presence
+  answer, escaped), `this instance` or `deny`, the request id and when.
 
 Without a credential named, the GitHub repo fences follow (`fences`,
 [fence](../architecture/credentials/fence.md)): each folder in
@@ -508,7 +513,8 @@ sandbox name, `profile` its profile. An *always* answer appends one with
 the request's scope, repo, sandbox and id
 ([broker](../architecture/credentials/broker.md#permission-requests));
 an `id` must be a request id, a `profile` a profile name. A deny kept in
-`access.json` beats a rule.
+`access.json` beats a rule. No rule answers a presence call
+([broker](../architecture/credentials/broker.md#presence)).
 
 `expires_at` (RFC 3339, UTC) is written by `login`, from its token
 check, and by the broker: on an injected call with a pasted secret, the response's header the claim's
@@ -558,8 +564,8 @@ file, never its content. `Secret` has no `Display` and a blank `Debug`.
 Next to `state.toml` (`answers::path`, `daemon_config::ACCESS`), read
 and written under `access.lock` (`answers::update` over
 `serve::locked_file::update`): the *this instance* and deny answers of
-permission requests, one per instance, credential, scope and repo (a
-later answer replaces it). Written by the daemon's `asks::Registry`, by
+permission requests, one per instance, credential, scope, repo and, for
+a presence request, route and target (a later answer replaces it). Written by the daemon's `asks::Registry`, by
 `rm` (`answers::forget_instance` drops the instance's) and by `access
 revoke <request>`; read by the broker per call.
 
@@ -582,8 +588,9 @@ revoke <request>`; read by the broker per call.
 ```
 
 `answer` is `instance` or `deny`; `repo` only for a fenced claim's
-scope; `instance` is the name when answered, for display; `at` RFC 3339
-UTC. Another `version` fails the file, as do unknown keys.
+scope; `presence` only for a presence request's, `{"route": "DELETE
+/repos/o/r/git/refs/tags/v1", "target": "refs/tags/v1"}` (`asks::PresenceAt`);
+`instance` is the name when answered, for display; `at` RFC 3339 UTC. Another `version` fails the file, as do unknown keys.
 
 Both credential files, their locks, `access.json` and the member CA's
 `member-ca.key` and `member-ca.toml` ([member CA](../architecture/credentials/ca.md)) are refused as bind and build sources in every container,

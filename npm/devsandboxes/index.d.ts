@@ -1671,6 +1671,11 @@ export interface AccessRequest {
   method: string;
   /** The call's path, query dropped. Control characters escaped. */
   route: string;
+  /**
+   * A presence request's target (the tag or ref it acts on): answered `once`
+   * or `instance` only, `always` is `invalid`. Control characters escaped.
+   */
+  presence: string | null;
   /** Unix seconds. */
   opened_at: number;
   /** A call waits on it now; else only a late answer is left (a `once` then grants the next matching call). */

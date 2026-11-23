@@ -135,7 +135,7 @@ impl Case {
             parse_head(format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{extra}\r\n", self.port).as_bytes())
                 .unwrap();
         let header = ProxyHeader::BaseUrl { upstream: self.upstream.clone(), listener: self.port };
-        decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None }, &self.state, &self.src)
+        decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None, body: None }, &self.state, &self.src)
     }
 
     fn get(&self, path: &str, extra: &str) -> Outcome {
@@ -409,7 +409,7 @@ fn scopes_never_other_ask_and_defaults() {
     let head = parse_head(format!("GET /api/0/issues/1/ HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{}\r\n", c.port, bearer(OWN)).as_bytes())
         .unwrap();
     let header = ProxyHeader::BaseUrl { upstream: "sentry.io".into(), listener: c.port };
-    let call = Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None };
+    let call = Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None, body: None };
     injected(&decide(&call, &c.state, &Granted(&c.src, vec![key.clone()])));
     let wrong = AskKey { scope: "org.read".into(), ..key };
     asked(&decide(&call, &c.state, &Granted(&c.src, vec![wrong])), "issues.read", None);
@@ -438,7 +438,7 @@ fn scopes_never_other_ask_and_defaults() {
 fn through(state: &State, src: &Src, host: &str, port: u16, path: &str, extra: &str) -> Outcome {
     let head = parse_head(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{extra}\r\n").as_bytes()).unwrap();
     let header = ProxyHeader::Intercept { host: host.into(), port };
-    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None }, state, src)
+    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None, body: None }, state, src)
 }
 
 #[test]
@@ -486,7 +486,7 @@ fn intercept_leaks_and_mode_mismatches() {
     let head = parse_head(format!("GET /user HTTP/1.1\r\nHost: 127.0.0.1:{listener}\r\nAuthorization: token {GH}\r\n\r\n").as_bytes())
         .unwrap();
     let header = ProxyHeader::BaseUrl { upstream: "api.github.com".into(), listener };
-    let o = decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None }, &state, &src);
+    let o = decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None, body: None }, &state, &src);
     refused(&o, &format!("port {listener} is no broker listener for `api.github.com`"));
 }
 
@@ -511,7 +511,7 @@ pub(crate) fn git_basic(p: &str) -> String {
 fn fenced(src: &Src, method: &str, host: &str, path: &str, extra: &str) -> Outcome {
     let head = parse_head(format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n{extra}\r\n").as_bytes()).unwrap();
     let header = ProxyHeader::Intercept { host: host.into(), port: 443 };
-    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None }, &fenced_state(), src)
+    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None, body: None }, &fenced_state(), src)
 }
 
 const UPLOAD_REFS: &str = "/o/r.git/info/refs?service=git-upload-pack";
@@ -602,7 +602,7 @@ fn batch(state: &State, src: &Src, path: &str, op: Option<route::LfsOp>) -> Outc
     let head = parse_head(format!("POST {path} HTTP/1.1\r\nHost: github.com\r\n{}Content-Length: 2\r\n\r\n", git_basic(GH)).as_bytes())
         .unwrap();
     let header = ProxyHeader::Intercept { host: "github.com".into(), port: 443 };
-    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: op, graphql: None }, state, src)
+    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: op, graphql: None, body: None }, state, src)
 }
 
 #[test]
@@ -750,7 +750,7 @@ fn resolving(state: &State, src: &Resolving, method: &str, host: &str, path: &st
     let auth = if host == "github.com" { git_basic(GH) } else { format!("Authorization: token {GH}\r\n") };
     let head = parse_head(format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n{auth}\r\n").as_bytes()).unwrap();
     let header = ProxyHeader::Intercept { host: host.into(), port: 443 };
-    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None }, state, src)
+    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None, body: None }, state, src)
 }
 
 #[test]
@@ -787,6 +787,7 @@ fn repository_ids_are_placed_by_the_fences_pins() {
                 .unwrap(),
             lfs: None,
             graphql: None,
+            body: None,
         },
         &pinned,
         &fenced_src(None),
@@ -847,7 +848,7 @@ fn gql(state: &State, src: &dyn Sources, body: serde_json::Value) -> Outcome {
     )
     .unwrap();
     let header = ProxyHeader::Intercept { host: "api.github.com".into(), port: 443 };
-    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: Some(&op) }, state, src)
+    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: Some(&op), body: None }, state, src)
 }
 
 fn gql_src(access: Option<Access>) -> Resolving {
@@ -883,7 +884,7 @@ fn graphql_queries_are_repo_less_reads() {
     let head = parse_head(format!("POST /graphql HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: token {GH}\r\n\r\n").as_bytes())
         .unwrap();
     let header = ProxyHeader::Intercept { host: "api.github.com".into(), port: 443 };
-    let o = decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None }, &state, &gql_src(None));
+    let o = decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None, body: None }, &state, &gql_src(None));
     assert_eq!(refused(&o, "its document unread").status, 500);
 }
 
@@ -1030,7 +1031,7 @@ fn org_call(src: &dyn Sources, method: &str, path: &str) -> Outcome {
     let head = parse_head(format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{}\r\n", bearer(OWN)).as_bytes())
         .unwrap();
     let header = ProxyHeader::BaseUrl { upstream: "us.sentry.io".into(), listener: port };
-    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None }, &state, src)
+    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None, body: None }, &state, src)
 }
 
 #[test]
@@ -1123,6 +1124,9 @@ impl Sources for Kept<'_> {
     fn github(&self) -> Option<&dyn github::Lookup> {
         self.0.github()
     }
+    fn granted(&self, key: &AskKey) -> bool {
+        self.0.granted(key)
+    }
     fn remembered(&self, key: &AskKey) -> Result<Option<Remembered>> {
         let kept = crate::credentials::answers::Answers { answers: self.1.clone() };
         Ok(crate::credentials::answers::lookup(&kept, key).cloned())
@@ -1137,6 +1141,7 @@ fn kept(id: &str, key: &AskKey, answer: Kind) -> Remembered {
         credential: key.credential.clone(),
         scope: key.scope.clone(),
         repo: key.repo.clone(),
+        presence: key.presence.clone(),
         answer,
         at: "2026-11-23T10:00:00Z".into(),
     }
@@ -1161,7 +1166,7 @@ fn rules_and_kept_answers_let_asked_calls_through_and_a_kept_deny_refuses() {
     let call = |src: &dyn Sources| {
         let head = parse_head(format!("GET /repos/O/R HTTP/1.1\r\nHost: api.github.com\r\n{token}\r\n").as_bytes()).unwrap();
         let header = ProxyHeader::Intercept { host: "api.github.com".into(), port: 443 };
-        decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None }, &fenced_state(), src)
+        decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None, body: None }, &fenced_state(), src)
     };
     let key = asked(&call(&ask()), "repo.read", Some("o/r")).key.clone();
     assert_eq!(asked(&call(&ask()), "repo.read", Some("o/r")).sandbox, "web");
@@ -1211,4 +1216,143 @@ fn a_kept_deny_refuses_before_another_scope_is_asked() {
     let issues = AskKey { scope: "issues.write".into(), ..first };
     let o = gql(&state, &Kept(&ask, vec![kept(DENIED, &issues, Kind::Deny)]), both);
     refused(&o, "denied for this instance");
+}
+
+/// [`gql_src`] with a release and a ref for the home to resolve.
+fn presence_src(access: Option<Access>) -> Resolving {
+    let mut src = gql_src(access);
+    src.fake.releases.insert("/repos/o/r/releases/5".into(), "v1.2".into());
+    src.fake.refs.insert("REF_1".into(), "refs/tags/v1".into());
+    src.fake.nodes.insert("REF_1".into(), github::tests::repo(42, "o/r"));
+    src.fake.nodes.insert("REF_2".into(), github::tests::repo(42, "o/r"));
+    src
+}
+
+/// A REST call to `api.github.com` with `body` read as the serve layer
+/// reads a presence route's.
+fn rest(src: &dyn Sources, method: &str, path: &str, body: Option<serde_json::Value>) -> Outcome {
+    let head = parse_head(format!("{method} {path} HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: token {GH}\r\n\r\n").as_bytes())
+        .unwrap();
+    let header = ProxyHeader::Intercept { host: "api.github.com".into(), port: 443 };
+    decide(&Call { caller: &caller(), header: &header, head: &head, lfs: None, graphql: None, body: body.as_ref() }, &fenced_state(), src)
+}
+
+/// The presence ask `o` holds for: its scope, repo, route and target.
+#[track_caller]
+fn presence_asked(o: &Outcome, scope: &str, route: &str, target: &str) -> AskKey {
+    let a = asked(o, scope, Some("o/r"));
+    assert_eq!(a.key.presence, Some(PresenceAt { route: route.into(), target: target.into() }), "{a:?}");
+    a.key.clone()
+}
+
+const TAG_V1: &str = "/repos/o/r/git/refs/tags/v1";
+
+#[test]
+fn presence_is_asked_even_when_the_scope_allows_the_call() {
+    use serde_json::json;
+    let src = presence_src(None);
+    let key = presence_asked(&rest(&src, "DELETE", TAG_V1, None), "git.push", &format!("DELETE {TAG_V1}"), "refs/tags/v1");
+    injected(&rest(&Granted(&src, vec![key.clone()]), "DELETE", TAG_V1, None));
+    // Another target is another ask.
+    let v2 = rest(&Granted(&src, vec![key]), "DELETE", "/repos/o/r/git/refs/tags/v2", None);
+    presence_asked(&v2, "git.push", "DELETE /repos/o/r/git/refs/tags/v2", "refs/tags/v2");
+    injected(&rest(&src, "PATCH", "/repos/o/r/git/refs/heads/main", None));
+
+    let refs = rest(&src, "POST", "/repos/o/r/git/refs", Some(json!({ "ref": "refs/tags/v1", "sha": "0" })));
+    presence_asked(&refs, "git.push", "POST /repos/o/r/git/refs", "refs/tags/v1");
+    let r = refused(&rest(&src, "POST", "/repos/o/r/git/refs", Some(json!({ "sha": "0" }))), "can't name its target");
+    assert_eq!(
+        (r.status, r.reason.as_str()),
+        (403, "`POST /repos/o/r/git/refs` is a presence call (always asked), and the broker can't name its target (`ref`: the call holds none)")
+    );
+    assert_eq!(refused(&rest(&src, "POST", "/repos/o/r/git/refs", None), "its body unread").status, 500);
+
+    // A release: published at create, or by an edit setting `draft: false`
+    // (its tag looked up by the home); a draft and other edits aren't asked.
+    let create = |body: serde_json::Value| rest(&src, "POST", "/repos/o/r/releases", Some(body));
+    presence_asked(&create(json!({ "tag_name": "v1" })), "releases.write", "POST /repos/o/r/releases", "v1");
+    injected(&create(json!({ "tag_name": "v1", "draft": true })));
+    let publish = rest(&src, "PATCH", "/repos/o/r/releases/5", Some(json!({ "draft": false })));
+    presence_asked(&publish, "releases.write", "PATCH /repos/o/r/releases/5", "v1.2");
+    assert!(src.fake.calls.borrow().contains(&"release /repos/o/r/releases/5".to_string()));
+    injected(&rest(&src, "PATCH", "/repos/o/r/releases/5", Some(json!({ "name": "notes" }))));
+    let r = refused(&rest(&src, "PATCH", "/repos/o/r/releases/6", Some(json!({ "draft": false }))), "can't name its target");
+    assert!(r.reason.ends_with("(`{release_id}`: the release doesn't resolve to its `tag_name`)"), "{}", r.reason);
+    // Without a lookup no id resolves.
+    refused(&rest(&fenced_src(None), "PATCH", "/repos/o/r/releases/5", Some(json!({ "draft": false }))), "doesn't resolve");
+}
+
+#[test]
+fn presence_mutations_name_their_ref_resolved_by_the_home() {
+    let state = fenced_state();
+    let src = presence_src(None);
+    let create = serde_json::json!({ "query": "mutation($i: CreateRefInput!) { createRef(input: $i) { ref { id } } }", "variables": { "i": { "repositoryId": "R_42", "name": "refs/tags/v1", "oid": "0" } } });
+    presence_asked(&gql(&state, &src, create), "git.push", "graphql mutation createRef", "refs/tags/v1");
+    let delete = |id: &str| serde_json::json!({ "query": format!("mutation {{ deleteRef(input: {{refId: \"{id}\"}}) {{ clientMutationId }} }}") });
+    let key = presence_asked(&gql(&state, &src, delete("REF_1")), "git.push", "graphql mutation deleteRef", "refs/tags/v1");
+    assert!(src.fake.calls.borrow().contains(&"ref REF_1".to_string()));
+    injected(&gql(&state, &Granted(&src, vec![key]), delete("REF_1")));
+    let r = refused(&gql(&state, &src, delete("REF_2")), "can't name its target");
+    assert!(r.reason.ends_with("(`input.refId`: the ref doesn't resolve to its name)"), "{}", r.reason);
+}
+
+#[test]
+fn presence_takes_no_rule_and_a_kept_answer_only_for_its_target() {
+    let mut src = presence_src(None);
+    src.src.home.get_mut("github-work").unwrap().rules = vec![rule("git.push", None, None, None)];
+    let key = presence_asked(&rest(&src, "DELETE", TAG_V1, None), "git.push", &format!("DELETE {TAG_V1}"), "refs/tags/v1");
+
+    injected(&rest(&Kept(&src, vec![kept("R-AAAAAAAAAAAA", &key, Kind::Instance)]), "DELETE", TAG_V1, None));
+    let v2 = rest(&Kept(&src, vec![kept("R-AAAAAAAAAAAA", &key, Kind::Instance)]), "DELETE", "/repos/o/r/git/refs/tags/v2", None);
+    presence_asked(&v2, "git.push", "DELETE /repos/o/r/git/refs/tags/v2", "refs/tags/v2");
+    // A scope's kept answer isn't a presence one.
+    let scope_only = AskKey { presence: None, ..key.clone() };
+    asked(&rest(&Kept(&src, vec![kept("R-AAAAAAAAAAAA", &scope_only, Kind::Instance)]), "DELETE", TAG_V1, None), "git.push", Some("o/r"));
+    refused(&rest(&Kept(&src, vec![kept(DENIED, &key, Kind::Deny)]), "DELETE", TAG_V1, None), "denied for this instance");
+}
+
+#[test]
+fn an_asked_scope_comes_before_its_presence() {
+    let src = presence_src(Some(Access { ask: vec!["git.push".into()], ..Access::default() }));
+    let scope = asked(&rest(&src, "DELETE", TAG_V1, None), "git.push", Some("o/r")).key.clone();
+    assert_eq!(scope.presence, None);
+    let next = rest(&Granted(&src, vec![scope.clone()]), "DELETE", TAG_V1, None);
+    let presence = presence_asked(&next, "git.push", &format!("DELETE {TAG_V1}"), "refs/tags/v1");
+    injected(&rest(&Granted(&src, vec![scope, presence]), "DELETE", TAG_V1, None));
+    // A kept deny on the presence refuses before the scope is asked.
+    let deny = AskKey { presence: Some(PresenceAt { route: format!("DELETE {TAG_V1}"), target: "refs/tags/v1".into() }), ..asked(&rest(&src, "DELETE", TAG_V1, None), "git.push", Some("o/r")).key.clone() };
+    refused(&rest(&Kept(&src, vec![kept(DENIED, &deny, Kind::Deny)]), "DELETE", TAG_V1, None), "denied for this instance");
+}
+
+#[test]
+fn ref_targets_are_asked_only_for_tags_and_deletions() {
+    use serde_json::json;
+    let state = fenced_state();
+    let mut src = presence_src(None);
+    src.fake.refs.insert("REF_B".into(), "refs/heads/x".into());
+    src.fake.nodes.insert("REF_B".into(), github::tests::repo(42, "o/r"));
+
+    let refs = |r: &str| rest(&src, "POST", "/repos/o/r/git/refs", Some(json!({ "ref": r, "sha": "0" })));
+    injected(&refs("refs/heads/x"));
+    presence_asked(&refs("refs/tags/v1"), "git.push", "POST /repos/o/r/git/refs", "refs/tags/v1");
+    refused(&refs("tags/v1"), "isn't a full ref");
+
+    let create = |name: &str| {
+        let q = "mutation($i: CreateRefInput!) { createRef(input: $i) { ref { id } } }";
+        gql(&state, &src, json!({ "query": q, "variables": { "i": { "repositoryId": "R_42", "name": name, "oid": "0" } } }))
+    };
+    injected(&create("refs/heads/x"));
+    presence_asked(&create("refs/tags/v1"), "git.push", "graphql mutation createRef", "refs/tags/v1");
+
+    let by_id = |m: &str, id: &str| {
+        gql(&state, &src, json!({ "query": format!("mutation {{ {m}(input: {{refId: \"{id}\", oid: \"0\"}}) {{ clientMutationId }} }}") }))
+    };
+    injected(&by_id("updateRef", "REF_B"));
+    presence_asked(&by_id("updateRef", "REF_1"), "git.push", "graphql mutation updateRef", "refs/tags/v1");
+    presence_asked(&by_id("deleteRef", "REF_B"), "git.push", "graphql mutation deleteRef", "refs/heads/x");
+    refused(&by_id("updateRef", "REF_2"), "the ref doesn't resolve to its name");
+
+    let o = rest(&src, "DELETE", "/repos/o/r/git/refs/heads/a/x", None);
+    presence_asked(&o, "git.push", "DELETE /repos/o/r/git/refs/heads/a/x", "refs/heads/a/x");
+    injected(&rest(&src, "PATCH", "/repos/o/r/git/refs/heads/a/x", None));
 }

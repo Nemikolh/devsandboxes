@@ -1391,6 +1391,16 @@ fn check_ref_pattern(p: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether full ref `name` is one [`check_ref_pattern`]'s `pattern` names:
+/// equal, or under a trailing `*`'s prefix by one or more segments
+/// (`refs/heads/*` holds `refs/heads/a/x`), as git's refspec globs read.
+pub fn ref_pattern_matches(pattern: &str, name: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => name.strip_prefix(prefix).is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/')),
+        None => pattern == name,
+    }
+}
+
 fn path_var(seg: &str) -> Option<&str> {
     seg.strip_prefix('{')?.strip_suffix('}')
 }

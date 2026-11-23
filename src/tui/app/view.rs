@@ -151,8 +151,9 @@ Command prompt (:)
               (an instance is required; a global service is reached by
                naming any instance that references it)
   access      the oldest pending permission request (the header counts
-              them): o once · i this instance · a always · d deny ·
-              esc later (it stays pending; a new one opens by itself)
+              them): o once · i this instance · a always (not on a
+              presence one) · d deny · esc later (it stays pending; a
+              new one opens by itself)
   tab         complete / cycle
   ↑ ↓         history
   ctrl-u      clear line       ctrl-w  delete word
@@ -354,7 +355,8 @@ impl ConfirmModal {
             Confirmed::IdentityOffer(_) => "u update · c continue as is · l/esc later",
             Confirmed::Profile { .. } => "↑↓ move · enter switch · esc cancel",
             Confirmed::Attach { .. } => "↑↓ move · enter attach · esc cancel",
-            Confirmed::Access(_) => "o once · i this instance · a always · d deny · esc later",
+            Confirmed::Access { presence: false, .. } => "o once · i this instance · a always · d deny · esc later",
+            Confirmed::Access { presence: true, .. } => "o once · i this instance · d deny · esc later",
         }
     }
 
@@ -366,7 +368,8 @@ impl ConfirmModal {
             Confirmed::IdentityOffer(_) => "[u] update  [c] continue as is  [l] later",
             Confirmed::Profile { .. } => "[enter] switch  [esc] cancel",
             Confirmed::Attach { .. } => "[enter] attach (an attached one is taken over)  [esc] cancel",
-            Confirmed::Access(_) => "[o] once  [i] this instance  [a] always  [d] deny  [esc] later",
+            Confirmed::Access { presence: false, .. } => "[o] once  [i] this instance  [a] always  [d] deny  [esc] later",
+            Confirmed::Access { presence: true, .. } => "[o] once  [i] this instance (this target)  [d] deny  [esc] later",
         }
     }
 
@@ -377,7 +380,7 @@ impl ConfirmModal {
     /// The permission request this modal answers, if it's one.
     pub fn access_id(&self) -> Option<&str> {
         match &self.action {
-            Confirmed::Access(id) => Some(id),
+            Confirmed::Access { id, .. } => Some(id),
             _ => None,
         }
     }
@@ -402,8 +405,8 @@ pub(super) enum Confirmed {
     /// running): its `sessions` as `(id, line)`, detached first, the
     /// `cursor` over them.
     Attach { instance: String, sessions: Vec<(String, String)>, cursor: usize },
-    /// Permission request `id`.
-    Access(String),
+    /// Permission request `id`; a `presence` one is never answered always.
+    Access { id: String, presence: bool },
 }
 
 /// The session picker's body: one `session ls` line per session (it says
@@ -710,7 +713,9 @@ impl App {
                 let answer = match key.code {
                     KeyCode::Char('o') => Some(Answer::Once),
                     KeyCode::Char('i') => Some(Answer::Instance),
-                    KeyCode::Char('a') => Some(Answer::Always),
+                    KeyCode::Char('a') if !matches!(view.action, Confirmed::Access { presence: true, .. }) => {
+                        Some(Answer::Always)
+                    }
                     KeyCode::Char('d') => Some(Answer::Deny),
                     KeyCode::Esc | KeyCode::Char('q') => None,
                     _ => return,
@@ -793,7 +798,7 @@ impl App {
                         | Confirmed::IdentityOffer(_)
                         | Confirmed::Profile { .. }
                         | Confirmed::Attach { .. }
-                        | Confirmed::Access(_),
+                        | Confirmed::Access { .. },
                         _,
                     ) => {}
                 }

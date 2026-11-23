@@ -280,8 +280,11 @@ through the daemon worker: it subscribes to `access` and fetches
 - **Modal.** The oldest request not answered or put off here
   (`access_quiet`) opens a `Confirm` modal: `` `<instance>` (sandbox
   <sandbox>) asks for credential `<credential>` (<kind>) ``, then its
-  scope (and repo), `METHOD route`, whether a call is held on it and its
-  id. `o` once, `i` this instance, `a` always, `d` deny queue
+  scope (and repo), `METHOD route`, a presence request's `target` (the
+  tag or ref, `AccessRequest::presence`), whether a call is held on it
+  and its id. `o` once, `i` this instance, `a` always (not offered, and
+  ignored, on a presence request: `Confirmed::Access`'s `presence`), `d`
+  deny queue
   `pending_decide`, sent as `access.decide` (`Cmd::AccessDecide`), whose
   answer is a status line worded as `devsandbox access approve|deny`'s
   (`commands::access::decided_line`); `esc`/`q` put it off: it stays

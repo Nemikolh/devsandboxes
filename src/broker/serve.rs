@@ -45,7 +45,7 @@ use super::policy::{self, Action, Call, Context, Injection, Sources};
 use super::redact::Secrets;
 use super::refusal::{Refusal, reason_phrase};
 use super::upstream::{self, Body, Length, Request, Response, Upstream, UpstreamError};
-use super::{github, graphql, guard, intercept, lfs, orgs, rewrite, route};
+use super::{github, graphql, guard, intercept, lfs, orgs, presence, rewrite, route};
 use crate::config::{Access, Config};
 use crate::credentials::answers;
 use crate::credentials::ca::{Leaf, MemberCa};
@@ -370,9 +370,20 @@ impl Service {
             }
         }
         let mut gql = None;
-        if route::graphql(&head.method, head.target.path()) && instance_claim(&state, caller, header).is_some_and(|c| c.graphql()) {
+        let mut json = None;
+        let own = instance_claim(&state, caller, header);
+        let path = head.target.path();
+        if route::graphql(&head.method, path) && own.as_ref().is_some_and(|c| c.graphql()) {
             match graphql_body(&head, conn)? {
                 Ok(read) => gql = Some(read),
+                Err((r, close)) => {
+                    self.refuse(conn.get_mut(), &r, shape.as_ref(), close, &mut line)?;
+                    return Ok(!close);
+                }
+            }
+        } else if own.as_ref().is_some_and(|c| presence::reads_body(c, &head.method, path)) {
+            match presence_body(&head, conn)? {
+                Ok(read) => json = Some(read),
                 Err((r, close)) => {
                     self.refuse(conn.get_mut(), &r, shape.as_ref(), close, &mut line)?;
                     return Ok(!close);
@@ -385,6 +396,7 @@ impl Service {
             head: &head,
             lfs: batch.as_ref().map(|(_, op)| *op),
             graphql: gql.as_ref().map(|(_, op)| op),
+            body: json.as_ref().map(|(_, v)| v),
         };
         let token = |credential: &str| {
             let now = Instance::now();
@@ -422,7 +434,7 @@ impl Service {
                 Err(r) => policy::Outcome { action: Action::Refuse(r), context: outcome.context },
             };
         }
-        let pre = batch.map(|(body, _)| body).or(gql.map(|(body, _)| body));
+        let pre = batch.map(|(body, _)| body).or(gql.map(|(body, _)| body)).or(json.map(|(body, _)| body));
         let cx = outcome.context;
         line.incarnation = cx.incarnation.clone();
         line.kind = cx.kind.clone();
@@ -1166,6 +1178,43 @@ fn graphql_body(head: &RequestHead, conn: &mut Conn) -> io::Result<GraphqlBody> 
     }
 }
 
+/// A presence route's body as sent and its JSON, else the refusal and
+/// whether the connection closes after it.
+type PresenceBody = Result<(Vec<u8>, serde_json::Value), (Refusal, bool)>;
+
+/// A presence route's body, read whole before policy (it names the target,
+/// or a release's `draft`), after the `100 Continue` it asked for: within
+/// [`presence::MAX_BODY`], unencoded, strict JSON. Past the bound it's
+/// refused, never passed unasked.
+fn presence_body(head: &RequestHead, conn: &mut Conn) -> io::Result<PresenceBody> {
+    let too_large = || {
+        Refusal::new(413, "refused", format!("a body over {} bytes to a route that's always asked", presence::MAX_BODY))
+    };
+    if head::header(&head.headers, "content-encoding").is_some() {
+        return Ok(Err((Refusal::new(400, "refused", "a body with a `Content-Encoding` to a route that's always asked"), true)));
+    }
+    if matches!(head.framing, Framing::Length(n) if n > presence::MAX_BODY) {
+        return Ok(Err((too_large(), true)));
+    }
+    if head.expect_continue {
+        conn.get_mut().write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+        conn.get_mut().flush()?;
+    }
+    let mut body = Vec::new();
+    let mut reader = BodyReader::new(&mut *conn, head.framing);
+    if let Err(e) = (&mut reader).take(presence::MAX_BODY + 1).read_to_end(&mut body) {
+        let Some(why) = super::refusal(&e) else { return Err(e) };
+        return Ok(Err((Refusal::new(why.status(), "refused", why.to_string()), true)));
+    }
+    if body.len() as u64 > presence::MAX_BODY {
+        return Ok(Err((too_large(), true)));
+    }
+    match graphql::strict_json(&body) {
+        Ok(v) => Ok(Ok((body, v))),
+        Err(why) => Ok(Err((Refusal::new(400, "refused", format!("a body that isn't strict JSON: {why}")), !head.keep_alive()))),
+    }
+}
+
 /// An injected LFS batch's response rewrite ([`lfs::rewrite_batch`]).
 struct LfsRewrite<'a> {
     store: &'a Mutex<lfs::Store>,
@@ -1461,7 +1510,15 @@ impl Sources for Files<'_> {
 /// A held call's reason once its hold ended unanswered.
 fn waiting(id: &str, key: &AskKey) -> String {
     let on = key.repo.as_ref().map(|r| format!(" on `{r}`")).unwrap_or_default();
-    format!("scope `{}`{on} of credential `{}` needs permission: request {id} is pending", key.scope, key.credential)
+    match &key.presence {
+        Some(p) => format!(
+            "`{}` on `{}` (scope `{}`{on} of credential `{}`) needs a person's permission each time: request {id} is pending",
+            p.route, p.target, key.scope, key.credential
+        ),
+        None => {
+            format!("scope `{}`{on} of credential `{}` needs permission: request {id} is pending", key.scope, key.credential)
+        }
+    }
 }
 
 /// A new request's popup text, control characters escaped: the repo is
@@ -1469,7 +1526,13 @@ fn waiting(id: &str, key: &AskKey) -> String {
 fn request_popup(ask: &Ask, id: &str) -> String {
     let p = crate::open::printable;
     let on = ask.key.repo.as_deref().map(|r| format!(" on {}", p(r))).unwrap_or_default();
-    format!("{} asks {} {}{on}: devsandbox access approve {id}", p(&ask.instance), p(&ask.key.credential), p(&ask.key.scope))
+    let target = ask.key.presence.as_ref().map(|t| format!(", for {}", p(&t.target))).unwrap_or_default();
+    format!(
+        "{} asks {} {}{on}{target}: devsandbox access approve {id}",
+        p(&ask.instance),
+        p(&ask.key.credential),
+        p(&ask.key.scope)
+    )
 }
 
 #[cfg(test)]

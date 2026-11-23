@@ -473,7 +473,11 @@ fn render(list: &[Credential], now: u64) -> String {
                     Kind::Instance => "this instance",
                     Kind::Deny => "deny",
                 };
-                let scope = on_repo(&a.scope, a.repo.as_deref());
+                let mut scope = on_repo(&a.scope, a.repo.as_deref());
+                if let Some(p) = &a.presence {
+                    // The target is what the sandbox's call named.
+                    scope.push_str(&format!(" for {}", crate::open::printable(&p.target)));
+                }
                 out.push_str(&format!("    {:<width$}  {scope}  {answer}  {}  {}\n", a.instance, a.id, a.at));
             }
         }
@@ -850,13 +854,21 @@ fn pending_text(list: &[AccessRequest], now: u64, utc_offset: i64) -> String {
                 r.credential.clone(),
                 r.scope.clone(),
                 r.repo.clone().unwrap_or_else(|| "-".into()),
-                format!("{} {}", r.method, r.route),
+                call_text(r),
                 crate::inbox::clock::short_age(r.opened_at, now, utc_offset),
                 held,
             ]
         })
         .collect();
     crate::render::table(&["ID", "INSTANCE", "CREDENTIAL", "SCOPE", "REPO", "CALL", "AGE", "HELD"], &cells)
+}
+
+/// The call, and a presence request's target.
+fn call_text(r: &AccessRequest) -> String {
+    match &r.presence {
+        Some(target) => format!("{} {} (presence: {target})", r.method, r.route),
+        None => format!("{} {}", r.method, r.route),
+    }
 }
 
 /// `access approve <request>` and `access deny <request>`.
@@ -877,6 +889,9 @@ fn decide_with(id: &str, answer: Answer, call: &mut Call, show: &mut dyn FnMut(&
     let listed = requests(call)?;
     let Some(request) = listed.iter().find(|r| r.id == id) else { bail!("{}", not_found(id)) };
     show(&format!("request {id}: {}", what(request)));
+    if answer == Answer::Always && request.presence.is_some() {
+        bail!("request {id} is a presence request: answer it `--for once` or `--for instance`, never always");
+    }
     let r = call("access.decide", json!({ "request": id, "answer": answer.marker() }))?;
     if r.error.as_ref().is_some_and(|e| e.code == "not-found") {
         bail!("{}", not_found(id));
@@ -891,19 +906,21 @@ fn decide_with(id: &str, answer: Answer, call: &mut Call, show: &mut dyn FnMut(&
 
 fn what(r: &AccessRequest) -> String {
     format!(
-        "`{}` (sandbox {}) asks `{}` {} for {} {}",
+        "`{}` (sandbox {}) asks `{}` {} for {}",
         r.instance,
         r.sandbox,
         r.credential,
         on_repo(&r.scope, r.repo.as_deref()),
-        r.method,
-        r.route
+        call_text(r)
     )
 }
 
 /// What an answer did, one line: the CLI's and the dashboard's.
 pub(crate) fn decided_line(r: &AccessRequest, answer: Answer) -> String {
-    let (id, scope) = (&r.id, on_repo(&r.scope, r.repo.as_deref()));
+    let (id, mut scope) = (&r.id, on_repo(&r.scope, r.repo.as_deref()));
+    if let Some(target) = &r.presence {
+        scope.push_str(&format!(" for {target}"));
+    }
     let covers = format!("`{}` `{}` {scope}", r.instance, r.credential);
     match answer {
         Answer::Once if r.held => format!("approved {id} once: {covers}"),
@@ -1186,6 +1203,7 @@ mod tests {
             credential: credential.into(),
             scope: "other".into(),
             repo: repo.map(String::from),
+            presence: None,
             answer,
             at: "2026-11-23T10:00:00Z".into(),
         };
@@ -1540,6 +1558,7 @@ mod tests {
             repo: repo.map(Into::into),
             method: "POST".into(),
             route: "/repos/o/r/pulls".into(),
+            presence: None,
             opened_at: 1_000,
             held: waiting > 0,
             waiting,
@@ -1583,6 +1602,39 @@ mod tests {
             assert!(lines[1].contains(want), "{want}: {text}");
         }
         assert!(lines[2].contains(" - ") && lines[2].trim_end().ends_with("no"), "{text}");
+
+        let text = pending_text(&[tag_request()], 1_000, 0);
+        assert!(text.contains("DELETE /repos/o/r/git/refs/tags/v1 (presence: v1)"), "{text}");
+    }
+
+    fn tag_request() -> AccessRequest {
+        AccessRequest {
+            scope: "git.push".into(),
+            repo: Some("o/r".into()),
+            method: "DELETE".into(),
+            route: "/repos/o/r/git/refs/tags/v1".into(),
+            presence: Some("v1".into()),
+            ..request(Some("o/r"), 1)
+        }
+    }
+
+    #[test]
+    fn a_presence_request_is_never_answered_always() {
+        let mut sent = Vec::new();
+        let mut shown = Vec::new();
+        let err = decide_with(RID, Answer::Always, &mut daemon(vec![tag_request()], answered(tag_request()), &mut sent), &mut |l| {
+            shown.push(l.to_string())
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "request R-7Q2M9XK4TB0D is a presence request: answer it `--for once` or `--for instance`, never always");
+        assert!(sent.is_empty(), "never sent");
+        assert_eq!(
+            shown,
+            ["request R-7Q2M9XK4TB0D: `web-1` (sandbox web) asks `gh` git.push on o/r for DELETE /repos/o/r/git/refs/tags/v1 (presence: v1)"]
+        );
+        let done = decide_with(RID, Answer::Instance, &mut daemon(vec![tag_request()], answered(tag_request()), &mut sent), &mut |_| {})
+            .unwrap();
+        assert!(done.starts_with("approved R-7Q2M9XK4TB0D for this instance: `web-1` `gh` git.push on o/r for v1, until its `rm`"), "{done}");
     }
 
     /// A daemon answering `access.pending` with `listed` and

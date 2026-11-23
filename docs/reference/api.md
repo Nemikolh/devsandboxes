@@ -1022,11 +1022,12 @@ Requests live in the daemon's memory; the answers they leave live in
 | `credential`, `kind`, `scope` | what the call needs: the credential, its kind (`github`), the claim's scope |
 | `repo` | the repo the call names (lowercase `owner/name`) for a repo-fenced scope, else `null` |
 | `method`, `route` | the call's HTTP method and path (query dropped) |
+| `presence` | a presence request's target (the tag or ref the call acts on, an id resolved by the home), else `null`: answered `once`, `instance` or `deny` only |
 | `opened_at` | unix seconds |
 | `held` | a call waits on it now; `false`: its hold ended, and it waits only for a late answer (5 min) |
 | `waiting` | calls held on it now (a retry joins the request) |
 
-`repo`, `method` and `route` come from the sandbox's call: their control
+`repo`, `method`, `route` and `presence` come from the sandbox's call: their control
 characters and whitespace but a space are escaped (`\n`, `\u{1b}`).
 
 ### `access.pending`
@@ -1040,11 +1041,12 @@ their hold, those without.
 Params: `{"request": "R-…", "answer": "once" | "instance" | "always" |
 "deny"}`: once (the held calls, or with none the instance's next
 matching call), this instance (until its `rm`), always (a rule on the
-credential for the sandbox), deny (kept, until `devsandbox access
-revoke`). The answer is written before the held calls wake. Result:
-`{"request": request}` as it stood when answered.
+credential for the sandbox; never for a presence request), deny (kept,
+until `devsandbox access revoke`). The answer is written before the held
+calls wake. Result: `{"request": request}` as it stood when answered.
 
-Errors: `invalid` (an unknown `answer`), `not-found` (``no pending
+Errors: `invalid` (an unknown `answer`, or `always` to a presence
+request: it stays pending), `not-found` (``no pending
 request `R-…` ``: answered meanwhile, past its late window, or never
 raised), `internal` (the answer couldn't be written: the request stays
 pending).

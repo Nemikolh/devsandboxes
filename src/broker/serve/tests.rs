@@ -673,9 +673,18 @@ fn a_new_request_pops_up_once_and_a_join_doesnt() {
 
 #[test]
 fn request_popups_escape_and_name_the_repo() {
-    let key = AskKey { instance_id: "i".into(), credential: "github-work".into(), scope: "pr.write".into(), repo: Some("o/r\u{1b}[2J".into()) };
+    let key = AskKey { instance_id: "i".into(), credential: "github-work".into(), scope: "pr.write".into(), repo: Some("o/r\u{1b}[2J".into()), presence: None };
     let ask = Ask { key, instance: "web-1".into(), sandbox: "web".into(), kind: "github".into(), method: "POST".into(), route: "/x".into(), hold: Duration::from_secs(1) };
     assert_eq!(request_popup(&ask, "R-1"), "web-1 asks github-work pr.write on o/r\\u{1b}[2J: devsandbox access approve R-1");
+    let mut tag = ask.clone();
+    tag.key.repo = Some("o/r".into());
+    tag.key.presence = Some(asks::PresenceAt { route: "DELETE /repos/o/r/git/refs/tags/v1".into(), target: "v1\u{7}".into() });
+    assert_eq!(request_popup(&tag, "R-1"), "web-1 asks github-work pr.write on o/r, for v1\\u{7}: devsandbox access approve R-1");
+    assert_eq!(
+        waiting("R-1", &tag.key),
+        "`DELETE /repos/o/r/git/refs/tags/v1` on `v1\u{7}` (scope `pr.write` on `o/r` of credential `github-work`) \
+         needs a person's permission each time: request R-1 is pending"
+    );
 }
 
 #[test]
@@ -1173,6 +1182,53 @@ fn a_graphql_body_past_the_bound_is_refused() {
     assert_eq!(a.status, 413, "{a:?}");
     assert!(c.closed());
     assert!(seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_presence_body_is_read_before_policy_and_bounded() {
+    let (port, seen) = upstream_server(github_api);
+    let rig = Rig::fenced("presence-body", port);
+    let mut ca = MemberCa::load_or_create(&rig.dir.join("data")).unwrap();
+    ca.ensure_hosts(&BTreeSet::from(["api.github.com".to_string()])).unwrap();
+    let client = || rig.intercept_to("api.github.com", 443, Some("api.github.com"), &[b"http/1.1"]).unwrap();
+    let auth = format!("Authorization: token {GH}\r\n");
+    let mut c = client();
+
+    let draft = br#"{"tag_name":"v1","draft":true}"#;
+    assert_eq!(c.call("POST", "/repos/o/r/releases", &auth, draft).status, 200, "a draft isn't asked");
+    let service = rig.service.clone();
+    let approver = thread::spawn(move || {
+        let r = first_pending(service.asks());
+        let p = r.key.presence.clone().unwrap();
+        assert_eq!((p.route.as_str(), p.target.as_str()), ("POST /repos/o/r/releases", "v1"));
+        assert_eq!(r.key.scope, "releases.write");
+        service.asks().answer(&r.id, asks::Answer::Once).unwrap();
+    });
+    let publish = br#"{"tag_name":"v1"}"#;
+    assert_eq!(c.call("POST", "/repos/o/r/releases", &auth, publish).status, 200, "held, then let through once");
+    approver.join().unwrap();
+    let tool = tool_calls(&seen);
+    assert_eq!(tool.iter().map(|(_, b)| b.as_slice()).collect::<Vec<_>>(), [&draft[..], &publish[..]], "sent as read");
+
+    for (extra, body, status, why) in [
+        ("Content-Encoding: gzip\r\n", &publish[..], 400, "a body with a `Content-Encoding`"),
+        ("", b"tag_name=v1", 400, "a body that isn't strict JSON"),
+        ("", br#"{"tag_name":"v0","tag_name":"v1"}"#, 400, "twice in one object"),
+    ] {
+        let a = client().call("POST", "/repos/o/r/releases", &format!("{auth}{extra}"), body);
+        assert_eq!(a.status, status, "{a:?}");
+        assert!(a.json()["message"].as_str().unwrap().contains(why), "{:?}", a.json());
+    }
+    let mut c = client();
+    let head = format!(
+        "POST /repos/o/r/git/refs HTTP/1.1\r\nHost: api.github.com\r\n{auth}Content-Length: {}\r\n\r\n",
+        presence::MAX_BODY + 1
+    );
+    c.write(head.as_bytes());
+    let a = c.read();
+    assert_eq!(a.status, 413, "{a:?}");
+    assert!(c.closed());
+    assert_eq!(tool_calls(&seen).len(), 2, "no refused call went upstream");
 }
 
 const STORAGE_AUTH: &str = "RemoteAuth STORAGE-secret-42";

@@ -3044,7 +3044,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dsv-bridge-access-{}", std::process::id()));
         let asks = Arc::new(Registry::new(dir));
         let ask = |instance_id: &str| Ask {
-            key: AskKey { instance_id: instance_id.into(), credential: "gh".into(), scope: "pr.write".into(), repo: None },
+            key: AskKey { instance_id: instance_id.into(), credential: "gh".into(), scope: "pr.write".into(), repo: None, presence: None },
             instance: "web-1".into(),
             sandbox: "web".into(),
             kind: "github".into(),

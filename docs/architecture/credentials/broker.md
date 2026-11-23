@@ -18,8 +18,9 @@ Code: `src/broker/serve.rs` (`Service`, `Respond`, `Files`, `pump`),
 `src/broker/policy.rs` (`decide`, `admit_intercept`, `intercept_claim`,
 `Sources`, `Outcome`, `Action`, `Injection`, `Phantom`, `inject`,
 `strip`, `fence_of`, `fence_for`, `graphql_scopes`, `check_org`,
-`OrgList`, `secrets`), `src/broker/github.rs`
-(`Fence`, `Live`), `src/broker/orgs.rs` (`place`, `allowed`, `Lookup`,
+`OrgList`, `secrets`), `src/broker/presence.rs` (`reads_body`, `http`,
+`mutation`, `Named`), `src/broker/github.rs`
+(`Fence`, `Live`, `Lookup::release_tag`, `Lookup::ref_name`), `src/broker/orgs.rs` (`place`, `allowed`, `Lookup`,
 `Live`, `Cache`, `Https`), `src/broker/graphql.rs` (`decode`, `parse`,
 `Operation`, `inputs`), `src/broker/intercept.rs`
 (`server_config`, `fold`, `ALPN`), `src/credentials/ca.rs` (`MemberCa`),
@@ -76,7 +77,9 @@ LFS transfers, not calls: `Service::lfs_request` serves them
    whole (`batch_body`, at most `route::MAX_LFS_BATCH`, after the `100
    Continue` it asked for; [git](git.md#lfs)), and so is a GraphQL
    request's to a claim with GraphQL routes (`graphql_body`,
-   [GraphQL](#graphql)), then `policy::decide`.
+   [GraphQL](#graphql)) and a presence route's that names its target in
+   its body (`presence_body`, [Presence](#presence)), then
+   `policy::decide`.
 4. A refusal is answered; an uninjected, injected or outside call is
    forwarded (below); one `access.log` line either way.
 
@@ -158,12 +161,14 @@ only for a call carrying the phantom). First refusal answers:
    `access.<kind>.ask` on a repo-less route of a fenced claim is refused
    as never asked. Then, for the asked scopes (in `access.<kind>.ask`,
    or `other`), each by its `asks::AskKey` (instance id, credential,
-   scope, and the repo a fenced claim's call names), in this order: a
-   deny kept for it (`Sources::remembered`, `access.json`) refuses,
-   checked for every asked scope before any is asked; one a rule on the
-   credential allows (`Entry::rule_for`), or a *this instance* answer
-   kept for it, or `Sources::granted`, goes through; the first other is
-   `Action::Ask`: the call is held for a
+   scope, and the repo a fenced claim's call names), then for each
+   [presence](#presence) target of the call (its key also naming the
+   route and target), in this order: a deny kept for it
+   (`Sources::remembered`, `access.json`) refuses, checked for every key
+   before any is asked; a scope one a rule on the credential allows
+   (`Entry::rule_for`; never a presence one), or a *this instance*
+   answer kept for it, or `Sources::granted`, goes through; the first
+   other is `Action::Ask`: the call is held for a
    [permission request](#permission-requests) and decided again.
 
 The result (`Outcome`) carries the refusal, the injection (credential,
@@ -318,6 +323,62 @@ The bytes as sent go upstream, `Content-Encoding` and all (and are what a
 
 Every scope the fields need must pass step 11; the log line's `scope`
 lists them, comma-separated.
+
+### Presence
+
+A claim's `presence` route entries (`claim::Presence::Route`) mark calls
+a person approves each time, on each target, even when their scope is
+allowed or granted: no config, rule or *always* answer opens them. After the scope
+checks (step 11), each `presence` route the call is (`route::is`, so a
+route matches whichever scope route matched first) or each mutation
+field it names (`presence::mutation`) yields its targets:
+
+- a `{var}` target is the segment the path gave it (`route::var_value`,
+  past `{repo}` with `%2F` decoded); on a `git/refs` route it is the full
+  ref instead, `refs/` and the route's segments past `git/refs/` with each
+  `{var}` filled (`presence::path_ref`: `heads/{prefix}/{branch}` reads
+  `refs/heads/a/x`);
+- `{release_id}` is the release at the call's own path: the home `GET`s
+  that path with the credential (`Lookup::release_tag`, a renamed repo's
+  current name used) and takes its `tag_name`;
+- any other target of an HTTP route is a body field (`ref`, `tag_name`),
+  read as `fence` inputs are (`graphql::json_inputs`): the body of such a
+  route, and of a release route, is read whole before policy
+  (`presence::reads_body`, `serve::presence_body`): at most
+  `presence::MAX_BODY` (1 MiB) else a `413` and the connection closes,
+  any `Content-Encoding` a `400`, strict JSON (no key twice) else a
+  `400`. The bytes as read go upstream;
+- a mutation's target is its input (`input.name`, `graphql::inputs`); one
+  whose last step ends in `Id` (`input.refId`) is a `Ref`'s node id, the
+  home's `node(id:)` names it (`Lookup::ref_name`: `prefix` and `name`,
+  `refs/tags/v1`).
+
+A ref target (a `git/refs` route's, a `createRef`/`updateRef`/`deleteRef`
+input, a resolved `refId` included) has an operation: create for `POST`
+and `createRef`, update for `PATCH` and `updateRef`, delete for `DELETE`
+and `deleteRef`. It is asked only when one of the claim's `ref` entries
+(`claim::Presence::Ref`) holds it for that operation
+(`presence::ref_asked`: `claim::ref_pattern_matches`, a trailing `*`
+taking one or more segments; an empty `on`, every operation); else the
+call is no presence call and goes on as any other of its scope. gh's
+claim names `refs/tags/*` and, on delete, `refs/heads/*`: tags and ref
+deletions are asked whichever route moves them, a branch's creation or
+update isn't. A ref target named as sent that isn't a full ref
+(`refs/…`) is refused, as it could match no entry. Release targets
+aren't ref operations.
+
+A target that's absent, empty, not a string or doesn't resolve refuses
+the call, `403`, never passes it unasked: "`<METHOD path>` is a presence
+call (always asked), and the broker can't name its target (`<target>`:
+<why>)". Lookups go out with the credential on `api.github.com` (the
+approved claim must list it) and are never cached. A release is presence
+only when it publishes, so gh's draft-then-publish is one ask: `POST
+…/releases` unless its body's `draft` is `true`, `PATCH
+…/releases/{release_id}` only when it's `false` (`presence::draft_exempt`). Each
+target is one `AskKey` with `presence` (`asks::PresenceAt`: the call's
+`<METHOD> <path>`, or `graphql mutation <name>`, and the target) and the
+call's scope and repo, asked after the call's scope asks; a mutation
+naming several repos asks per repo.
 
 ## The call
 
@@ -509,12 +570,15 @@ hands it through `Host::start` to `Service::from_host`):
 - **Join**: a call whose key matches an unanswered request joins it, a
   retry included, and extends its hold to the joiner's; another repo or
   scope is another request.
-- **Cap**: an instance with `MAX_OPEN_SCOPE_ASKS` (3) requests still in
-  their hold gets a new one refused at once, `403` `pending`, "another
-  request pending for this instance: <id>" naming the oldest, no request
-  raised.
+- **Cap**: an instance with `MAX_OPEN_SCOPE_ASKS` (3) scope requests
+  still in their hold, or `MAX_OPEN_PRESENCE_ASKS` (1) presence ones
+  (counted apart), gets a new one of that kind refused at once, `403`
+  `pending`, "another request pending for this instance: <id>" naming
+  the oldest, no request raised.
 - **Answers** (`Registry::answer`, `asks::Answer`): `once`, `instance`
-  (this instance, until its `rm`), `always` (a rule), `deny`. The
+  (this instance, until its `rm`), `always` (a rule), `deny`. A presence
+  request refuses `always` (`asks::NotAlways`, left unanswered); its
+  `instance` and `deny` cover its route and target only. The
   answer is kept first (`asks::remember`, under the registry's lock):
   `instance` and `deny` as an entry in `access.json`
   (`credentials::answers`, one per key: a later answer replaces it),
@@ -533,7 +597,10 @@ hands it through `Host::start` to `Service::from_host`):
   an agent stops retrying. A hold ending unanswered refuses
   `403` `pending`, "scope `<scope>`[ on `<repo>`] of credential
   `<credential>` needs permission: request <id> is pending", naming
-  `devsandbox access approve <id>`.
+  `devsandbox access approve <id>`; a presence one, "`<METHOD path>` on
+  `<target>` (scope `<scope>`[ on `<repo>`] of credential
+  `<credential>`) needs a person's permission each time: request <id> is
+  pending".
 - **Late answers**: a request no call waits on stays listed
   (`Registry::pending`) for `LATE_GRANT` (5 min) past its hold, then is
   dropped. A `once` then becomes a one-shot grant: the instance's next
@@ -565,13 +632,14 @@ hands it through `Host::start` to `Service::from_host`):
 - **Popup**: the call that opens a request (`Ticket::opened`, never a
   join) raises a desktop notification (`Service::raise`, through
   `desktop::notify_desktop`), titled `devsandbox: permission request`:
-  "<instance> asks <credential> <scope>[ on <repo>]: devsandbox access
-  approve <id>", escaped by `open::printable`. Each instance's popups go
+  "<instance> asks <credential> <scope>[ on <repo>][, for <target>]:
+  devsandbox access approve <id>", escaped by `open::printable`. Each instance's popups go
   through a `desktop::RateLimit`, as the cap bounds a burst of asks but
   not ones answered one after another.
 - **Who answers**: the API, local clients only: `access.pending` lists
   the requests (`api::AccessRequest`: what the sandbox's call chose,
-  method, route and repo, with control characters escaped by
+  method, route, repo and a presence request's target, with control
+  characters escaped by
   `open::printable`), `access.decide` answers one
   ([API](../../reference/api.md#access)); the CLI's `devsandbox access
   pending`, `access approve <request> [--for …]` and `access deny

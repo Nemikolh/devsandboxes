@@ -68,7 +68,7 @@ Devcontainer keys are camelCase; devsandbox extras are kebab-case. **Unknown key
 - **`profiles`** ([string]): the `[profiles.*]` this sandbox's instances may be in, preferred first. Unset: every declared profile, in name order. An undeclared name errors; repeats are dropped.
 - **`access`** ({kind = table}): what the sandbox takes of this host's credential for a feature's claim kind (`[sandbox.web.access.sentry]`; kinds are lowercase letters, digits and `-`). All keys optional, unknown ones error. See [gh and sentry without a token](https://devsandboxes.com/examples/credentials).
   - `scopes` ([string]): the claim's scopes calls may use; unset or empty: all of them, within the credential's grant.
-  - `ask` ([string]): scopes held for an answer; refused until asking exists.
+  - `ask` ([string]): scopes whose calls are held for a permission request (answered in the dashboard, the desktop popup or `devsandbox access approve|deny`), within the claim's `hold`; on a repo-fenced claim only routes naming a repo can be asked.
   - `credential` (string): a credential from `credentials.toml` (`"sentry-work"`) to take instead of the profile's.
   - `repos` ([string], `github`): repos (`owner/repo` or a URL) the repo fence allows beyond the remotes recorded at the folder's first `run`.
   - `orgs` ([string], claims with an org fence, e.g. `sentry`): the org slugs calls may name, within the credential's `orgs` in `credentials.toml`; unset or empty: all of the credential's.

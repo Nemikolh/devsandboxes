@@ -37,11 +37,13 @@ is frozen: no new work on it.
   → [plan](plans/active/isolation.md)
 - **credentials**: no secret in any sandbox: a broker in `serve` swaps
   per-instance phantoms for credentials kept at their home member, under
-  per-sandbox policy. Built locally: sentry, gh and git (credential-broker
-  steps 1-3, github-and-sentry-access steps 1-2, git-gateway step 1). Next:
-  permission requests, `CRED` over the fleet (then the live config drops its
-  gh and sentry mounts), signed policy, delegation, git push rules and
-  clones.
+  per-sandbox policy. Built locally: sentry, gh and git, and permission
+  requests for asked scopes and `presence` calls (credential-broker steps
+  1-4, github-and-sentry-access steps 1-2, git-gateway step 1). Next:
+  `CRED` over the fleet (then the live config drops its gh and sentry
+  mounts), presence on git pushes and approvers answering from another
+  host (credential-broker step 4b), signed policy, delegation, git push
+  rules and clones.
   → [plan](plans/active/credential-broker.md); per tool:
   [gh and sentry](plans/active/github-and-sentry-access.md),
   [git over smart HTTP, clones replacing worktrees](plans/active/git-gateway.md)
@@ -157,7 +159,8 @@ is frozen: no new work on it.
   like a container's URL (the row's profile, `profiles.toml`); it never
   reaches the container. → [terminal](architecture/dashboard/terminal.md)
 - **helper**: schemes beyond `http(s)` (`mailto:`, `vscode:`) behind a
-  confirmation routed to the user (the broker's "ask" route).
+  confirmation routed to the user (a permission request, as the broker's
+  asks are).
   → [bridges](architecture/helper/bridges.md#opening-urls-kind-open); `open::decide`
 - **daemon**: opening on every member attached right now instead of the
   last attach only. → [fleet](architecture/daemon/fleet.md#last-attach); `serve::opens::route`
@@ -365,7 +368,8 @@ is frozen: no new work on it.
 - `github-app-manifest` logins are refused
   (github-and-sentry-access step 3). `credentials.toml`'s `members`,
   `approvers` and `delegate` parse and `access ls` lists them, but
-  nothing acts on them yet; of `as`'s kinds only `user` works, `app`
+  nothing acts on them yet (approvers: credential-broker step 4b); of
+  `as`'s kinds only `user` works, `app`
   (installation tokens) refusing the run until step 3.
   → [login](architecture/credentials/login.md); `commands::login::choose`
 - A pasted token's expiry comes from `login`'s `check` response, else
@@ -404,10 +408,14 @@ is frozen: no new work on it.
   → [images and features](architecture/instances/images-and-features.md#credential-claims),
   [ca](architecture/credentials/ca.md#trust-in-containers);
   `credentials::instance::plan`, `commands::run::claims::wire`
-- Permission requests: `presence` routes pass unasked (credential-broker
-  step 4's next part), and requests live in the daemon's memory, so a
-  drain or restart drops the open ones and the answers `devsbd access
-  wait` would read (it then says `unknown`). The GitHub
+- Permission requests: a push's `presence` ref forms (`refs/tags/*`,
+  branch deletions) pass unasked, as receive-pack's commands aren't read
+  (credential-broker step 4b, with git-gateway step 2). Requests live in
+  the daemon's memory, so a drain or restart drops the open ones with
+  their held calls, and the late answers `devsbd access wait` would read
+  (it then says `unknown`). A held call keeps one of its bridge's 48
+  broker handler slots and an `access wait` one of its 8 notify/control
+  handler slots for as long as it waits. The GitHub
   repo fence is enforced on a fenced claim's `{repo}` and
   `/repositories/{id}` routes
   ([fence](architecture/credentials/fence.md#enforcement)) and on
@@ -429,9 +437,9 @@ is frozen: no new work on it.
   actions' headers (only the injected token masked); transfer adapters
   other than `basic` (tus, ssh) aren't rewritten. No token and registration
   endpoints a claim could mark (no claim field). A credential marked
-  broken notifies no approver (credential-broker step 4). Policy reads no
-  request body beyond an LFS batch's `operation` and a GraphQL request's
-  document, and token-shaped response headers aren't stripped: only the injected value is masked. One
+  broken notifies no approver (credential-broker step 4b). Policy reads no
+  request body beyond an LFS batch's `operation`, a GraphQL request's
+  document and a presence route's target or `draft`, and token-shaped response headers aren't stripped: only the injected value is masked. One
   upstream connection per call, no pooling. `access.log` shows nowhere
   (no dashboard view, nor in `access ls`).
   → [broker](architecture/credentials/broker.md); `broker::policy::decide`,
@@ -444,8 +452,8 @@ is frozen: no new work on it.
   mirrors the features repo's metadata and claim by hand.
   → [gh](architecture/credentials/gh.md)
 - The agent relay's key filter under a git-host claim signs a named
-  key's login with no confirmation (confirm-on-sign is a permission
-  request, credential-broker step 4). A destination key's forwarding hops
+  key's login with no confirmation (confirm-on-sign, a permission
+  request, is git-gateway step 5). A destination key's forwarding hops
   aren't checked, only the login's own bind; an agent certificate isn't
   matched by its underlying key; ecdsa nistp521, `ssh-rsa` (SHA-1),
   certificate and security-key host keys can't bind. The dashboard's `o`
@@ -453,16 +461,18 @@ is frozen: no new work on it.
   `devsandbox vscode --allow-credential-leak`).
   → [ssh-agent](architecture/helper/ssh-agent.md#key-filtering);
   `devsbd::agent_filter::Filter`, `commands::vscode::leak_refusal`
-- `login` and `access approve|ls|revoke` are local only: no `access.*` /
-  `credentials.*` API methods, so no approver answers from another host
-  (credential-broker step 4). → [plan](plans/active/credential-broker.md)
+- `access.pending` and `access.decide` take local clients only, and
+  `login` and `access approve <credential>|ls|revoke` are local commands
+  with no `credentials.*` API methods, so no approver answers from
+  another host (credential-broker step 4b).
+  → [plan](plans/active/credential-broker.md)
 - `access revoke` of an OAuth credential leaves its token valid at the
   provider until it expires (no claim field names a revocation
   endpoint), and `access ls` shows no approval time (`credentials.toml`
   records none). → [credentials CLI](reference/credentials-cli.md#access-revoke);
   `commands::access::revoke_at`
 - `run`'s host-class warning fires only on a host that brokers a
-  credential, not yet on one that is a credential's approver (step 4), and
+  credential, not yet on one that is a credential's approver (step 4b), and
   `access ls` marks neither it nor a shared writable bind (left out of
   step 2, deferred again by git-gateway step 1); the
   `runArgs` refusals wait for `runArgs` to reach the runtime. In a build

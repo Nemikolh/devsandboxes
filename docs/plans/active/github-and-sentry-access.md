@@ -2,8 +2,8 @@
 
 Status: agreed; steps 1-2 built, building step 2b, steps 3-4 parked. Needs [credential-broker](credential-broker.md)
 step 1 for sentry (step 1 here), its step 3 for gh (step 2 here), its
-step 4 for `ask` scopes (which answer 403 with the reason until
-then), its step 5 for remote sandboxes; its git half needs
+step 4 for `ask` scopes and `presence` (built), its step 5 for remote
+sandboxes; its git half needs
 [git-gateway](git-gateway.md) step 1, the smart-HTTP rule table on the
 `github.com` intercept on git's own proxy port (*git* below).
 Design and diagrams:

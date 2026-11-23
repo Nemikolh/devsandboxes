@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- **Permission requests: an asked scope waits for your answer instead of failing.** A call needing a scope in a sandbox's `access.<kind>.ask` (or one in no scope of an unfenced claim) is now held, up to the claim's `hold` (2 minutes by default), while you answer from the dashboard's modal, the desktop popup or `devsandbox access pending|approve|deny`: `--for once` (the default), `instance` (this instance until its `rm`) or `always` (a rule on the credential in `credentials.toml`, which you can also write by hand). A deny is kept, so a retrying agent is refused at once; `devsandbox access revoke R-…` drops a kept answer or rule. An agent refused while a request is pending can run `devsbd access wait R-…` in the sandbox and retry once it's answered. An instance gets at most three open requests, so volume can't wear you down.
+
+  ```bash
+  devsandbox access pending
+  devsandbox access approve R-7Q2M9XK4TB0D --for instance
+  ```
+
+- **Tags, releases and ref deletions always ask.** With gh's claim, deleting a branch, creating, moving or deleting a tag (REST `git/refs` or GraphQL `createRef`/`updateRef`/`deleteRef`) and publishing a release are asked every time, on each tag or ref, even when the scope allows them (creating or moving a branch isn't): answered once or for this instance on that one target, never always, and no rule opens them. A draft release isn't asked until it's published, so gh's draft-then-publish is one question. Pushes over git aren't asked yet.
+
 ### Changed
 
 - **Sentry credentials reach only the orgs they name.** A Sentry token spans every org its account is in; now a `sentry` credential names the orgs sandboxes may use, with `devsandbox login --org <slug>` (repeatable, each checked with the token), and the broker refuses calls naming any other org, by slug or id. The org list sentry gets shows only those orgs, and `access.sentry.orgs` in a sandbox's config narrows it further. A credential naming none has every org call refused, so an existing `sentry` credential needs its orgs: log in a new one under a new name (`devsandbox login sentry-my-org --feature ghcr.io/devsandboxes/features/sentry:1 --org my-org`) or add `orgs = ["my-org"]` to its entry in `credentials.toml`. Needs the sentry feature 1.3.0, which also drops the routes that listed other orgs' projects and app installations.

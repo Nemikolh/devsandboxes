@@ -3,8 +3,10 @@
 //! on its connection's thread while a request waits in the daemon's one
 //! [`Registry`] for an answer. Requests are keyed by [`AskKey`]: a call
 //! with the key of an unanswered request joins it, so a retry never opens
-//! a second one. An instance with [`MAX_OPEN_SCOPE_ASKS`] requests still
-//! held is refused at once, so volume can't wear an approver down. A
+//! a second one. An instance with [`MAX_OPEN_SCOPE_ASKS`] scope requests
+//! (or [`MAX_OPEN_PRESENCE_ASKS`] presence ones) still held is refused at
+//! once, so volume can't wear an approver down. A presence request
+//! ([`AskKey::presence`]) is never answered *always*. A
 //! request no call waits on any more stays listed for [`LATE_GRANT`]: a
 //! `once` answer then becomes a one-shot grant for the instance's next
 //! matching call ([`Registry::granted`]). *This instance* and deny answers
@@ -20,6 +22,7 @@ use std::sync::{Condvar, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 use super::refusal::Refusal;
 use crate::credentials::answers::{self, Kind, Remembered};
@@ -33,6 +36,8 @@ pub const DEFAULT_HOLD: Duration = Duration::from_secs(120);
 pub const LATE_GRANT: Duration = Duration::from_secs(300);
 /// Held scope requests per instance; a new one past it is refused.
 pub const MAX_OPEN_SCOPE_ASKS: usize = 3;
+/// Held presence requests per instance, counted apart from scope ones.
+pub const MAX_OPEN_PRESENCE_ASKS: usize = 1;
 
 /// What one answer covers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -43,7 +48,34 @@ pub struct AskKey {
     /// The repo a repo-attributed scope's call names (lowercase
     /// `owner/name`); `None` for a claim without a repo fence.
     pub repo: Option<String>,
+    /// A `presence` call's: asked even when its scope is allowed, and
+    /// answered for this one route and target only.
+    pub presence: Option<PresenceAt>,
 }
+
+/// What a presence answer covers beside its scope.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PresenceAt {
+    /// `<METHOD> <path>` as the call sent it (query dropped), or
+    /// `graphql mutation <name>`.
+    pub route: String,
+    /// The ref or tag it acts on, ids resolved by the home.
+    pub target: String,
+}
+
+/// [`Registry::answer`]'s error for an *always* answer to a presence
+/// request: a client's mistake, not the registry's.
+#[derive(Debug)]
+pub struct NotAlways(pub String);
+
+impl std::fmt::Display for NotAlways {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotAlways {}
 
 /// A call policy holds for an answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,12 +283,19 @@ impl Registry {
             self.changed();
             return Ok(Ticket { id, deadline, opened: false });
         }
+        let presence = ask.key.presence.is_some();
         let held: Vec<&Entry> = g
             .entries
             .iter()
-            .filter(|e| e.answer.is_none() && e.request.key.instance_id == ask.key.instance_id && now < e.request.held_until)
+            .filter(|e| {
+                e.answer.is_none()
+                    && e.request.key.instance_id == ask.key.instance_id
+                    && e.request.key.presence.is_some() == presence
+                    && now < e.request.held_until
+            })
             .collect();
-        if held.len() >= MAX_OPEN_SCOPE_ASKS {
+        let cap = if presence { MAX_OPEN_PRESENCE_ASKS } else { MAX_OPEN_SCOPE_ASKS };
+        if held.len() >= cap {
             let refusal = pending(&held[0].request.id, format!("another request pending for this instance: {}", held[0].request.id));
             drop(g);
             self.changed_if(dropped);
@@ -319,7 +358,8 @@ impl Registry {
     /// Answers listed request `id`: keeps the answer ([`remember`]), then
     /// wakes its waiters; with none left, a `once` leaves a one-shot grant
     /// instead. `Ok(None)`: no such request. A failed write leaves the
-    /// request unanswered.
+    /// request unanswered; so does *always* to a presence request, a
+    /// [`NotAlways`] error.
     pub fn answer(&self, id: &str, answer: Answer) -> Result<Option<Request>> {
         let now = (self.clock)();
         let (mut g, dropped) = self.lock(now);
@@ -329,6 +369,15 @@ impl Registry {
             return Ok(None);
         };
         let request = g.entries[i].request.clone();
+        if answer == Answer::Always && request.key.presence.is_some() {
+            drop(g);
+            self.changed_if(dropped);
+            return Err(NotAlways(format!(
+                "request {id} is a presence request (a call the claim has a person approve on each target): \
+                 answer it once or for this instance, never always"
+            ))
+            .into());
+        }
         // Under the lock: a second answer to the same request finds it
         // answered, never writes again.
         if let Err(e) = remember(&self.data, &request, answer) {
@@ -466,6 +515,7 @@ fn remember(data: &Path, request: &Request, answer: Answer) -> Result<()> {
         credential: key.credential.clone(),
         scope: key.scope.clone(),
         repo: key.repo.clone(),
+        presence: key.presence.clone(),
         answer: kind,
         at: crate::inbox::rfc3339(crate::state::Instance::now()),
     };

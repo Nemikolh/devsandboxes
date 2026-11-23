@@ -98,6 +98,15 @@ pub trait Lookup {
     fn node(&self, via: &Via<'_>, node_id: &str) -> Option<RepoRef>;
     /// Records `repo`'s pin unless it has one.
     fn pin(&self, repo: &str, to: &RepoRef);
+    /// `GET` of a release's own path (`/repos/{repo}/releases/{id}`): its
+    /// `tag_name`, what a presence call publishing it acts on.
+    fn release_tag(&self, _via: &Via<'_>, _path: &str) -> Option<String> {
+        None
+    }
+    /// `node(id:)` of a `Ref`: its full name (`refs/tags/v1`).
+    fn ref_name(&self, _via: &Via<'_>, _node_id: &str) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,6 +334,38 @@ pub fn parse_node(body: &[u8]) -> (Fetched, bool) {
     (r.map_or(Fetched::Missing, Fetched::Found), repo)
 }
 
+/// The `node(id:)` query for a ref's name.
+const REF_QUERY: &str = "query($id:ID!){node(id:$id){__typename ...on Ref{name prefix}}}";
+
+/// `GET path` (a release's): its `tag_name`; `None` for any other answer.
+pub fn fetch_release_tag(t: &dyn Transport, via: &Via<'_>, path: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Release {
+        tag_name: String,
+    }
+    let a = t.call(via, "GET", path, None).ok().filter(|a| a.status == 200)?;
+    let r: Release = serde_json::from_slice(&a.body).ok()?;
+    (!r.tag_name.is_empty()).then_some(r.tag_name)
+}
+
+/// `node(id:)` of a ref: `prefix` and `name`; `None` when the node isn't a
+/// `Ref` or there's no answer.
+pub fn fetch_ref_name(t: &dyn Transport, via: &Via<'_>, node_id: &str) -> Option<String> {
+    let body = serde_json::json!({ "query": REF_QUERY, "variables": { "id": node_id } }).to_string();
+    let a = t.call(via, "POST", "/graphql", Some(body.as_bytes())).ok().filter(|a| a.status == 200)?;
+    parse_ref(&a.body)
+}
+
+pub fn parse_ref(body: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let node = &v["data"]["node"];
+    if node["__typename"] != "Ref" {
+        return None;
+    }
+    let (prefix, name) = (node["prefix"].as_str()?, node["name"].as_str()?);
+    (prefix.starts_with("refs/") && prefix.ends_with('/') && !name.is_empty()).then(|| format!("{prefix}{name}"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Key {
     Name(String),
@@ -417,6 +458,16 @@ impl Lookup for Live<'_> {
             }
             _ => None,
         }
+    }
+
+    // Never cached: a release's tag can change between two calls, and an
+    // asked call is rare enough to look up each time.
+    fn release_tag(&self, via: &Via<'_>, path: &str) -> Option<String> {
+        fetch_release_tag(self.transport, via, path)
+    }
+
+    fn ref_name(&self, via: &Via<'_>, node_id: &str) -> Option<String> {
+        fetch_ref_name(self.transport, via, node_id)
     }
 
     fn pin(&self, repo: &str, to: &RepoRef) {

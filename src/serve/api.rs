@@ -1364,8 +1364,8 @@ fn forwards_rm(p: ForwardsRmParams, ctx: &Ctx) -> Answer {
 }
 
 /// A permission request as `access.*` show it. What the sandbox's call
-/// chose (method, route, repo) has its control characters escaped, so no
-/// client prints a container's terminal escapes.
+/// chose (method, route, repo, a presence target) has its control
+/// characters escaped, so no client prints a container's terminal escapes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccessRequest {
     pub id: String,
@@ -1378,6 +1378,9 @@ pub struct AccessRequest {
     pub repo: Option<String>,
     pub method: String,
     pub route: String,
+    /// A presence request's target (the ref or tag it acts on): answered
+    /// once or for this instance only, never always.
+    pub presence: Option<String>,
     /// Unix seconds.
     pub opened_at: u64,
     /// A call waits on it now; else only a late answer is left.
@@ -1399,6 +1402,7 @@ impl AccessRequest {
             repo: r.key.repo.as_deref().map(printable),
             method: printable(&r.method),
             route: printable(&r.route),
+            presence: r.key.presence.as_ref().map(|p| printable(&p.target)),
             opened_at: r.opened_unix,
             held: r.waiting > 0,
             waiting: r.waiting,
@@ -1430,7 +1434,10 @@ fn access_decide(p: DecideParams, ctx: &Ctx) -> Answer {
         .ok_or_else(|| ApiError::invalid(format!("unknown answer `{}` (once, instance, always, deny)", p.answer)))?;
     let request = registry
         .answer(&p.request, answer)
-        .map_err(ApiError::internal)?
+        .map_err(|e| match e.downcast_ref::<asks::NotAlways>() {
+            Some(not) => ApiError::invalid(not.to_string()),
+            None => ApiError::internal(e),
+        })?
         .ok_or_else(|| ApiError::not_found(format!("no pending request `{}`", crate::open::printable(&p.request))))?;
     Ok(json!({ "request": AccessRequest::new(&request) }))
 }
@@ -2950,6 +2957,7 @@ mod tests {
                 credential: "github-work".into(),
                 scope: scope.into(),
                 repo: Some("o/r\u{1b}[2J".into()),
+                presence: None,
             },
             instance: "web-1".into(),
             sandbox: "web".into(),
@@ -3015,6 +3023,19 @@ mod tests {
         // Answered already, or never raised.
         assert_eq!(code(access("access.decide", json!({"request": deny, "answer": "once"}))), "not-found");
         assert_eq!(code(access("access.decide", json!({"request": "R-0000000000AB", "answer": "once"}))), "not-found");
+
+        // A presence request lists its target, escaped, and takes no always.
+        let mut tag = held_ask("git.push", "/repos/o/r/git/refs/tags/v1");
+        tag.key.presence = Some(asks::PresenceAt { route: "DELETE /repos/o/r/git/refs/tags/v1".into(), target: "v1\u{1b}".into() });
+        let id = registry.ask(&tag).unwrap().id().to_string();
+        let listed = access("access.pending", json!({})).unwrap();
+        assert_eq!(listed["requests"][0]["presence"], "v1\\u{1b}");
+        crate::serve::dts::assert_matches("AccessRequest", &listed["requests"][0]);
+        let e = access("access.decide", json!({"request": id, "answer": "always"})).unwrap_err();
+        assert_eq!(e.code, "invalid");
+        assert!(e.message.contains("once or for this instance, never always"), "{}", e.message);
+        assert_eq!(access("access.pending", json!({})).unwrap()["requests"][0]["id"], id.as_str(), "still pending");
+        access("access.decide", json!({"request": id, "answer": "instance"})).unwrap();
 
         // A daemon brokering nothing says so.
         assert_eq!(code(run(&path, "access.pending", json!({}))), "internal");

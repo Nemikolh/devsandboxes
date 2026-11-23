@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::broker::asks::AskKey;
+use crate::broker::asks::{AskKey, PresenceAt};
 
 pub const VERSION: u32 = 1;
 
@@ -40,6 +40,8 @@ pub struct Remembered {
     pub scope: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence: Option<PresenceAt>,
     pub answer: Kind,
     /// RFC 3339, UTC.
     pub at: String,
@@ -52,6 +54,7 @@ impl Remembered {
             credential: self.credential.clone(),
             scope: self.scope.clone(),
             repo: self.repo.clone(),
+            presence: self.presence.clone(),
         }
     }
 }
@@ -137,6 +140,7 @@ mod tests {
             credential: "github-work".into(),
             scope: scope.into(),
             repo: repo.map(String::from),
+            presence: None,
             answer,
             at: "2026-11-23T10:00:00Z".into(),
         }

@@ -1,7 +1,7 @@
 //! Permission requests (docs/architecture/dashboard/tabs-and-actions.md,
 //! *Permission requests*): each pending one the user hasn't put off opens
 //! a modal, `o`/`i`/`a`/`d` answering it (once, this instance, always,
-//! deny) and `esc` putting it off; `:access` reopens the oldest. A request
+//! deny; a presence one takes no `a`) and `esc` putting it off; `:access` reopens the oldest. A request
 //! listed while another modal is up, the prompt is open or keys go to a
 //! terminal or a text input waits for them to close, so a modal never
 //! takes keys typed for something else. One that opens by itself ignores
@@ -32,12 +32,11 @@ fn modal_text(r: &AccessRequest) -> (String, Vec<String>) {
         1 => "yes, a call waits on the answer".to_string(),
         n => format!("yes, {n} calls wait on the answer"),
     };
-    let body = vec![
-        format!("  scope    {scope}"),
-        format!("  call     {} {}", r.method, r.route),
-        format!("  held     {held}"),
-        format!("  request  {}", r.id),
-    ];
+    let mut body = vec![format!("  scope    {scope}"), format!("  call     {} {}", r.method, r.route)];
+    if let Some(target) = &r.presence {
+        body.push(format!("  target   {target} (a person approves each one)"));
+    }
+    body.extend([format!("  held     {held}"), format!("  request  {}", r.id)]);
     (question, body)
 }
 
@@ -95,7 +94,8 @@ impl App {
     fn show_access(&mut self, r: &AccessRequest) {
         self.access_guard = None;
         let (question, body) = modal_text(r);
-        self.modal = Modal::Confirm(ConfirmModal::new(question, body, Confirmed::Access(r.id.clone())));
+        let action = Confirmed::Access { id: r.id.clone(), presence: r.presence.is_some() };
+        self.modal = Modal::Confirm(ConfirmModal::new(question, body, action));
     }
 
     /// The modal's key: an answer goes to the daemon, `None` (`esc`) puts
@@ -147,6 +147,7 @@ mod tests {
             repo: Some("o/r".into()),
             method: "POST".into(),
             route: "/repos/o/r/pulls".into(),
+            presence: None,
             opened_at: 1,
             held: true,
             waiting: 1,
@@ -182,6 +183,31 @@ mod tests {
         app.set_access(vec![request("R-1"), request("R-2")]);
         assert_eq!(shown(&app), Some("R-1"));
         assert_eq!(app.access_note().as_deref(), Some("2 permission requests (:access)"));
+    }
+
+    #[test]
+    fn a_presence_request_shows_its_target_and_takes_no_always() {
+        let mut app = new_app();
+        let tag = AccessRequest { presence: Some("v1".into()), route: "/repos/o/r/git/refs/tags/v1".into(), method: "DELETE".into(), ..request("R-1") };
+        app.set_access(vec![tag]);
+        let Modal::Confirm(m) = &app.modal else { unreachable!() };
+        assert_eq!(
+            m.body,
+            [
+                "  scope    pr.write on o/r",
+                "  call     DELETE /repos/o/r/git/refs/tags/v1",
+                "  target   v1 (a person approves each one)",
+                "  held     yes, a call waits on the answer",
+                "  request  R-1",
+            ]
+        );
+        assert_eq!(m.choices(), "[o] once  [i] this instance (this target)  [d] deny  [esc] later");
+        assert!(!m.keys_hint().contains("always"), "{}", m.keys_hint());
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(shown(&app), Some("R-1"), "`a` does nothing");
+        assert_eq!(app.take_pending_decide(), None);
+        app.on_key(key(KeyCode::Char('i')));
+        assert_eq!(app.take_pending_decide(), Some(("R-1".to_string(), Answer::Instance)));
     }
 
     #[test]

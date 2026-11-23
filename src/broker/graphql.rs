@@ -115,10 +115,16 @@ struct Request {
     operation_name: Option<String>,
 }
 
-fn request(body: &[u8]) -> Result<Request, String> {
+/// `body` as one JSON value, no object naming a key twice.
+pub fn strict_json(body: &[u8]) -> Result<Json, String> {
     let mut de = serde_json::Deserializer::from_slice(body);
-    let Strict(v) = Strict::deserialize(&mut de).map_err(|e| format!("a GraphQL body that isn't strict JSON: {e}"))?;
-    de.end().map_err(|e| format!("a GraphQL body that isn't strict JSON: {e}"))?;
+    let Strict(v) = Strict::deserialize(&mut de).map_err(|e| e.to_string())?;
+    de.end().map_err(|e| e.to_string())?;
+    Ok(v)
+}
+
+fn request(body: &[u8]) -> Result<Request, String> {
+    let v = strict_json(body).map_err(|e| format!("a GraphQL body that isn't strict JSON: {e}"))?;
     let mut obj = match v {
         Json::Object(o) => o,
         Json::Array(_) => return Err("a batch of GraphQL requests".into()),
@@ -835,6 +841,13 @@ pub fn inputs(field: &Field, path: &str) -> Result<Vec<Leaf>, String> {
         }
     }
     Ok(out)
+}
+
+/// [`inputs`] over a REST call's JSON body, an object.
+pub fn json_inputs(body: &Json, path: &str) -> Result<Vec<Leaf>, String> {
+    let Json::Object(o) = body else { return Err("a body that isn't a JSON object".into()) };
+    let field = Field { name: "the body".into(), args: o.iter().map(|(k, v)| (k.clone(), from_json(v))).collect() };
+    inputs(&field, path)
 }
 
 #[cfg(test)]

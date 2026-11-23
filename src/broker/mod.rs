@@ -17,6 +17,8 @@
 //!   upstream URLs turned into loopback ones, the broker's own answers.
 //! - [`lfs`]: LFS batch responses' transfers behind handles on the
 //!   instance's LFS listener.
+//! - [`presence`]: the `presence` routes a call is and the targets they
+//!   name.
 //! - [`policy`], [`github`], [`orgs`], [`asks`], [`audit`], [`intercept`],
 //!   [`serve`] (unix, with `serve`): the decision per call, the repo fence
 //!   resolved to GitHub's ids, org slugs resolved to their ids, the
@@ -54,6 +56,7 @@ pub mod lfs;
 pub mod orgs;
 #[cfg(unix)]
 pub mod policy;
+pub mod presence;
 pub mod redact;
 pub mod refusal;
 pub mod rewrite;
