@@ -1,6 +1,6 @@
 {
   "id": "sentry",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "name": "sentry, brokered (test fixture)",
   "description": "Test fixture mirroring github.com/devsandboxes/features' src/sentry: the same metadata and claim, keep them in step. Its install.sh installs nothing.",
   "options": {
