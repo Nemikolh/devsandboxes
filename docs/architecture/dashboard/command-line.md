@@ -21,7 +21,8 @@ some `ArgValue`), `positionals` (required, in order) and `trailing`
 
 Both parsing and completion read it, so a flag can't parse without
 completing or the other way round. Commands today: `run`, `exec`, `code`,
-`rm`, `rename`, `profile`, `stop`, `start`, `rebuild` (alias `recreate`), `port`.
+`rm`, `rename`, `profile`, `stop`, `start`, `rebuild` (alias `recreate`), `port`,
+`access`.
 
 `ArgValue` says what a position holds and what completes there:
 `Instance`, `InstanceOrService` (services on the Services tab),
@@ -46,7 +47,9 @@ prompt open. Two rewrites happen here, where the tab is known, keeping the
 parser pure: `rebuild` on the Services tab becomes
 `PromptAction::ServiceRebuild` (`--force` dropped), and `port` becomes a
 `pending_port` request (switching to the Ports tab) rather than a
-`pending_action`.
+`pending_action`. `access` reaches no event loop either: it opens the
+oldest pending permission request's modal
+([tabs-and-actions.md](tabs-and-actions.md#permission-requests)).
 
 `port`'s names resolve together (`resolve_port`): the instance names the
 machine and a bare `--service` is that machine's (`port box/web --service

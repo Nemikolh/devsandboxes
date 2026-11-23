@@ -61,14 +61,14 @@ works on the store alone.
   (client `tui`), so the dashboard is a holder. Connects lazily (starting
   a daemon if none answers; after a version handoff it waits for the
   successor first), subscribes to `inbox`, `instances`, `forwards`,
-  `opens`, and watches this root (`instances.watch` with `machines: true`) on every
+  `opens`, `access`, and watches this root (`instances.watch` with `machines: true`) on every
   (re)connect. Reconnects on the `Backoff` schedule (at once, then 1 s
   doubling to 30 s). Relays pushes as `DaemonUpdate`s
   (`Snapshot`, `Down`, `InboxChanged`, `InstancesChanged`, `Shown`,
-  `Ports`, …; `forwards.status` and `opens.done` lines are `Status`,
+  `Ports`, `AccessPending`, …; `forwards.status` and `opens.done` lines are `Status`,
   `line_update`) and carries the one-shot `Cmd`s: `Fetch` (logs, config,
   inspect), `BuildLog`, `Signal`, `Rename`, `Done`, `Cancel`, `Inbox`
-  ops, `ForwardAdd`/`ForwardRm`. Disconnected, each answers with a
+  ops, `ForwardAdd`/`ForwardRm`, `AccessDecide`. Disconnected, each answers with a
   "needs devsandbox serve" line.
 - **Poll worker** (`PollWorker`): `instances.procs` on a connection of its
   own, so a slow `docker exec` never delays notifications; at most one

@@ -404,11 +404,11 @@ is frozen: no new work on it.
   → [images and features](architecture/instances/images-and-features.md#credential-claims),
   [ca](architecture/credentials/ca.md#trust-in-containers);
   `credentials::instance::plan`, `commands::run::claims::wire`
-- Permission requests are held and their answers kept (rules in
-  `credentials.toml`, `access.json`), but nothing can answer one yet: no
-  API, `access pending|approve|deny`, dashboard modal or popup
-  (credential-broker step 4), so a held call ends `pending` after its
-  hold; `presence` routes pass. The GitHub
+- Permission requests are answered by `access pending|approve|deny`,
+  the dashboard's modal and the command a desktop popup names, but a
+  container can't wait for an answer past the hold yet (`devsbd access
+  wait`, credential-broker step 4), so a held call still ends `pending`
+  after its hold; `presence` routes pass. The GitHub
   repo fence is enforced on a fenced claim's `{repo}` and
   `/repositories/{id}` routes
   ([fence](architecture/credentials/fence.md#enforcement)) and on

@@ -54,6 +54,9 @@ pub enum PromptAction {
     /// `App` turns this into a `pending_port` request (not a suspending
     /// `pending_action`) so the event loop never suspends the TUI for it.
     Port { instance: String, service: Option<String>, address: Option<String>, spec: String },
+    /// `access`: the oldest pending permission request's modal; `App`
+    /// opens it, nothing reaches the event loop.
+    Access,
 }
 
 /// In-flight tab-completion over a single token.
@@ -452,6 +455,7 @@ fn parse_line(line: &str) -> Result<PromptAction, String> {
                 spec,
             })
         }
+        "access" => Ok(PromptAction::Access),
         other => unreachable!("spec `{other}` has no PromptAction mapping"),
     }
 }

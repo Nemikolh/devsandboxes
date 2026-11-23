@@ -158,7 +158,8 @@ fills the modal if it is still the one open:
   picker (`Confirmed::Profile`: the allowed profiles listed, the current
   one marked, `↑↓`/`j`/`k` move, `enter` switches, `esc`/`q` cancel),
   and `a`'s session picker (`Confirmed::Attach`, the same keys, `enter`
-  attaching).
+  attaching), and a permission request (`Confirmed::Access`:
+  [Permission requests](#permission-requests)).
 - `?` → `Help`: settings toggles, then every key by context.
 
 ## One-key actions and the pending queue
@@ -166,7 +167,7 @@ fills the modal if it is still the one open:
 `App` never sends anything. A key sets a pending field (`pending_action`,
 `pending_signal`, `pending_session_rm`, `pending_done`, `pending_fetch`, `pending_cancel`,
 `pending_port`/`pending_unport`, `pending_machine_set`, `pending_inbox`,
-`pending_open`, `pending_identity`), and the
+`pending_open`, `pending_identity`, `pending_decide`), and the
 event loop takes each once per pass and hands it to a thread.
 
 A letter or symbol key fires bare or with shift only: `App::stray_chord`
@@ -266,5 +267,36 @@ machine (`machine`, `config.*` being forwarded quick calls).
 
 A rewrite changes `config_hash`, so the next push shows the affected
 instances drifted and their notes gone.
+
+## Permission requests
+
+The dashboard answers the broker's held asks
+([../credentials/broker.md](../credentials/broker.md#permission-requests))
+through the daemon worker: it subscribes to `access` and fetches
+`access.pending` after every (re)connect and on each `access.changed`
+(`Worker::fetch_access`); `DaemonUpdate::AccessPending` hands the list to
+`App::set_access` (`app/access.rs`), and a lost connection empties it.
+
+- **Modal.** The oldest request not answered or put off here
+  (`access_quiet`) opens a `Confirm` modal: `` `<instance>` (sandbox
+  <sandbox>) asks for credential `<credential>` (<kind>) ``, then its
+  scope (and repo), `METHOD route`, whether a call is held on it and its
+  id. `o` once, `i` this instance, `a` always, `d` deny queue
+  `pending_decide`, sent as `access.decide` (`Cmd::AccessDecide`), whose
+  answer is a status line worded as `devsandbox access approve|deny`'s
+  (`commands::access::decided_line`); `esc`/`q` put it off: it stays
+  pending and listed. A request arriving while another modal is up, the
+  prompt is open, or keys go to a terminal or a text input waits until
+  they don't (`App::open_access`, run after every key and mouse event),
+  so typing never lands on the modal. One that opens by itself ignores
+  `o`/`i`/`a`/`d` for `ANSWER_GUARD` (400 ms, on the clock the event loop
+  passes in, `App::set_clock`): a dashboard key already typed (`a`
+  attach, `o` VS Code) would otherwise answer it; `esc`/`q` and an
+  `:access`-opened modal aren't guarded. A request gone from the list
+  (answered elsewhere, or expired) closes its modal with a status line.
+- **Count.** While any is pending, the tab bar's right side leads with
+  `N permission request(s) (:access)` (`App::access_note`), alone when
+  the totals don't fit beside it.
+- **`:access`** opens the oldest pending request, put off or not.
 
 Limitations: [status.md](../../status.md#dashboard)

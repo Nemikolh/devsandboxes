@@ -122,6 +122,16 @@ fn tab_bar_areas(app: &App, area: Rect) -> (Rect, Rect, Option<String>) {
                 _ => with(false).unwrap_or(line),
             }
         });
+    // Pending permission requests lead, so a put-off one isn't lost; when
+    // the totals don't fit beside it, it's shown alone.
+    let totals = match (app.access_note(), totals) {
+        (Some(note), Some(t)) => {
+            let tabs_w = tab_spans(app).last().map_or(0, |(_, _, r)| r.end);
+            let full = format!("{note} · {t}");
+            Some(if tabs_w + cols(&full) as u16 + 4 < area.width { full } else { note })
+        }
+        (note, t) => note.or(t),
+    };
     let totals_w = totals.as_deref().map_or(0, |t| t.chars().count() as u16);
     let reserve = if totals_w > 0 && area.width > totals_w + 4 {
         totals_w + 2
@@ -190,9 +200,15 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), tabs_area);
 
     if let Some(totals) = totals {
-        let line = Line::from(Span::styled(totals, Style::default().add_modifier(Modifier::DIM)))
-            .alignment(Alignment::Right);
-        frame.render_widget(Paragraph::new(line), totals_area);
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        let spans = match app.access_note().filter(|n| totals.starts_with(n.as_str())) {
+            Some(note) => {
+                let rest = totals[note.len()..].to_string();
+                vec![Span::styled(note, Style::default().fg(Color::Yellow)), Span::styled(rest, dim)]
+            }
+            None => vec![Span::styled(totals, dim)],
+        };
+        frame.render_widget(Paragraph::new(Line::from(spans).alignment(Alignment::Right)), totals_area);
     }
 }
 

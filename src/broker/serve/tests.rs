@@ -645,6 +645,39 @@ fn an_unanswered_hold_is_pending_and_a_late_answer_grants_the_next_call() {
     assert_eq!(seen.lock().unwrap().len(), 1);
 }
 
+/// The call that opens a request raises one popup; a retry joining it
+/// raises none.
+#[test]
+fn a_new_request_pops_up_once_and_a_join_doesnt() {
+    let (port, _) = upstream_server(echo);
+    let mut claim = private(sentry());
+    claim.pinned.hold = Some(1);
+    let shown = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let sink = shown.clone();
+    let rig = Rig::with_service("ask-popup", port, state_with(claim.clone()), home_with(&claim), "sentry-work", &claim, |s| {
+        s.with_notify(move |subject, body| sink.lock().unwrap().push((subject.to_string(), body.to_string())))
+    });
+    rig.config("[sandbox.web]\nfolder = \".\"\n[sandbox.web.access.sentry]\nask = [\"issues.read\"]\n");
+    let mut first = rig.connect("sentry.io");
+    let opener = thread::spawn(move || first.call("GET", "/api/0/issues/1/", &bearer(OWN), b"").status);
+    let id = first_pending(rig.service.asks()).id;
+    let mut retry = rig.connect("sentry.io");
+    assert_eq!(retry.call("GET", "/api/0/issues/2/", &bearer(OWN), b"").status, 403);
+    assert_eq!(opener.join().unwrap(), 403);
+    let shown = shown.lock().unwrap();
+    assert_eq!(
+        *shown,
+        [("permission request".to_string(), format!("web-1 asks sentry-work issues.read: devsandbox access approve {id}"))]
+    );
+}
+
+#[test]
+fn request_popups_escape_and_name_the_repo() {
+    let key = AskKey { instance_id: "i".into(), credential: "github-work".into(), scope: "pr.write".into(), repo: Some("o/r\u{1b}[2J".into()) };
+    let ask = Ask { key, instance: "web-1".into(), sandbox: "web".into(), kind: "github".into(), method: "POST".into(), route: "/x".into(), hold: Duration::from_secs(1) };
+    assert_eq!(request_popup(&ask, "R-1"), "web-1 asks github-work pr.write on o/r\\u{1b}[2J: devsandbox access approve R-1");
+}
+
 #[test]
 fn config_edits_apply_to_the_next_call() {
     let (port, _) = upstream_server(echo);
@@ -944,7 +977,10 @@ fn a_pasted_tokens_reported_expiry_is_recorded_and_noticed_once_a_day() {
     let shown = Arc::new(Mutex::new(Vec::<String>::new()));
     let sink = shown.clone();
     let rig = Rig::with_service("expiry", port, state, intercept_home(&claim), "github-work", &claim, |s| {
-        s.with_notify(move |body| sink.lock().unwrap().push(body.to_string()))
+        s.with_notify(move |subject, body| {
+            assert_eq!(subject, "credentials");
+            sink.lock().unwrap().push(body.to_string())
+        })
     });
     let mut c = git_client(&rig);
     for _ in 0..2 {

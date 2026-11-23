@@ -117,11 +117,18 @@ pub struct Request {
 pub struct Ticket {
     id: String,
     deadline: Instant,
+    opened: bool,
 }
 
 impl Ticket {
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// The call opened its request rather than joining one: what raises
+    /// the desktop popup, once per request.
+    pub fn opened(&self) -> bool {
+        self.opened
     }
 }
 
@@ -208,7 +215,7 @@ impl Registry {
             let id = e.request.id.clone();
             drop(g);
             self.changed();
-            return Ok(Ticket { id, deadline });
+            return Ok(Ticket { id, deadline, opened: false });
         }
         let held: Vec<&Entry> = g
             .entries
@@ -245,7 +252,7 @@ impl Registry {
         });
         drop(g);
         self.changed();
-        Ok(Ticket { id, deadline })
+        Ok(Ticket { id, deadline, opened: true })
     }
 
     /// Blocks until the request is answered or the ticket's hold ends

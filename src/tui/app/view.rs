@@ -7,6 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKin
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
+use crate::broker::asks::Answer;
 use crate::build_log::Tail;
 use crate::config::SandboxText;
 use crate::snapshot::PhaseRow;
@@ -149,6 +150,9 @@ Command prompt (:)
   port <instance> [--service s] [--address a] <[host:]port>
               (an instance is required; a global service is reached by
                naming any instance that references it)
+  access      the oldest pending permission request (the header counts
+              them): o once · i this instance · a always · d deny ·
+              esc later (it stays pending; a new one opens by itself)
   tab         complete / cycle
   ↑ ↓         history
   ctrl-u      clear line       ctrl-w  delete word
@@ -327,7 +331,8 @@ fn build_log_title(instance: &str, phase: Option<&PhaseRow>) -> String {
 /// a skip. The profile picker (`P` with more than two allowed) lists the
 /// profiles as `body`, the cursor's marked: `↑↓`/`j`/`k` move, `enter`
 /// switches to it, `esc`/`q` cancel. The session picker (`a` with several
-/// sessions to choose from) is the same, `enter` attaching.
+/// sessions to choose from) is the same, `enter` attaching. A permission
+/// request (`access.rs`) takes `o`/`i`/`a`/`d`, `esc`/`q` putting it off.
 pub struct ConfirmModal {
     pub question: String,
     /// Lines listed under the question (the identity findings).
@@ -349,6 +354,7 @@ impl ConfirmModal {
             Confirmed::IdentityOffer(_) => "u update · c continue as is · l/esc later",
             Confirmed::Profile { .. } => "↑↓ move · enter switch · esc cancel",
             Confirmed::Attach { .. } => "↑↓ move · enter attach · esc cancel",
+            Confirmed::Access(_) => "o once · i this instance · a always · d deny · esc later",
         }
     }
 
@@ -360,11 +366,20 @@ impl ConfirmModal {
             Confirmed::IdentityOffer(_) => "[u] update  [c] continue as is  [l] later",
             Confirmed::Profile { .. } => "[enter] switch  [esc] cancel",
             Confirmed::Attach { .. } => "[enter] attach (an attached one is taken over)  [esc] cancel",
+            Confirmed::Access(_) => "[o] once  [i] this instance  [a] always  [d] deny  [esc] later",
         }
     }
 
     pub fn is_identity(&self) -> bool {
         matches!(self.action, Confirmed::Identity { .. } | Confirmed::IdentityOffer(_))
+    }
+
+    /// The permission request this modal answers, if it's one.
+    pub fn access_id(&self) -> Option<&str> {
+        match &self.action {
+            Confirmed::Access(id) => Some(id),
+            _ => None,
+        }
     }
 }
 
@@ -387,6 +402,8 @@ pub(super) enum Confirmed {
     /// running): its `sessions` as `(id, line)`, detached first, the
     /// `cursor` over them.
     Attach { instance: String, sessions: Vec<(String, String)>, cursor: usize },
+    /// Permission request `id`.
+    Access(String),
 }
 
 /// The session picker's body: one `session ls` line per session (it says
@@ -689,6 +706,21 @@ impl App {
                     _ => {}
                 }
             }
+            Modal::Confirm(view) if view.access_id().is_some() => {
+                let answer = match key.code {
+                    KeyCode::Char('o') => Some(Answer::Once),
+                    KeyCode::Char('i') => Some(Answer::Instance),
+                    KeyCode::Char('a') => Some(Answer::Always),
+                    KeyCode::Char('d') => Some(Answer::Deny),
+                    KeyCode::Esc | KeyCode::Char('q') => None,
+                    _ => return,
+                };
+                let id = view.access_id().unwrap_or_default().to_string();
+                if answer.is_some() && self.access_guarded() {
+                    return;
+                }
+                self.access_chosen(id, answer);
+            }
             Modal::Confirm(view) if matches!(view.action, Confirmed::Profile { .. }) => {
                 let Confirmed::Profile { instance, profiles, current, cursor } = &mut view.action else { return };
                 let n = profiles.len();
@@ -760,7 +792,8 @@ impl App {
                         Confirmed::Identity { .. }
                         | Confirmed::IdentityOffer(_)
                         | Confirmed::Profile { .. }
-                        | Confirmed::Attach { .. },
+                        | Confirmed::Attach { .. }
+                        | Confirmed::Access(_),
                         _,
                     ) => {}
                 }

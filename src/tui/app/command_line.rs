@@ -39,6 +39,7 @@ fn resolve_action(s: &crate::snapshot::Snapshot, action: PromptAction, services:
             let (instance, service) = resolve_port(s, &instance, service.as_deref())?;
             PromptAction::Port { instance, service, address, spec }
         }
+        PromptAction::Access => PromptAction::Access,
     })
 }
 
@@ -272,6 +273,11 @@ impl App {
                             Ok(req) => self.request_port(req),
                             Err(why) => self.status = Some(why),
                         }
+                        return;
+                    }
+                    if action == PromptAction::Access {
+                        self.prompt = None;
+                        self.reopen_access();
                         return;
                     }
                     // `rebuild`/`recreate` parses tab-agnostically as an instance

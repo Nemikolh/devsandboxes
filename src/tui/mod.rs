@@ -264,7 +264,10 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
             TERM_POLL_INTERVAL
         };
         if event::poll(poll)? {
-            match event::read()? {
+            let read = event::read()?;
+            // A key's time, for the access modal's guard.
+            app.set_clock(Instant::now());
+            match read {
                 Event::Key(key) if key.kind == event::KeyEventKind::Press => app.on_key(key),
                 // Feed the full frame area so the modal divider math and the
                 // terminal-panel hit-testing stay I/O-free.
@@ -348,6 +351,9 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         for req in app.take_pending_done() {
             daemon.set_done(req);
         }
+        if let Some((request, answer)) = app.take_pending_decide() {
+            daemon.access_decide(request, answer);
+        }
         for fetch in app.take_pending_fetch() {
             let route = app.snapshot.as_ref().map(|s| fetch_route(s, &fetch)).unwrap_or_default();
             daemon.fetch(fetch, route);
@@ -382,6 +388,8 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         if let Some((name, agent)) = app.take_pending_machine_set() {
             daemon.machine_set(name, agent);
         }
+        // A modal the updates open is guarded from now.
+        app.set_clock(Instant::now());
         while let Some(update) = daemon.try_recv() {
             match update {
                 daemon::DaemonUpdate::InboxChanged => reload_inbox = true,
@@ -432,6 +440,7 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                 daemon::DaemonUpdate::IdentityOffer { groups, asked } => app.identity_offer(groups, asked),
                 // A released verb is taken on the next pass.
                 daemon::DaemonUpdate::Identity { outcome, then } => app.identity_answered(outcome, then),
+                daemon::DaemonUpdate::AccessPending(list) => app.set_access(list),
             }
         }
         // The Inbox lives in one shared file (`crate::inbox::store`), so any

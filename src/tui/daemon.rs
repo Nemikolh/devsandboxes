@@ -2,8 +2,8 @@
 //! worker thread that owns the [`Conn`], so the UI thread never waits on the
 //! socket or on a lazy start (up to 5 s).
 //!
-//! It connects lazily, subscribes to `inbox`, `instances`, `forwards` and
-//! `opens`, and forwards what the daemon says as [`DaemonUpdate`]s the event
+//! It connects lazily, subscribes to `inbox`, `instances`, `forwards`,
+//! `opens` and `access`, and forwards what the daemon says as [`DaemonUpdate`]s the event
 //! loop drains (`opens.done`, what became of a URL a container opened, is a
 //! status line). Holding the connection makes the dashboard a holder, so the worker
 //! reconnects after a `closing`, an EOF or an error, on the [`Backoff`]
@@ -54,6 +54,11 @@
 //! [`DaemonUpdate`] naming its target; disconnected, that answer says the
 //! dashboard needs devsandbox serve ([`needs_serve`]), as `cancel`'s does.
 //!
+//! Permission requests: the worker subscribes to `access` and, after every
+//! (re)connect and on each `access.changed`, fetches `access.pending`
+//! ([`DaemonUpdate::AccessPending`]; none while disconnected); an answer
+//! is `access.decide` ([`Cmd::AccessDecide`]), its outcome a status line.
+//!
 //! Identity (docs/architecture/dashboard/tabs-and-actions.md, *Identity
 //! modals*): the offer's `config.findings` and a modal's
 //! `config.migrate`/`config.ack` share it too ([`Cmd::Identity`]), run by
@@ -81,7 +86,8 @@ use crate::serve::verbs_client::identity::{self, Ask, Group, Scope};
 use crate::build_log::Tail;
 use crate::config::SandboxText;
 use crate::inbox::{self, Op};
-use crate::serve::api::InstancesList;
+use crate::broker::asks;
+use crate::serve::api::{AccessRequest, InstancesList};
 use crate::serve::client::{self, Conn};
 use crate::serve::forwards::{Added, ForwardRow};
 use crate::serve::endpoint;
@@ -147,6 +153,9 @@ pub enum DaemonUpdate {
     /// it did (one line), `Err` for a file changed meanwhile; and the verb
     /// it held.
     Identity { outcome: Result<String, String>, then: Option<PromptAction> },
+    /// The pending permission requests, oldest first; none while
+    /// disconnected.
+    AccessPending(Vec<AccessRequest>),
 }
 
 /// From the event loop to the worker.
@@ -178,6 +187,8 @@ enum Cmd {
     Done(PendingDone),
     /// `config.findings` for the offer, or an identity modal's answer.
     Identity(IdentityReq),
+    /// `access.decide`.
+    AccessDecide { request: String, answer: asks::Answer },
 }
 
 /// Handle to the daemon worker. Never blocks the UI thread; dropping it
@@ -285,6 +296,12 @@ impl DaemonWorker {
     /// [`DaemonUpdate::Identity`].
     pub fn identity(&self, req: IdentityReq) {
         self.send(Cmd::Identity(req));
+    }
+
+    /// Answer permission request `request`. Never blocks; the outcome is a
+    /// status line.
+    pub fn access_decide(&self, request: String, answer: asks::Answer) {
+        self.send(Cmd::AccessDecide { request, answer });
     }
 
     fn send(&self, cmd: Cmd) {
@@ -633,6 +650,38 @@ fn identity_outcome(done: Result<()>, said: Vec<String>) -> Result<String, Strin
     Ok(said.iter().flat_map(|s| s.lines()).map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("; "))
 }
 
+fn access_decide_call(request: &str, answer: asks::Answer) -> (&'static str, Value) {
+    ("access.decide", json!({ "request": request, "answer": answer.marker() }))
+}
+
+/// The status line for an `access.decide` answer: what it did, as `devsandbox
+/// access approve|deny` says it, or why not.
+fn access_decide_status(request: &str, answer: asks::Answer, reply: Answer) -> String {
+    #[derive(serde::Deserialize)]
+    struct Decided {
+        request: AccessRequest,
+    }
+    match reply {
+        Answer::Refused(msg) => format!("{request}: {msg}"),
+        reply => match reply.parse::<Decided>("access") {
+            Ok(d) => crate::commands::access::decided_line(&d.request, answer),
+            Err(line) => line,
+        },
+    }
+}
+
+/// `access.pending`'s answer as the requests.
+fn access_requests(reply: Answer) -> Result<Vec<AccessRequest>, String> {
+    #[derive(serde::Deserialize)]
+    struct Pending {
+        requests: Vec<AccessRequest>,
+    }
+    match reply {
+        Answer::Refused(msg) => Err(format!("access: {msg}")),
+        reply => reply.parse::<Pending>("access").map(|p| p.requests),
+    }
+}
+
 /// The API call for `forwards.list` of config root `dir`, plus every
 /// forward into a machine (they bind here whatever root they reach).
 fn list_call(dir: &Path) -> (&'static str, Value) {
@@ -746,7 +795,7 @@ fn watch_call(dir: &Path) -> (&'static str, Value) {
 /// watch fails the connect, as a dashboard without its pushes isn't one.
 fn open(connect: &Connector, dir: &Path, after_handoff: bool) -> Result<Conn> {
     let mut conn = connect(after_handoff)?;
-    let r = conn.call("subscribe", json!({ "topics": ["inbox", "instances", "forwards", "opens"] }))?;
+    let r = conn.call("subscribe", json!({ "topics": ["inbox", "instances", "forwards", "opens", "access"] }))?;
     if let Some(e) = r.error {
         anyhow::bail!("subscribe: {} ({})", e.message, e.code);
     }
@@ -835,6 +884,7 @@ fn run(dir: &Path, connector: &Connector, rx: Receiver<Cmd>, utx: Sender<DaemonU
             Ok(Cmd::SetProfile { instance, profile }) => w.set_profile(&instance, &profile),
             Ok(Cmd::Done(req)) => w.set_done(req),
             Ok(Cmd::Identity(req)) => w.identity(req),
+            Ok(Cmd::AccessDecide { request, answer }) => w.access_decide(&request, answer),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
@@ -859,6 +909,7 @@ impl Worker<'_> {
                 self.send(DaemonUpdate::InboxChanged);
                 // A new daemon may hold other forwards than the last one.
                 self.fetch_ports();
+                self.fetch_access();
             }
             Err(e) => {
                 self.down = Some(format!("{e:#}"));
@@ -884,6 +935,7 @@ impl Worker<'_> {
         self.connected.store(false, Ordering::Release);
         // No live rows without the daemon that holds them.
         self.send(DaemonUpdate::Ports(Vec::new()));
+        self.send(DaemonUpdate::AccessPending(Vec::new()));
         self.send(DaemonUpdate::Down("connection lost".into()));
         self.after_handoff = after_handoff;
         self.next_attempt = Instant::now() + self.backoff.next();
@@ -902,6 +954,7 @@ impl Worker<'_> {
             "instances.snapshot" => self.send(snapshot_update(note.params)),
             "instances.changed" => self.send(DaemonUpdate::InstancesChanged),
             "forwards.changed" => self.fetch_ports(),
+            "access.changed" => self.fetch_access(),
             "forwards.status" | "opens.done" | "inbox.shown" => {
                 if let Some(update) = line_update(&note.method, &note.params) {
                     self.send(update);
@@ -931,6 +984,23 @@ impl Worker<'_> {
             },
             Err(_) => self.lost(false),
         }
+    }
+
+    /// `access.pending`, into the dashboard's requests.
+    fn fetch_access(&mut self) {
+        if self.conn.is_none() {
+            return;
+        }
+        let reply = self.one_shot("access", ("access.pending", json!({})));
+        match access_requests(reply) {
+            Ok(list) => self.send(DaemonUpdate::AccessPending(list)),
+            Err(line) => self.send(DaemonUpdate::Status(line)),
+        }
+    }
+
+    fn access_decide(&mut self, request: &str, answer: asks::Answer) {
+        let reply = self.one_shot("access", access_decide_call(request, answer));
+        self.send(DaemonUpdate::Status(access_decide_status(request, answer, reply)));
     }
 
     /// `forwards.add`; the answer (or why there's none) is a status line. The
@@ -1683,6 +1753,27 @@ mod tests {
         assert_eq!(done_status(&done(true), warned), ("marked a done; cannot fetch lap/a back: no link".into(), true), "shown even unasked");
         assert_eq!(done_status(&done(false), Answer::Refused("no instance `a`".into())), ("undone: no instance `a`".into(), true));
         assert_eq!(done_status(&done(true), down()), ("x: needs devsandbox serve (down)".into(), true));
+    }
+
+    #[test]
+    fn access_calls_and_their_lines() {
+        assert_eq!(
+            access_decide_call("R-1", asks::Answer::Instance),
+            ("access.decide", json!({"request": "R-1", "answer": "instance"}))
+        );
+        let request = json!({
+            "id": "R-1", "instance": "web-1", "instance_id": "i1", "sandbox": "web", "credential": "github-work",
+            "kind": "github", "scope": "pr.write", "repo": null, "method": "POST", "route": "/x",
+            "opened_at": 1, "held": true, "waiting": 1,
+        });
+        let line = access_decide_status("R-1", asks::Answer::Deny, Answer::Ok(json!({"request": request.clone()})));
+        assert_eq!(line, "denied R-1: `web-1` `github-work` pr.write, kept until `devsandbox access revoke R-1`");
+        assert_eq!(access_decide_status("R-1", asks::Answer::Once, Answer::Refused("no pending request `R-1`".into())), "R-1: no pending request `R-1`");
+        assert_eq!(access_decide_status("R-1", asks::Answer::Once, Answer::Unreachable("access: needs devsandbox serve".into())), "access: needs devsandbox serve");
+
+        let listed = access_requests(Answer::Ok(json!({"requests": [request]}))).unwrap();
+        assert_eq!((listed.len(), listed[0].id.as_str()), (1, "R-1"));
+        assert_eq!(access_requests(Answer::Refused("this daemon brokers no credentials".into())), Err("access: this daemon brokers no credentials".into()));
     }
 
     #[test]

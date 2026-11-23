@@ -99,8 +99,12 @@ pub struct Service {
     ca: Mutex<Option<Arc<RwLock<MemberCa>>>>,
     log: fn(&str),
     notices: Mutex<Notices>,
-    /// Shows a notice's text: the desktop's notifier, a test's sink.
-    notify: Box<dyn Fn(&str) + Send + Sync>,
+    /// Shows a notice: its subject (the popup's title after `devsandbox: `)
+    /// and text, on the desktop's notifier or a test's sink.
+    notify: Notify,
+    /// New requests' popups, per instance: the cap of open asks bounds a
+    /// burst, not a stream of asks answered one after another.
+    popups: Mutex<crate::devsbd::desktop::RateLimit>,
     /// The permission requests held calls wait on: the daemon's one.
     asks: Arc<Registry>,
 }
@@ -152,6 +156,8 @@ impl Wire {
 
 type Conn = BufReader<Wire>;
 
+type Notify = Box<dyn Fn(&str, &str) + Send + Sync>;
+
 impl Service {
     /// The data dir is `state`'s.
     pub fn new(state: PathBuf, upstream: std::result::Result<Upstream, String>) -> Result<Service> {
@@ -173,14 +179,15 @@ impl Service {
             orgs: Mutex::default(),
             log: |_| {},
             notices: Mutex::default(),
-            notify: Box::new(|body| {
+            notify: Box::new(|subject, body| {
                 let popup = crate::inbox::ShownPopup {
                     key: None,
                     level: crate::devsbd::notify::Level::Warn,
                     body: body.to_string(),
                 };
-                crate::devsbd::desktop::notify_desktop("credentials", &popup);
+                crate::devsbd::desktop::notify_desktop(subject, &popup);
             }),
+            popups: Mutex::default(),
         })
     }
 
@@ -215,7 +222,7 @@ impl Service {
     }
 
     #[cfg(test)]
-    pub fn with_notify(mut self, notify: impl Fn(&str) + Send + Sync + 'static) -> Service {
+    pub fn with_notify(mut self, notify: impl Fn(&str, &str) + Send + Sync + 'static) -> Service {
         self.notify = Box::new(notify);
         self
     }
@@ -487,12 +494,24 @@ impl Service {
         })?;
         let id = ticket.id().to_string();
         line.request = Some(id.clone());
+        if ticket.opened() {
+            self.raise(ask, &id);
+        }
         let answer = self.asks.wait(ticket);
         line.decided = Some(answer.map_or("timeout", asks::Answer::marker));
         match answer {
             Some(a) if a.allows() => Ok(()),
             Some(_) => Err(named(asks::denied(&id))),
             None => Err(named(asks::pending(&id, waiting(&id, &ask.key)))),
+        }
+    }
+
+    /// The desktop popup of request `id`, just opened by `ask`.
+    fn raise(&self, ask: &Ask, id: &str) {
+        let now = std::time::Instant::now();
+        let shown = self.popups.lock().unwrap_or_else(|e| e.into_inner()).allow(&ask.key.instance_id, None, now);
+        if shown {
+            (self.notify)("permission request", &request_popup(ask, id));
         }
     }
 
@@ -731,7 +750,7 @@ impl Service {
         let Some(end) = end else { return };
         let due = self.notices.lock().unwrap_or_else(|e| e.into_inner()).due(&inj.credential, end, Instance::now());
         if let Some(body) = due {
-            (self.notify)(&body);
+            (self.notify)("credentials", &body);
         }
     }
 
@@ -1443,6 +1462,14 @@ impl Sources for Files<'_> {
 fn waiting(id: &str, key: &AskKey) -> String {
     let on = key.repo.as_ref().map(|r| format!(" on `{r}`")).unwrap_or_default();
     format!("scope `{}`{on} of credential `{}` needs permission: request {id} is pending", key.scope, key.credential)
+}
+
+/// A new request's popup text, control characters escaped: the repo is
+/// what the sandbox's call named.
+fn request_popup(ask: &Ask, id: &str) -> String {
+    let p = crate::open::printable;
+    let on = ask.key.repo.as_deref().map(|r| format!(" on {}", p(r))).unwrap_or_default();
+    format!("{} asks {} {}{on}: devsandbox access approve {id}", p(&ask.instance), p(&ask.key.credential), p(&ask.key.scope))
 }
 
 #[cfg(test)]

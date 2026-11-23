@@ -137,6 +137,7 @@ pub const SPECS: &[CommandSpec] = &[
         positionals: &[ArgValue::Instance, ArgValue::Free],
         trailing: false,
     },
+    CommandSpec { name: "access", aliases: &[], usage: "access", flags: &[], positionals: &[], trailing: false },
 ];
 
 /// Look up a command by primary name or alias.
@@ -360,6 +361,6 @@ mod tests {
     #[test]
     fn specs_cover_all_commands_in_display_order() {
         let names: Vec<&str> = SPECS.iter().map(|s| s.name).collect();
-        assert_eq!(names, ["run", "exec", "code", "rm", "rename", "profile", "stop", "start", "rebuild", "port"]);
+        assert_eq!(names, ["run", "exec", "code", "rm", "rename", "profile", "stop", "start", "rebuild", "port", "access"]);
     }
 }

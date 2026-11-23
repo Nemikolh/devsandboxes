@@ -901,7 +901,8 @@ fn what(r: &AccessRequest) -> String {
     )
 }
 
-fn decided_line(r: &AccessRequest, answer: Answer) -> String {
+/// What an answer did, one line: the CLI's and the dashboard's.
+pub(crate) fn decided_line(r: &AccessRequest, answer: Answer) -> String {
     let (id, scope) = (&r.id, on_repo(&r.scope, r.repo.as_deref()));
     let covers = format!("`{}` `{}` {scope}", r.instance, r.credential);
     match answer {

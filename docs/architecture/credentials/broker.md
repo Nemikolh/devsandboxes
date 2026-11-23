@@ -546,6 +546,13 @@ hands it through `Host::start` to `Service::from_host`):
   (`serve::host`) calls every pass. The daemon's hook
   (`daemon::publish_access`) flags `access.changed` for `access`
   subscribers.
+- **Popup**: the call that opens a request (`Ticket::opened`, never a
+  join) raises a desktop notification (`Service::raise`, through
+  `desktop::notify_desktop`), titled `devsandbox: permission request`:
+  "<instance> asks <credential> <scope>[ on <repo>]: devsandbox access
+  approve <id>", escaped by `open::printable`. Each instance's popups go
+  through a `desktop::RateLimit`, as the cap bounds a burst of asks but
+  not ones answered one after another.
 - **Who answers**: the API, local clients only: `access.pending` lists
   the requests (`api::AccessRequest`: what the sandbox's call chose,
   method, route and repo, with control characters escaped by
@@ -553,7 +560,9 @@ hands it through `Host::start` to `Service::from_host`):
   ([API](../../reference/api.md#access)); the CLI's `devsandbox access
   pending`, `access approve <request> [--for …]` and `access deny
   <request>` are clients of them
-  ([credentials CLI](../../reference/credentials-cli.md#permission-requests)).
+  ([credentials CLI](../../reference/credentials-cli.md#permission-requests)),
+  and so is the dashboard's modal
+  ([dashboard](../dashboard/tabs-and-actions.md#permission-requests)).
   `lent::admit` refuses
   `access.*`, `credentials.*` and a `subscribe` to `access` to every
   peer, under either trust.

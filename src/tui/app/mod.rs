@@ -19,6 +19,7 @@ use super::select::{Candidate, Region, RegionId, Selection};
 use super::settings::Settings;
 use super::term::{TermParser, TermTabs};
 
+mod access;
 mod actions;
 mod command_line;
 mod forms;
@@ -174,6 +175,18 @@ pub struct App {
     identity_offered: bool,
     /// What an identity answer did, for the released verb's status line.
     identity_note: Option<String>,
+    /// Pending permission requests (`access.pending`), oldest first.
+    pub access: Vec<crate::serve::api::AccessRequest>,
+    /// Requests answered or put off here: their modal doesn't open by
+    /// itself again (`access.rs`).
+    access_quiet: BTreeSet<String>,
+    /// An answer for the event loop to send as `access.decide`.
+    pending_decide: Option<(String, crate::broker::asks::Answer)>,
+    /// Until when the access modal that opened by itself ignores answers.
+    access_guard: Option<std::time::Instant>,
+    /// The event loop's clock as of its last [`Self::set_clock`]; `None`
+    /// before the first.
+    clock: Option<std::time::Instant>,
     /// Appended to the status line the event loop writes after launching a
     /// [`PromptAction::Code`]: an Inbox `vscode` action's caveats (a goto it
     /// couldn't honor, the event and child done queued), which would
@@ -330,6 +343,11 @@ impl App {
             pending_identity: None,
             identity_offered: false,
             identity_note: None,
+            access: Vec::new(),
+            access_quiet: BTreeSet::new(),
+            pending_decide: None,
+            access_guard: None,
+            clock: None,
             code_note: None,
             stopping: BTreeSet::new(),
             starting: BTreeSet::new(),
@@ -493,6 +511,8 @@ impl App {
         let modal = std::mem::discriminant(&self.modal);
         let term = (self.terms.active(), self.terms.sessions().len());
         self.dispatch_key(key);
+        // A request listed while keys went elsewhere opens once they don't.
+        self.open_access();
         // A modal opening or closing, or another terminal tab (`[`/`]`/`x`,
         // `t`), changes what's on screen under the selection: a terminal
         // selection would otherwise read the next session's rows.
@@ -692,6 +712,7 @@ impl App {
                 self.selection_press(ev);
             }
         }
+        self.open_access();
         if std::mem::discriminant(&self.modal) != modal {
             self.clear_selection();
         }
