@@ -22,7 +22,7 @@ devsandbox exec web --end 1790000000-a1b2     # end one
 
 ## Who you are inside
 
-You are the config's `remoteUser` (else `containerUser`, else the image's `USER`) with your host uid/gid, so workspace files stay yours. Mount into that user's home with `${containerEnv:HOME}`. [`identity = "image"`](/docs/config#devsandbox-extras) takes the image's users as written. A config that mounts into `/root` gets a prompt before `run` that offers to rewrite it.
+You are the config's `remoteUser` (else `containerUser`, else the image's `USER`) with your host uid/gid, so workspace files stay yours. Mount into that user's home with `${containerEnv:HOME}`. [`identity = "image"`](/docs/config#environment) takes the image's users as written. A config that mounts into `/root` gets a prompt before `run` that offers to rewrite it.
 
 ## Links open on your desktop
 

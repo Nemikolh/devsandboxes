@@ -38,7 +38,7 @@ const browser = await chromium.launch({
 - Docker sandboxes get docker's default seccomp profile plus user namespaces. Podman's default already allows them.
 - Where the check passes, every `exec` gets `DEVSANDBOX_BROWSER_SANDBOX=1`. Where it fails, the tools' own sandbox-off variables are set instead.
 - Where execs run as root, `DEVSANDBOX_CHROME` points at a wrapper that starts the browser as a non-root user.
-- [`userns = false`](/docs/config#devsandbox-extras) keeps docker's default profile, with the browser sandbox off.
+- [`userns = false`](/docs/config#environment) keeps docker's default profile, with the browser sandbox off.
 
 ## Agent instructions
 
