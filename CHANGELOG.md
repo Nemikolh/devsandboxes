@@ -2,22 +2,24 @@
 
 ## Unreleased
 
+Sandboxes can use gh, git and Sentry's CLI without ever holding your tokens: devsandbox's credential broker keeps them on the host and spends them only on what each sandbox's config allows, gh and git only on the sandbox's own repos. Features now update their tools on a schedule, with no rebuild and no sandbox able to swap them, and host git no longer follows anything a sandbox can write. The features gh 1.3.1, zidane 2.1.1 and sentry 1.2.1 need this release.
+
 ### Added
 
-- **sentry-cli without its token in the sandbox.** The new `ghcr.io/devsandboxes/features/sentry` feature installs sentry-cli and claims a `sentry` credential. The sandbox gets a phantom token, and `SENTRY_URL` points at a loopback port that devsandbox's credential broker answers on the host. The broker checks each call against the claim's scopes, swaps the phantom for the real token and calls Sentry, so releases, source-map and debug-file uploads work as before. Any feature can claim a credential the same way, in its `customizations.devsandbox.credentials`.
-- **gh without its token in the sandbox, fenced to the sandbox's repos.** The new `ghcr.io/devsandboxes/features/gh` feature installs the GitHub CLI and claims a `github` credential: gh, git and anything else calling `api.github.com` reach GitHub through devsandbox's credential broker with a phantom token. Calls on the sandbox's own repos (its folders' remotes plus `access.github.repos`) get the real token, scoped per sandbox (`repo.read`, `pr.write`, `pr.merge`, `issues.write`, `git.push`, `releases.write`, `actions.read`, `actions.write`, …); other repos are read anonymously and never written; GraphQL writes are checked by every id they name. Deploy keys, webhooks, runner tokens, secret writes and other routes that would plant access are refused whatever the config. Use it instead of `ghcr.io/devcontainers/features/github-cli`. `gh-update`, run on the host against a shared bin dir the sandboxes mount read-only, updates gh in every sandbox without a rebuild.
+- **Sentry's CLI without its token in the sandbox.** The new `ghcr.io/devsandboxes/features/sentry` feature installs Sentry's `sentry` CLI and claims a `sentry` credential. The sandbox gets a phantom `SENTRY_AUTH_TOKEN`, and its calls to `sentry.io` and the region hosts reach devsandbox's credential broker on the host, which checks each against the claim's scopes (issues, events, releases, uploads, alerts, dashboards, …), swaps the phantom for the real token and calls Sentry. Deleting an org, project or team and minting tokens are refused whatever the config. Any feature can claim a credential the same way, in its `customizations.devsandbox.credentials`, either intercepting its hosts or giving the tool a loopback base URL.
+- **gh without its token in the sandbox, fenced to the sandbox's repos.** The new `ghcr.io/devsandboxes/features/gh` feature installs the GitHub CLI and claims a `github` credential: gh, git and anything else calling `api.github.com` reach GitHub through devsandbox's credential broker with a phantom token. Calls on the sandbox's own repos (its folders' remotes plus `access.github.repos`) get the real token, scoped per sandbox (`repo.read`, `pr.write`, `pr.merge`, `issues.write`, `git.push`, `releases.write`, `actions.read`, `actions.write`, …); other repos are read anonymously and never written; GraphQL writes are checked by every id they name. Deploy keys, webhooks, runner tokens, secret writes and other routes that would plant access are refused whatever the config. Use it instead of `ghcr.io/devcontainers/features/github-cli`. gh runs from a shared dir the sandboxes mount read-only, kept current by feature updates (below), so no sandbox can swap the gh the others run.
 
   ```bash
   devsandbox login github --feature ghcr.io/devsandboxes/features/gh:1 --profile work
   ```
 
-- **`devsandbox login` and `devsandbox access approve`.** `login` stores a credential's secret on this host and approves the claim of the feature it's for, which it shows you first. A feature update that changes its claim stops `run` until you approve the change with `access approve`, which shows what changed. `--profile` limits a credential to the sandboxes of those profiles.
+- **`devsandbox login` and `devsandbox access approve`.** `login` stores a credential's secret on this host and approves the claim of the feature it's for, which it shows you first. A feature release that changes its claim needs approving again, with `access approve`, which shows what changed, or when `run` asks. `--profile` limits a credential to the sandboxes of those profiles.
 
   ```bash
   devsandbox login sentry-work --feature ghcr.io/devsandboxes/features/sentry:1 --profile work
   ```
 
-- **`devsandbox login` by device code or browser.** A claim that lists the `device` or `browser` login gets its token by OAuth: `login` shows a code to enter at the provider's page (works on a headless box), or opens the provider's login page and takes the redirect on a loopback port. `--method` picks among the claim's methods, and `--client-id` logs in to your own OAuth app (a GitHub App you made) instead of the feature's, or names the app when the feature ships none: `features/gh` 1.1.0 offers GitHub's device flow that way. The token, its refresh token and expiries are kept on the host, and the broker renews the token before it expires (or when the provider rejects it, replaying the call), so tools in the sandbox never see it change. A credential whose renewal is refused is marked broken until you log in again.
+- **`devsandbox login` by device code or browser.** A claim that lists the `device` or `browser` login gets its token by OAuth: `login` shows a code to enter at the provider's page (works on a headless box), or opens the provider's login page and takes the redirect on a loopback port. `--method` picks among the claim's methods, and `--client-id` logs in to your own OAuth app (a GitHub App you made) instead of the feature's, or names the app when the feature ships none: `features/gh` offers GitHub's device flow that way. The token, its refresh token and expiries are kept on the host, and the broker renews the token before it expires (or when the provider rejects it, replaying the call), so tools in the sandbox never see it change. A credential whose renewal is refused is marked broken until you log in again.
 
   ```bash
   devsandbox login github --method device --client-id Iv1.0123456789abcdef
@@ -30,7 +32,31 @@
   devsandbox access revoke sentry-work --version 3f2a1b
   ```
 
-- **GitHub tokens that stay narrow, and a warning before they expire.** `devsandbox login` for a GitHub credential takes fine-grained PATs (`github_pat_…`) and GitHub App user tokens (`ghu_…`) and refuses classic PATs and gh's own OAuth token, which reach every repo you can. `access.github.as` in a sandbox's config picks which kind of token a sandbox takes, within the kinds the credential offers (`as` in `credentials.toml`, `["user"]` by default). `access ls` shows when a credential expires and warns two weeks ahead, and in its last week you get a desktop notice once a day while sandboxes use it.
+- **GitHub tokens that stay narrow, and a warning before they expire.** `devsandbox login` for a GitHub credential takes fine-grained PATs (`github_pat_…`) and GitHub App user tokens (`ghu_…`) and refuses classic PATs, which reach every repo you can; gh's own OAuth token only with `--broad` (below). `access.github.as` in a sandbox's config picks which kind of token a sandbox takes, within the kinds the credential offers (`as` in `credentials.toml`, `["user"]` by default). `access ls` shows when a credential expires and warns two weeks ahead, and in its last week you get a desktop notice once a day while sandboxes use it.
+- **GitHub logins that land on the right token.** For a pasted token, `login` opens GitHub's fine-grained token page prefilled with a name, a description and the permissions the claim's granted scopes need, so you only select the repos; `--owner` prefills the user or org that owns it. Before storing any token, `login` checks it against the provider and says whose it is (`… as alice`), so a work credential can't silently be your personal account. Login pages open in the browser of the credential's profile, where its account is signed in.
+
+  ```bash
+  devsandbox login github --feature ghcr.io/devsandboxes/features/gh:1 --owner my-org
+  ```
+
+- **`login --broad` for orgs that allow neither a GitHub App nor fine-grained tokens.** It makes a broad credential, which takes gh's own OAuth token (`gho_…`, by gh's device login or pasted), after a confirmation naming its reach: the repo fence still refuses writes outside the sandbox's repos, but GraphQL reads aren't fenced, so a sandbox can read every repo the account can. Narrow tokens stay the default, and a credential is broad or not from its first login.
+
+  ```bash
+  devsandbox login github --feature ghcr.io/devsandboxes/features/gh:1 --broad
+  ```
+
+- **Feature updates keep tools current with no setup and no rebuild.** A feature can declare updates (`customizations.devsandbox.updates`): a command baked in its image that refreshes a `${sharedVolumes}` dir its sandboxes mount read-only, gh's binary for one. The daemon runs each due update when it starts and then hourly, every 7 days unless the feature or the config's `[updates]` says otherwise, in a throwaway container from the sandbox's features image with only that dir writable: no sandbox can swap the binary the others run, and no feature code runs on the host. A failure is retried after 6 h and posts an Inbox notice; each run's output is in `logs/` next to `state.toml`. `devsandbox update <name>` runs one now, and a version after the name pins or rolls back. An image runs the updates it was built with, so a feature release that moves its updater reaches an image at its next rebuild. Not on Apple's container yet.
+
+  ```toml
+  [updates]
+  gh = "1d"
+  ```
+
+  ```bash
+  devsandbox update gh 2.60.0
+  ```
+
+- **`run` asks to approve a changed claim.** When a feature release changes a credential claim, `run` on a terminal shows what changed and asks, instead of refusing and sending you to `access approve`; a yes approves it and the run goes on. Off a terminal (`--json`, `-d`, the dashboard, `rebuild`, a machine's run) it still refuses.
 - **`access.<kind>` in a sandbox's config** picks the credential a claim takes (`credential`) and narrows what the sandbox may do with it (`scopes`). Edits apply to the next call, no rebuild.
 
   ```toml
@@ -68,6 +94,106 @@
 ### Changed
 
 - **A sandbox can no longer see a config.** `run` refuses a bind, read-only too, that covers a config root (any config an instance was created from), a whole `shared-volumes/` dir, or another instance's worktree or per-instance volume. A config that sits inside its own `folder` (`folder = "."`) no longer runs: move it beside the repo. A sandbox that needs config files binds them read-only, one bind each. `run` also warns when a privileged sandbox, or one bound to the container runtime's socket or the desktop's display or session sockets, runs on a host that holds credentials.
+- **Host git never follows what a sandbox can write.** A sandbox can write its checkout's `.git`, so host git (worktree add, fetch, fleet code transfer) refuses a git dir that points elsewhere (a planted `gitdir:` or `commondir`, symlinked refs, objects, index or reflog), fetches `origin` only from the URL trusted at its first fetch, and leaves your filter drivers, git-lfs included, inert. Changed a repo's origin yourself? `devsandbox trust-origin <folder>` trusts the new URL. LFS files in host-made worktrees are pointers until `git lfs pull` in the sandbox, and a repo layout git didn't make (`--separate-git-dir`, symlinked `objects/`) is refused.
+
+  ```bash
+  devsandbox trust-origin ~/src/app
+  ```
+
+- **Refusals for what isn't built yet say so**, ending in "not supported yet! open an issue in https://github.com/Nemikolh/devsandboxes" instead of naming internal plan steps.
+- **The docs site covers the credential broker and feature updates.** A credentials example replaces the ssh-and-git-push one, the babysit-a-PR example is gone, agent prompts are a copy button with nothing to fill in, and the config reference is condensed to what each property needs.
+
+### Fixed
+
+- **A `run` refused for an unapproved claim is rolled back**, so running again is a plain `run` instead of leaving a dead instance beside a new one.
+- **`rm` deletes the per-instance bind dirs devsandbox created.** A later instance reusing the id inherited them, with whatever the old one stored there (the zidane feature's tokens, say).
+- **Copying `worktree-include` files no longer follows a symlinked dir**, which a sandbox could swap in to have the host read a host file into the worktree or write outside it.
+- **A helper install that failed once is retried** by the daemon each time the instance's container shows up running, instead of leaving it without notifications for good. `inspect` shows why the helper is unavailable, and bridge failures, an unreadable `state.toml` and notifications that couldn't be stored go to `serve.log`, once per reason.
+
+<details><summary>Commits</summary>
+
+- 4283a0d docs(serve): instances with credential claims hold the daemon, and drop the stale ctrl-d limitation
+- dcae3ea docs(site): bring every page up to the credential broker and feature updates
+- d35ce80 docs(config): condense the config reference to what each property needs, checked against the code
+- 4236f2e docs(site): agent prompts are a copy button with nothing to fill in, the agent works the specifics out
+- 1e8f9bb docs(site): a credentials example replaces ssh and git push, and the babysit example goes until a k8s page replaces it
+- c159cdb docs(site): plan the site refresh and the 0.11.0 release
+- fa68c3d docs(features): close the read-only update mounts plan
+- b58ee3f docs(gh): the feature's update and bin dir mount shipped, its version is 1.3.1
+- 6a28a40 test(features): mirror the gh and sentry patch releases
+- 82e44db fix(features): an update's mount is read-only because the update declares it, since the feature schema can't say readonly
+- 2bd0e82 docs(features): plan read-only update mounts by declaration, the feature schema has no readonly
+- 470a003 docs(features): close the sentry and update fixes plan, image-declared updates as an adr
+- a813698 test(sentry): follow the feature to sentry's new cli through intercept mode, keeping base-url mode covered by its own fixture
+- e64d152 fix(update): run the updates an image was built with, so a feature release that moves its updater can't break older images
+- df0aa01 fix(run): roll back a run refused for an unapproved claim, so running again doesn't leave a dead instance beside a new one
+- 0c802c8 docs(features): plan sentry's new cli, rolling back unapproved runs and updates from the image's label
+- bcafd40 docs(features): close the zidane and sentry updates plan
+- 6def2bd test(sentry): mirror the sentry feature declaring its own update and read-only bin mount
+- 3d283f2 docs(features): plan zidane and sentry updates so no sandbox can swap a shared binary
+- 4b56554 docs(features): close the feature updates plan, running updates in the feature's image as an adr
+- b8bda61 test(gh): mirror the gh feature declaring its own update and read-only bin mount
+- c1d7cd7 feat(run): ask to approve a changed credential claim on a terminal instead of sending the user to access approve
+- 5baa06e feat(serve): run due feature updates at start and hourly, so tools stay current with zero setup
+- 59992d3 feat(update): run a feature's update in its own image with only its shared dir writable, so tools refresh without host code
+- 85f8702 feat(features): read a feature's declared updates and the config's intervals, the data the update runner needs
+- 39ce272 docs(features): plan feature updates so tools stay current with no setup and no sandbox can swap them
+- e677216 test(serve): wait out the races in two flaky tests
+- 08af4d1 docs(credentials): close the github login plan, the broad opt-in decision as an adr
+- 9ac9e6f feat(login): accept gh's broad oauth token behind an explicit --broad opt-in, for orgs where neither an app nor a fine-grained pat is possible
+- 8b8bc94 feat(login): open login pages in the credential's profile browser, where its account is signed in
+- 3357148 feat(login): check the token against the claim's check before storing it and say whose it is, so a work credential can't silently be the personal account
+- 406c817 feat(login): open the claim's token page prefilled with its permissions, so a narrow pat isn't hand-picked
+- 1f66463 docs(credentials): plan github login for orgs that can't install an app
+- 036c3af fix(credentials): refusals name what's unsupported and where to ask, not internal plan steps
+- 76b72da docs(credentials): park github app installation tokens, most users can't install an app in their org
+- adc3666 docs(status): gh, git and sentry-cli are brokered locally; the fleet half is next
+- 71bf2c8 feat(login): let the home bring its own oauth app when a claim names none
+- c52b701 feat(gh): the github claim features/gh ships, held to what gh actually calls
+- 960136a feat(broker): read graphql strictly and fence mutations by their input ids
+- 16a5892 feat(broker): pin the fence to github repo ids and take only narrow user tokens
+- d3a9445 test(git): clone and push through the broker end to end
+- f5a66e5 feat(broker): carry git lfs transfers through loopback handles
+- 3e12730 feat(run): route a git-host claim's git through the broker on its own proxy port
+- 06459ab feat(broker): enforce the repo fence and recognize git smart http
+- 64795a3 feat(ssh-agent): filter the relayed agent's keys under a git-host claim
+- cebfd9f feat(run): record each folder's remotes at its first run as the repo fence
+- 80516f1 feat(run): wire intercept claims with the proxy env and the member ca trusted
+- 4d17976 feat(broker): terminate tls for intercepted hosts with the member ca's leaf
+- ef5f203 feat(devsbd): proxy ports that send claimed hosts to the broker and dial the rest
+- d98fd51 feat(credentials): a per-member ca that mints leaves only for intercepted hosts
+- a1e1d21 feat(access): list and revoke the home's credentials
+- 188a517 feat(broker): renew oauth tokens behind the phantom
+- c90362b feat(login): log in by oauth device flow or browser with pkce
+- 796e648 test(broker): prove sentry-cli uploads through the broker with no token in the sandbox
+- a609f11 feat(broker): swap phantoms for the home's credential under per-call policy
+- ae5609a feat(run): refuse binds that reach a config root or another instance's paths
+- 1281442 feat(run): wire features' credential claims into instances
+- 1e297a9 feat(devsbd): carry broker connections from loopback listeners over the bridge
+- 154a7fa feat(credentials): keep credentials on the home with login by paste and access approve
+- 5888fa4 feat(broker): call upstreams over rustls, refusing private addresses on the dialed ip
+- 37db843 feat(credentials): read the credential claims features declare and version them
+- 48198da feat(broker): parse requests strictly and redact the injected token as it streams
+- 196cc2d docs(credentials): agree the broker, gh/sentry and git-gateway plans and start building them
+- e8532e0 docs(credentials): fold the client-behavior spike into the plans
+- a025402 docs(credentials): settle the questions blocking each plan's first step
+- 8e0bbff docs(git): close the host-side hardening plan with adr 0057
+- a9a8a92 fix(worktree): copy worktree-include files without following symlinked dirs
+- f202257 fix(rm): delete the per-instance bind dirs devsandbox created
+- a83d5a4 fix(git): make the user's filter drivers inert in host git
+- 49ae1fe fix(git): fetch origin only from the url trusted on first use
+- 3eeb23e fix(git): refuse git dirs a sandbox redirected at other host repos or files
+- e0df527 docs(plans): plan the host-side hardening fixes found by the credentials review
+- 67c6b57 docs(credentials): review rounds 5-12, final reconciliation and next steps
+- 1e98421 docs(credentials): drop the superseded cli-proxy plan and harden the plans through review rounds 1-4
+- 1a98a09 docs(credentials): split the credentials exploration into broker, gh/sentry, git and agent plans
+- 88b83e2 docs(site): repo fence, lifetimes, ca trust and one clone per instance in the credentials exploration
+- 8942f49 docs(site): explore brokering credentials so sandboxes never hold them
+- ed21f04 fix(serve): retry the helper install for a running instance recorded without one, once per appearance, since one failed install cut it off from notifications for good
+- 6ad9a5c feat(devsbd): record why the helper install failed on the instance and show it in inspect, since the note only reached one command's stderr
+- 6af31e9 feat(serve): log bridge failures, unreadable state and unstored notifications to serve.log, once per reason, so a stuck outbox leaves a trace
+
+</details>
 
 ## 0.10.0
 
