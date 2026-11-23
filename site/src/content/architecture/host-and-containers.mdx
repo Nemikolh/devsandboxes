@@ -8,8 +8,8 @@ order: 1
 import HelperDiagram from '../../components/architecture/HelperDiagram.astro';
 
 Nothing in a sandbox talks to the host directly. The host runs `exec -i … devsbd bridge` in the container and keeps
-the pipe open. Everything that crosses the boundary (ssh-agent requests, `devsbd notify`, a URL the sandbox opens, a
-dispatcher's `devsbd ensure`, a forwarded port, the host's own calls) is a stream in that pipe, which works the same
+the pipe open. Everything that crosses the boundary (ssh-agent requests, a brokered `gh` or `git push`, `devsbd notify`,
+a URL the sandbox opens, a dispatcher's `devsbd ensure`, a forwarded port, the host's own calls) is a stream in that pipe, which works the same
 on every runtime.
 
 <HelperDiagram />
@@ -36,6 +36,7 @@ a bind-mounted agent socket.
 | `/run/devsandbox/ssh-agent.sock` | 0666 | `ssh`, `git` (`SSH_AUTH_SOCK` points here in relay mode) |
 | `/run/devsandbox/api.sock` | 0666 | `devsbd notify`'s poke, `xdg-open` (the helper stands in for it), the control verbs (`ensure`, `events`, `run`, …) |
 | `/run/devsandbox/devsbd.ctl` | 0600 | `devsbd bridge` only |
+| `127.0.0.1:<port>`, one per claimed upstream, plus proxy ports | TCP | tools with a credential claim (`gh`, `git`, `sentry`), sent there by the claim's env |
 
 It also answers the host's `RPC` streams, one per call (`rpc.methods` lists them): that's how the host attaches to
 a helper session (`session.attach`) or drives a dispatcher child's tracked runs (`run.*`) without an `exec`.
@@ -53,7 +54,7 @@ several per container are normal:
 
 | host process | bridge | serves |
 |---|---|---|
-| `devsandbox serve` | one per running instance, reconciled on each container event (5 s timer while one is pending or failed, or there's no event stream) | ssh-agent, notify, control |
+| `devsandbox serve` | one per running instance, reconciled on each container event (5 s timer while one is pending or failed, or there's no event stream) | ssh-agent, notify, control, the credential broker |
 | a Ports-tab or `(open)` forward (inside `serve`) | one per forward | its `Connect` streams, ssh-agent |
 | `devsandbox port` (foreground) | its own | its `Connect` streams, ssh-agent when its shell has one |
 
@@ -69,9 +70,11 @@ another machine relays over its link ([Fleet](/architecture/fleet)), then the da
 record lands in `inbox.json` with a popup; an `open` record (an `http(s)` URL, rate-limited, at most 30 s old) opens
 in the desktop of the host the instance was last attached from, after forwarding the loopback ports it names as
 `(open)` forwards, stopped after 10 min idle. Control requests are served by the daemon (`src/commands/dispatch.rs`).
+A broker stream goes to the credential broker (`src/broker/`), which swaps the instance's phantom for the credential
+under its claim's policy and makes the upstream call.
 
 The host opens `Connect` streams for forwards and an `RPC` stream per call (`HelperClient`, `src/serve/helper.rs`).
 
 Design notes: `docs/architecture/helper/overview.md`, `docs/architecture/helper/bridges.md`,
 `docs/architecture/helper/in-container.md`, `docs/architecture/helper/ssh-agent.md`,
-`docs/architecture/daemon/forwards.md`.
+`docs/architecture/daemon/forwards.md`, `docs/architecture/credentials/broker.md`.

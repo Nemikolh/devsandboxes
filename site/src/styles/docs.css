@@ -293,12 +293,22 @@
 }
 
 /* Tables scroll sideways on their own (wrapper from src/lib/heading-anchors.ts)
-   rather than widening the page. */
+   rather than widening the page. Touch screens hide the scrollbar, so a
+   shadow marks the side with more table: the `local` covers move with the
+   content and hide the `scroll` shadows once an end is reached. */
 .table-scroll {
   overflow-x: auto;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
   margin: 24px 0;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+  background:
+    linear-gradient(to right, var(--bg) 40%, transparent) left / 32px 100% no-repeat local,
+    linear-gradient(to left, var(--bg) 40%, transparent) right / 32px 100% no-repeat local,
+    linear-gradient(to right, rgb(145 230 232 / 0.22), transparent) left / 16px 100% no-repeat scroll,
+    linear-gradient(to left, rgb(145 230 232 / 0.22), transparent) right / 16px 100% no-repeat scroll,
+    var(--bg);
 }
 
 .table-scroll:focus-visible {
@@ -337,8 +347,9 @@
   border-top: 0;
 }
 
+/* Translucent so the .table-scroll shadows show through. */
 .prose tbody tr:nth-child(even) {
-  background: #111a1c;
+  background: rgb(30 70 75 / 0.15);
 }
 
 .prose td:first-child {

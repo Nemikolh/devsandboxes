@@ -20,7 +20,7 @@ export const attachSteps = [
   { from: 'bridge', to: 'daemon', label: 'connect devsbd.ctl', sub: 'retries 2 s; nothing listening → starts devsbd daemon once' },
   { from: 'bridge', to: 'daemon', both: true, label: 'Hello ⇄ Hello', sub: 'version · build hash · daemon caps TCP_FORWARD · PORT_INFO · RPC' },
   { from: 'bridge', to: 'serve', both: true, label: 'Hello ⇄ Hello', sub: 'caps = bridge ∧ daemon · host gives up after 10 s' },
-  { from: 'serve', to: 'daemon', label: 'Caps', sub: 'SSH_AGENT · NOTIFY · CONTROL, through the bridge verbatim', tone: 'serve' },
+  { from: 'serve', to: 'daemon', label: 'Caps', sub: 'SSH_AGENT · NOTIFY · CONTROL · HTTP_PROXY, through the bridge verbatim', tone: 'serve' },
   { kind: 'act', at: 'bridge', label: 'copies bytes both ways', sub: 'never parses another frame' },
   { kind: 'phase', label: 'streams' },
   { from: 'client', to: 'daemon', label: 'connect ssh-agent.sock', tone: 'agent' },
@@ -75,7 +75,7 @@ u32 stream_id | u8 kind | u32 len | payload[len]      (len ≤ 1 MiB)
 | kind | name | stream | payload |
 |---|---|---|---|
 | 0 | `Hello` | 0 | `u32 version`, `u8` + build hash, `u32 caps` |
-| 1 | `Open` | daemon id; host id for rpc | `u8 channel`: 1 ssh-agent, 2 http-proxy (reserved), 3 notify, 4 control, 5 rpc |
+| 1 | `Open` | daemon id; host id for rpc | `u8 channel`: 1 ssh-agent, 2 http-proxy (the credential broker), 3 notify, 4 control, 5 rpc |
 | 2 | `Data` | any | bytes |
 | 3 | `Close` | any | optional reason (`connection refused`, …) |
 | 4 / 5 | `Ping` / `Pong` | 0 | echoed |
@@ -100,6 +100,7 @@ The daemon keeps every attached bridge and routes each stream it opens to the ne
 | ssh-agent | newest bridge with `SSH_AGENT` | held up to 1 s for one, then closed ("agent refused") |
 | notify (notices, threads, URLs to open) | newest bridge with `NOTIFY` | stays in `/var/lib/devsandbox/outbox/`, retried every 30 s and on attach |
 | control | newest bridge with `CONTROL` | answered `NoHost` (the CLI exits 75) |
+| http-proxy (a brokered call; its first bytes name the upstream) | newest bridge with `HTTP_PROXY` | held up to 1 s for one, then answered `503` |
 
 ## Takeover
 

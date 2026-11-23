@@ -5,7 +5,7 @@
  * sandboxes (each one a stack, the compose-project analogue, all in one
  * workspace's config), their instances and services, and the edges
  * between the sandboxes and the host: tunneled ports, the forwarded ssh-agent,
- * `devsbd notify`, and the planned on-demand credentials. Static, in the
+ * `devsbd notify`, and the brokered credentials. Static, in the
  * landing diagram's visual language (`HowItWorks.astro`): one grid on
  * desktop, stacked on narrow screens.
  */
@@ -63,16 +63,15 @@ const repos = ['shop', 'billing'];
 // the sandboxes, else out of them.
 const edges = [
   { id: 'ports', icon: Plug, label: 'devsandbox port', title: 'localhost:3000', sub: 'shop:3000 · no -p' },
-  { id: 'ssh', icon: KeyRound, label: 'git push · pull', title: 'ssh-agent', sub: 'keys stay on the host', up: true },
+  { id: 'ssh', icon: KeyRound, label: 'ssh · signing', title: 'ssh-agent', sub: 'keys stay on the host', up: true },
   { id: 'notify', icon: Bell, label: 'devsbd notify', title: 'you', sub: 'Inbox · desktop' },
   {
     id: 'creds',
     icon: LockKeyhole,
-    label: 'on demand',
+    label: 'gh · git push · sentry',
     title: 'credentials',
     sub: 'tokens stay on the host',
     up: true,
-    planned: true,
   },
 ];
 ---
@@ -86,8 +85,8 @@ const edges = [
     instance billing and a child instance billing-pr-42 on its own worktree of the PR branch fix/invoice-rounding, and a
     redis per instance. Across the
     sandbox boundary: ports tunneled to localhost with devsandbox port, your ssh-agent forwarded in so keys stay on the
-    host, devsbd notify reaching you in the dashboard's Inbox and on the desktop, and, planned, credentials handed out on
-    demand so tokens never live in a sandbox.
+    host, devsbd notify reaching you in the dashboard's Inbox and on the desktop, and gh, git push and sentry calls
+    brokered by the host, so tokens never live in a sandbox.
   </p>
 
   <div class="sd-host" aria-hidden="true">
@@ -191,10 +190,7 @@ const edges = [
               <e.icon />
             </span>
             <span class="sd-node-copy">
-              <strong>
-                {e.title}
-                {e.planned && <em>planned</em>}
-              </strong>
+              <strong>{e.title}</strong>
               <span>{e.sub}</span>
             </span>
             <span class="sd-edge-via">

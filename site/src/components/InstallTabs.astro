@@ -58,8 +58,9 @@ Expand-Archive devsandbox.zip .`}
     <CodeBlock code="cargo install devsandbox" />
     <Callout variant="warning" title="No in-container helper">
       <p>
-        crates.io builds don't embed <code>devsbd</code>, the helper that relays ssh-agent over <code>exec</code>. They fall
-        back to a socket bind mount, which only works with docker / podman on Linux. Prefer npm or a release archive.
+        crates.io builds don't embed <code>devsbd</code>, the in-container helper behind brokered credentials,
+        notifications, port forwards and the ssh-agent relay. Their ssh-agent falls back to a socket bind mount, which
+        only works with docker / podman on Linux. Prefer npm or a release archive.
       </p>
     </Callout>
   </Fragment>

@@ -1,6 +1,6 @@
 ---
 title: Going further
-description: Builds, sessions, who you are inside, links and profiles, GPUs and the host daemon.
+description: Builds, sessions, who you are inside, links and profiles, credentials, tool updates, GPUs and the host daemon.
 eyebrow: GETTING STARTED
 order: 2
 ---
@@ -26,7 +26,7 @@ You are the config's `remoteUser` (else `containerUser`, else the image's `USER`
 
 ## Links open on your desktop
 
-`xdg-open`, `$BROWSER` and CLI logins in a sandbox open `http(s)` links in your host's browser. A `localhost` URL or an OAuth callback gets a port forward first, so `gh auth login` works. Scripts call `devsbd open <url>`.
+`xdg-open`, `$BROWSER` and CLI logins in a sandbox open `http(s)` links in your host's browser. A `localhost` URL or an OAuth callback gets a port forward first, so a CLI's browser login works. Scripts call `devsbd open <url>`.
 
 [Profiles](/docs/config#profiles-profilesname) pick the browser:
 
@@ -50,10 +50,23 @@ devsandbox run web --profile personal
 devsandbox profile web work             # switch, nothing restarts (P in the dashboard)
 ```
 
+## Credentials
+
+A feature that claims a credential, like `ghcr.io/devsandboxes/features/gh` or `/sentry`, gives the sandbox a phantom token. The host daemon swaps in the real one, kept on your host, on each call the claim and the sandbox's [`access`](/docs/config#credentials-and-keys) allow. `devsandbox login <credential>` stores it, `devsandbox access ls` lists what is stored, and `run` asks you to approve a feature release that changes its claim. Walkthrough: [gh and sentry without a token](/examples/credentials).
+
+## Tools that stay current
+
+A feature can install its tool in a shared directory that its sandboxes mount read-only, with an update that refreshes it (gh and sentry do). The host daemon runs each update once its interval has passed, weekly unless the feature says otherwise, with no rebuild. [`[updates]`](/docs/config#updates-updates) changes an interval or turns one off with `"never"`.
+
+```bash
+devsandbox update gh            # now
+devsandbox update gh 2.60.0     # pin a version, or roll back
+```
+
 ## GPUs
 
 `hostRequirements.gpu = true` on a sandbox or a service gives its container every NVIDIA GPU. `run` stops before building when none is usable. `"optional"` runs without one. On a fleet, `run --place` sends it to a [machine](/docs/machines) that lends a GPU.
 
 ## The host daemon
 
-Verbs, the dashboard, port forwards, notifications and links go through `devsandbox serve`, one per user on Linux and macOS. It starts on demand and exits after 10 minutes idle. Stopping it loses nothing. A sandbox with `autostart = "runtime"` needs it from login, which `devsandbox serve install` sets up as a systemd user unit or a LaunchAgent. Anyone who can open its socket can act as you, like with `docker.sock`. Editors talk to it with `devsandbox api --stdio` or the [Node API](/docs/node-api).
+Verbs, the dashboard, port forwards, notifications, links, brokered credentials and feature updates go through `devsandbox serve`, one per user on Linux and macOS. It starts on demand and exits after 10 minutes idle. Stopping it loses nothing. A sandbox with `autostart = "runtime"` needs it from login, which `devsandbox serve install` sets up as a systemd user unit or a LaunchAgent. Anyone who can open its socket can act as you, like with `docker.sock`. Editors talk to it with `devsandbox api --stdio` or the [Node API](/docs/node-api).

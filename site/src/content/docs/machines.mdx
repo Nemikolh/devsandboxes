@@ -19,7 +19,7 @@ devsandbox stop my-server/test        # qualified when the name exists here too
 devsandbox port my-server/web 3000    # the port opens here
 ```
 
-A machine's config roots are the ones its own daemon lists. `machine add` asks you to confirm the machine's key fingerprint. Your ssh-agent reaches the machine only with `--agent` or `devsandbox machine set my-server --agent on`. VS Code on a machine isn't supported yet.
+A machine's config roots are the ones its own daemon lists. `machine add` asks you to confirm the machine's key fingerprint. Your ssh-agent reaches the machine only with `--agent` or `devsandbox machine set my-server --agent on`. VS Code on a machine isn't supported yet. [Brokered credentials](/examples/credentials) stay on the host that logged in: run `devsandbox login` on the machine whose sandboxes use them. An instance another machine placed there runs without its claims, with a warning.
 
 <Callout variant="note" title="Adding a machine means trusting it">
   Whoever controls it can act as you in its sandboxes, and sign with your ssh-agent if you turned that on.

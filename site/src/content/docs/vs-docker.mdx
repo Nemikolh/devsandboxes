@@ -18,6 +18,7 @@ devsandbox puts devcontainers, compose-style services, git worktrees and [your o
 | `docker compose up` a second time             | `devsandbox run web` again, with its own containers, worktree and branch |
 | `-p 3000:3000`, decided up front              | `devsandbox port web 3000`, opened on demand                             |
 | Keys mounted into the container               | Your ssh-agent relayed, keys stay on the host                            |
+| Tokens in env vars or `~/.config/gh`          | A phantom in the sandbox, [the token stays on the host](/examples/credentials) |
 | Root-owned files in your checkout             | Your host uid/gid inside, on every runtime                               |
 | No browser in the container                   | Links open in your desktop browser                                       |
 | `--gpus all` on each command                  | `hostRequirements.gpu = true`                                            |

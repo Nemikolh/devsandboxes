@@ -37,11 +37,15 @@ devsandbox              # the dashboard
 | `rebuild <name>\|--all [--force] [--reprobe] [-d]` | Recreate from current config when drifted; worktree and state kept (`--reprobe` alone isn't drift: add `--force`) |
 | `rm <name>`                                | Remove sandbox: container, worktree, and state entry are removed          |
 | `exec [-i] [-t] <name> [cmd…]`             | Exec as the instance's user with `remoteEnv`; no `cmd`: login shell       |
-| `vscode <name> [--goto PATH[:LINE[:COL]]]` | Open VS Code attached to the instance, optionally at a file and line      |
+| `vscode <name> [--goto PATH[:LINE[:COL]]]` | Open VS Code attached to the instance, optionally at a file and line (an instance with a credential claim needs `--allow-credential-leak`) |
 | `profile <name> [profile]`                 | Show or switch an instance's profile (no restart; the next URL it opens uses it) |
 | `done` / `undone <name>`                   | Mark an instance done (kept as is, shown dimmed) / clear the mark         |
 | `port <name> [--service s] <port…>`        | Forward a container/service port to the host until exited                 |
 | `inbox ls\|show\|reply\|act\|submit\|done\|reopen` | Read and answer Inbox threads (docs/reference/inbox-cli.md)         |
+| `login <credential> [--feature <ref>] [--profile p]` | Store a credential on this host and approve the feature claim it serves |
+| `access ls\|approve\|revoke\|forget`       | List, approve claim versions of, or revoke this host's credentials; drop a repo from a folder's fence |
+| `update <name> [version]`                  | Run a feature's update now (its tool into the dir sandboxes mount read-only) |
+| `trust-origin <folder>`                    | Trust a repo's current `origin` URL for the host's own fetches            |
 | `serve install` / `serve uninstall`        | Run the host daemon from login (it otherwise starts on demand; docs/architecture/daemon/role.md) |
 | `service ls` / `service rebuild`           | List services / recreate one and rewire running sandboxes in place        |
 | `gc [--force]`                             | Reap unreferenced services, orphaned history files and agent links        |
@@ -55,6 +59,17 @@ devsandbox              # the dashboard
 devsandbox port api 3000                # localhost:3000 -> api's :3000
 devsandbox port api --service postgres 5432   # api's postgres, via the api container
 ```
+
+## Credentials
+
+Features like `ghcr.io/devsandboxes/features/gh` and `/sentry` declare the credential their tool needs. The sandbox gets a phantom token; the host daemon keeps the real one and swaps it in on each call the claim allows, with gh's writes fenced to the sandbox's own repos:
+
+```bash
+devsandbox login github --feature ghcr.io/devsandboxes/features/gh:1
+devsandbox exec web gh pr list     # works, with no token in the container
+```
+
+Walkthrough: [gh and sentry without a token](https://devsandboxes.com/examples/credentials). Commands and files: [`docs/reference/credentials-cli.md`](docs/reference/credentials-cli.md).
 
 ## Automations
 

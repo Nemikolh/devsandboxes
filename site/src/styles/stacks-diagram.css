@@ -2,7 +2,7 @@
  * `StacksDiagram.astro`. Same colours as the landing diagram
  * (`how-it-works.css`): cyan containers, green worktrees,
  * lime you and your agent, purple devsandbox's own requests; yellow is
- * notify, dashed means planned. Desktop is a 4-column grid inside the host
+ * notify, green the brokered credentials. Desktop is a 4-column grid inside the host
  * box: links are CSS arrows in their own cells, so they always meet the
  * nodes; narrow screens stack it. Breakpoints are container queries: the
  * figure sits in a docs column, far narrower than the viewport.
@@ -438,29 +438,12 @@
 }
 
 .sd-edge--creds {
-  border-style: dashed;
-  border-color: #3d5053;
-  background: transparent;
-  box-shadow: none;
+  border-color: #3f5a35;
 }
 
 .sd-edge--creds .sd-edge-icon {
-  background: #172023;
-  color: var(--text-subtle);
-}
-
-.sd-edge--creds strong {
-  color: var(--text-muted);
-}
-
-.sd-node-copy em {
-  padding: 2px 5px;
-  border: 1px solid #3d5053;
-  border-radius: 3px;
-  font: normal 8.5px / 1 var(--font-mono);
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--text-subtle);
+  background: #1a2a17;
+  color: var(--push);
 }
 
 /* The edge's label inside the node: only when the arrows are gone. */
@@ -569,12 +552,8 @@
 }
 
 .sd-link--creds {
-  --c: #4a5f62;
-  --label: var(--text-subtle);
-}
-
-.sd-link--creds::before {
-  border-left-style: dashed;
+  --c: #4b6b3f;
+  --label: var(--push);
 }
 
 @container (max-width: 1100px) {
