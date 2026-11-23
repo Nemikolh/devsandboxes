@@ -158,7 +158,8 @@ calls inside the fence (gh's `token …`, the home's id lookups' `Bearer
 `gh-update.sh --bake` (release tarball, checked against the release's
 checksums), installs `gh-launcher.sh` as `/usr/local/bin/gh` and
 `gh-update.sh` as `/usr/local/lib/gh/gh-update`. The feature mounts
-`${sharedVolumes}/gh-bin` read-only at `/var/lib/devsandbox/gh/bin`; the
+`${sharedVolumes}/gh-bin` at `/var/lib/devsandbox/gh/bin`, read-only in
+the sandbox as every update's dir is (`commands::run::image::feature_container_opts`); the
 launcher runs `<dir>/<current>/gh` from there when the sandbox can't
 write it, else the baked gh. The feature's `gh` update
 (`customizations.devsandbox.updates`) runs `gh-update <dir> [version]` in
