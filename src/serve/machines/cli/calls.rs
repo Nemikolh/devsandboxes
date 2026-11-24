@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::serve::api::{ContainerLogs, ContainersList, ContainersStats, InstancesList, MAX_LINES, ProfileSet, Renamed};
+use crate::serve::api::{ContainerLogs, InstancesList, MAX_LINES, ProfileSet, Renamed};
 use crate::serve::proto::Response;
 use crate::snapshot::{InstanceRow, SandboxRow};
 use crate::{Command, ServiceCommand};
@@ -46,14 +46,10 @@ pub(crate) enum Use {
     Profile(Option<String>),
     /// `--machine m ls`: `instances.list` per config root, its sandboxes.
     Ls { json: bool },
-    /// `--machine m status --json`: `instances.list` per config root.
-    Status,
     /// `--machine m service ls`: `instances.list` per config root, its services.
     ServiceLs { json: bool },
-    /// `--machine m ps`: `containers.list`.
+    /// `--machine m ps`: one `instances.list`.
     Ps { all: bool, json: bool },
-    /// `--machine m stats`: `containers.stats`.
-    Stats { json: bool },
     /// Not an API call made here: what goes over the link's streams
     /// (`exec`, its sessions, `port`) and the verbs (`gc` among them, sent
     /// by `verbs_client`).
@@ -80,9 +76,7 @@ pub(crate) fn use_of(command: &Command) -> Use {
         Command::Rename { new_name, .. } => Use::Rename(new_name.clone()),
         Command::Profile { profile, .. } => Use::Profile(profile.clone()),
         Command::Ls { json } => Use::Ls { json: *json },
-        Command::Status { .. } => Use::Status,
         Command::Ps { all, json } => Use::Ps { all: *all, json: *json },
-        Command::Stats { json } => Use::Stats { json: *json },
         Command::Service { cmd: ServiceCommand::Ls { json } } => Use::ServiceLs { json: *json },
         Command::Vscode { .. } => Use::Refused(Refused::Vscode),
         _ => Use::Link,
@@ -157,7 +151,7 @@ fn container_of(row: Option<&InstanceRow>, name: &str) -> String {
     }
 }
 
-/// Run named `u` (not [`Use::Ls`] / `Status` / `Link` / `Refused`) on
+/// Run named `u` (not [`Use::Ls`] / `Ps` / `Link` / `Refused`) on
 /// instance or container `name` of machine `m`, `root` its config
 /// root there (or the machine's root). `tty`: stdout is a terminal (a pty
 /// build log keeps its colours). The exit code.
@@ -220,13 +214,7 @@ pub(crate) fn named(call: &mut Call, u: &Use, m: &str, name: &str, root: &Path, 
                 writeln!(out, "{line}")?;
             }
         }
-        Use::Ls { .. }
-        | Use::Status
-        | Use::ServiceLs { .. }
-        | Use::Ps { .. }
-        | Use::Stats { .. }
-        | Use::Link
-        | Use::Refused(_) => {
+        Use::Ls { .. } | Use::ServiceLs { .. } | Use::Ps { .. } | Use::Link | Use::Refused(_) => {
             bail!("not a named re-run")
         }
     }
@@ -302,22 +290,51 @@ pub(crate) fn follow_build_log(
     }
 }
 
-/// `--machine m ps|stats` (`u`) on machine `m`: one `containers.list` /
-/// `containers.stats` (the machine cuts the rows to what its trust admits),
-/// printed by the local command's render. The exit code.
-pub(crate) fn listing(call: &mut Call, u: &Use, m: &str, out: &mut dyn Write) -> Result<i32> {
-    match u {
-        Use::Ps { all, json } => {
-            let list: ContainersList = call_on(call, m, "containers.list", json!({ "all": all }))?;
-            write!(out, "{}", crate::commands::ps::render(list.rows, *json)?)?;
-        }
-        Use::Stats { json } => {
-            let stats: ContainersStats = call_on(call, m, "containers.stats", json!({}))?;
-            write!(out, "{}", crate::commands::stats::render(stats.rows, *json)?)?;
-        }
-        _ => bail!("not a listing re-run"),
-    }
+/// `--machine m ps` (`u`) on machine `m`: one `instances.list` at `root`
+/// (any of its roots: a snapshot lists every instance the machine's trust
+/// admits, whatever its `dir`), printed by the local command's render. The
+/// exit code.
+pub(crate) fn listing(call: &mut Call, u: &Use, m: &str, root: &Path, out: &mut dyn Write) -> Result<i32> {
+    let Use::Ps { all, json } = u else { bail!("not a listing re-run") };
+    let snapshot = list(call, m, root, None)?.snapshot;
+    write!(out, "{}", crate::commands::ps::render(snapshot, *all, *json, false)?)?;
     Ok(0)
+}
+
+/// Bare `ps`'s rows of every machine `machines.list` names, each tagged
+/// with its `machine`: one `instances.list` per machine at its first root
+/// (as [`listing`]). A machine without roots or whose call fails is one
+/// `warning:` line on `err`, its rows left out.
+pub(crate) fn machines_rows(call: &mut Call, err: &mut dyn Write) -> Result<Vec<InstanceRow>> {
+    let r = call("machines.list", Value::Null)?;
+    if let Some(e) = r.error {
+        bail!("{}", e.message);
+    }
+    let machines: Vec<crate::serve::machines::api::MachineRow> =
+        serde_json::from_value(r.result.unwrap_or(Value::Null)).context("bad machines.list result from devsandbox serve")?;
+    let mut rows = Vec::new();
+    for m in machines {
+        let Some(root) = m.roots.first() else {
+            writeln!(err, "warning: machine `{}` has no config roots listed (devsandbox machine ls)", m.name)?;
+            continue;
+        };
+        match list(call, &m.name, root, None) {
+            Ok(list) => rows.extend(list.snapshot.instances.into_iter().map(|mut r| {
+                r.machine = Some(m.name.clone());
+                r
+            })),
+            Err(e) => {
+                let e = format!("{e:#}");
+                // A trust refusal names the machine already (`answer_error`).
+                if e.starts_with("machine `") {
+                    writeln!(err, "warning: {e}")?;
+                } else {
+                    writeln!(err, "warning: machine `{}`: {e}", m.name)?;
+                }
+            }
+        }
+    }
+    Ok(rows)
 }
 
 /// The config roots a machine root `at` stands for, from a listing of it:
@@ -344,14 +361,13 @@ pub(crate) fn config_roots(at: &Path, list: &InstancesList) -> Vec<PathBuf> {
     roots
 }
 
-/// `--machine m ls|status|service ls` (`u`) on machine `m` with listed
+/// `--machine m ls|service ls` (`u`) on machine `m` with listed
 /// `roots`: one `instances.list` per config root ([`config_roots`]), each
 /// after its banner on `err` (`cli::root_banners`' rules: `--json` with
 /// several roots is an error). The exit code.
 pub(crate) fn per_root(call: &mut Call, u: &Use, m: &str, roots: &[PathBuf], out: &mut dyn Write, err: &mut dyn Write) -> Result<i32> {
     let json = match u {
         Use::Ls { json } | Use::ServiceLs { json } => *json,
-        Use::Status => true,
         _ => bail!("not a per-root re-run"),
     };
     let mut config = Vec::new();
@@ -364,7 +380,6 @@ pub(crate) fn per_root(call: &mut Call, u: &Use, m: &str, roots: &[PathBuf], out
     for (root, banner) in config.iter().zip(banners) {
         writeln!(err, "{banner}")?;
         match u {
-            Use::Status => writeln!(out, "{}", crate::commands::status::render(&list(call, m, root, None)?.snapshot)?)?,
             Use::ServiceLs { json } => {
                 // A listing for the statuses; `used_by` already cut to what the trust admits.
                 let snapshot = list(call, m, root, Some("listing"))?.snapshot;
@@ -426,11 +441,8 @@ mod tests {
         assert_eq!(u(&["profile", "lap/web"]), Use::Profile(None));
         assert_eq!(u(&["ls"]), Use::Ls { json: false });
         assert_eq!(u(&["ls", "--json"]), Use::Ls { json: true });
-        assert_eq!(u(&["status", "--json"]), Use::Status);
         assert_eq!(u(&["ps", "-a"]), Use::Ps { all: true, json: false });
         assert_eq!(u(&["ps", "--json"]), Use::Ps { all: false, json: true });
-        assert_eq!(u(&["stats"]), Use::Stats { json: false });
-        assert_eq!(u(&["stats", "--json"]), Use::Stats { json: true });
         // `gc` is a verb: `verbs_client` sends it.
         assert_eq!(u(&["gc", "--force"]), Use::Link);
         assert_eq!(u(&["service", "ls"]), Use::ServiceLs { json: false });
@@ -707,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn ls_and_status_print_as_the_local_commands_per_config_root() {
+    fn ls_prints_as_the_local_command_per_config_root() {
         let sandboxes = || vec![sandbox("web", "image node", Some("app"), &["db", "redis"], &["base"]), sandbox("cli", "dockerfile D", None, &[], &[])];
         let answer = |m: &str, p: &Value| {
             assert_eq!(m, "instances.list");
@@ -736,55 +748,68 @@ mod tests {
 
         let (_, out, _) = run_per_root(Use::Ls { json: true }, answer);
         assert_eq!(out, format!("{}\n", crate::commands::ls::render_json(&rows).unwrap()));
-        let (_, out, _) = run_per_root(Use::Status, answer);
-        let snapshot = list_of(listing(vec![row("w", "c", "/f/cfg", false)], sandboxes(), None)).snapshot;
-        assert_eq!(out, format!("{}\n", crate::commands::status::render(&snapshot).unwrap()));
     }
 
-    /// `ps` and `stats` print what the local commands print for the same rows.
+    /// `--machine m ps` prints what the local `ps` prints for the machine's
+    /// snapshot, from one full `instances.list`.
     #[test]
-    fn ps_and_stats_print_as_the_local_commands() {
-        use crate::commands::ps::PsRow;
-        use crate::runtime::{ContainerRow, StatsRow};
-        let ps_rows = vec![
-            PsRow { row: ContainerRow { name: "devsandbox-a".into(), image: "img".into(), status: "Up 1 hour".into(), ..Default::default() }, done: true, phase: None, profile: Some("work".into()), profile_disallowed: false },
-            PsRow {
-                row: ContainerRow { name: "devsandbox-b".into(), image: "img".into(), status: "Up".into(), ..Default::default() },
-                done: false,
-                phase: Some(crate::snapshot::PhaseRow::Failed { step: "postStartCommand".into(), error: "exit 1".into() }),
-                profile: Some("work".into()),
-                profile_disallowed: true,
-            },
-        ];
-        let stats_rows = vec![StatsRow { name: "devsandbox-a".into(), cpu: "1.5%".into(), mem: "20MiB / 1GiB".into() }];
-        let run = |u: Use| {
-            let mut f = fake(|m: &str, _: &Value| {
-                Ok(match m {
-                    "containers.list" => json!({ "rows": ps_rows }),
-                    _ => json!({ "rows": stats_rows }),
-                })
-            });
+    fn ps_prints_as_the_local_command() {
+        let mut done = row("a", "c", "/f/cfg", true);
+        done["profile"] = json!("work");
+        done["profile_disallowed"] = json!(true);
+        let mut stopped = row("b", "c", "/f/cfg", false);
+        stopped["status"] = json!({"state": "exited", "text": "Exited (0)"});
+        let answer = listing(vec![done, stopped], vec![], None);
+        let run = |all: bool, json: bool| {
+            let mut f = fake(|_: &str, _: &Value| Ok(answer.clone()));
             let mut out = Vec::new();
-            let r = super::listing(&mut |m, p| f.call(m, p), &u, "lap", &mut out);
+            let r = super::listing(&mut |m, p| f.call(m, p), &Use::Ps { all, json }, "lap", Path::new("/f/cfg"), &mut out);
             (r.unwrap(), String::from_utf8(out).unwrap(), f.calls)
         };
-        for json in [false, true] {
-            let (code, out, calls) = run(Use::Ps { all: true, json });
-            assert_eq!((code, out), (0, crate::commands::ps::render(ps_rows.clone(), json).unwrap()));
-            assert_eq!(calls, [("containers.list".into(), json!({"all": true, "machine": "lap"}))]);
-            let (_, out, calls) = run(Use::Stats { json });
-            assert_eq!(out, crate::commands::stats::render(stats_rows.clone(), json).unwrap());
-            assert_eq!(calls, [("containers.stats".into(), json!({"machine": "lap"}))]);
+        for (all, json) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (code, out, calls) = run(all, json);
+            let want = crate::commands::ps::render(list_of(answer.clone()).snapshot, all, json, false).unwrap();
+            assert_eq!((code, out), (0, want));
+            assert_eq!(calls, [("instances.list".into(), json!({"dir": "/f/cfg", "machine": "lap"}))]);
         }
-        let (_, out, _) = run(Use::Ps { all: false, json: false });
-        assert!(out.contains("Up 1 hour (done)") && out.contains("failed (postStartCommand)"), "{out}");
-        assert!(out.contains("work (not allowed)"), "{out}");
+        let (_, out, _) = run(false, false);
+        assert!(out.contains("running (done)") && out.contains("work (not allowed)") && !out.contains("exited"), "{out}");
 
         // A trust refusal is the error, naming the machine it's about.
         let denied = "`/x` isn't one of this member's roots (`devsandbox machine roots add <path>` there adds one)";
         let mut f = fake(|_: &str, _: &Value| Err(("denied", denied.into())));
-        let r = super::listing(&mut |m, p| f.call(m, p), &Use::Ps { all: false, json: false }, "lap", &mut Vec::new());
+        let r = super::listing(&mut |m, p| f.call(m, p), &Use::Ps { all: false, json: false }, "lap", Path::new("/x"), &mut Vec::new());
         assert_eq!(r.unwrap_err().to_string(), format!("machine `lap`: {denied}"));
+    }
+
+    /// Bare `ps`'s machine rows: each machine's at its first root, tagged;
+    /// one that can't answer, or has no roots, a warning.
+    #[test]
+    fn machines_rows_tag_each_machines_and_warn_for_the_rest() {
+        let machine = |name: &str, roots: &[&str]| {
+            json!({"name": name, "kind": "ssh", "target": name, "roots": roots, "command": null, "agent": false,
+                "state": "connected", "error": null, "version": null})
+        };
+        let machines = json!([machine("lap", &["/l/a", "/l/b"]), machine("box", &["/b"]), machine("new", &[]), machine("cp", &["/c"])]);
+        let mut f = fake(|m: &str, p: &Value| match (m, p["machine"].as_str()) {
+            ("machines.list", _) => Ok(machines.clone()),
+            (_, Some("lap")) => Ok(listing(vec![row("w", "c", "/l/a", false)], vec![], None)),
+            (_, Some("box")) => Err(("unavailable", "machine `box` is down".to_string())),
+            _ => Err(("denied", "`/c` isn't one of this member's roots".to_string())),
+        });
+        let mut err = Vec::new();
+        let rows = machines_rows(&mut |m, p| f.call(m, p), &mut err).unwrap();
+        let got: Vec<(&str, Option<&str>)> = rows.iter().map(|r| (r.name.as_str(), r.machine.as_deref())).collect();
+        assert_eq!(got, [("w", Some("lap"))]);
+        assert_eq!(f.calls[1], ("instances.list".into(), json!({"dir": "/l/a", "machine": "lap"})));
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "warning: machine `box` is down\n\
+             warning: machine `new` has no config roots listed (devsandbox machine ls)\n\
+             warning: machine `cp`: `/c` isn't one of this member's roots\n"
+        );
+        let mut f = fake(|_: &str, _: &Value| Err(("internal", "boom".to_string())));
+        assert_eq!(machines_rows(&mut |m, p| f.call(m, p), &mut Vec::new()).unwrap_err().to_string(), "boom");
     }
 
     /// `service ls` prints the listing's service rows as the local one
@@ -838,7 +863,7 @@ mod tests {
             let error = (p["dir"] == "/f").then_some("config: no devsandboxes.toml");
             Ok(listing(vec![row("a", "c", "/f/a", false), row("b", "c", "/f/b", false)], vec![], error))
         };
-        let (r, ..) = run_per_root(Use::Status, two);
+        let (r, ..) = run_per_root(Use::Ls { json: true }, two);
         assert!(r.unwrap_err().to_string().contains("/f/a, /f/b"));
         let (r, _, err) = run_per_root(Use::Ls { json: false }, two);
         assert_eq!((r.unwrap(), err.as_str()), (0, "==> lap:/f/a\n==> lap:/f/b\n"));

@@ -13,7 +13,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 
-use crate::commands::status::Envelope;
+use crate::commands::Envelope;
 use crate::inbox::wire::{self, Addr, ApiError, BlockView, FeedItemView, QuestionView, ThreadDetail, ThreadSummary};
 use crate::inbox::{Inbox, Op, View, ops, store};
 use crate::render::table;

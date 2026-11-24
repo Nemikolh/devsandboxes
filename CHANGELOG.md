@@ -22,6 +22,12 @@
   orgs = ["my-org"]
   ```
 
+- **`devsandbox ps` lists sandbox instances, like the dashboard.** One row per instance with its sandbox, status, uptime and CPU/memory (plus PROFILE when one has a profile, MACHINE when machines are registered, their rows included); `-a` adds stopped ones. Services are in `devsandbox services ls`. `ps --json` prints what `status --json` did, so `stats` and `status` are gone, and so are the `containers.list` / `containers.stats` API methods (and the npm package's `stats()` / `status()`; `ps()` returns the snapshot).
+
+  ```bash
+  devsandbox ps -a
+  ```
+
 ### Fixed
 
 - **VS Code no longer hands a claimed sandbox your logins when it can avoid it.** `devsandbox vscode` and the dashboard's `o` start `code` without your ssh-agent or git credential helper for an instance with a credential claim, and open it without asking when no other VS Code window could leak them (checked on Linux). Otherwise the dashboard now asks before opening, and `:code` takes `--allow-credential-leak` like the CLI.

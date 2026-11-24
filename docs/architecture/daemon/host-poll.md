@@ -126,7 +126,7 @@ false a pass asks nothing of a runtime:
   ([fleet.md](fleet.md#capacity)).
 
 The absence, and a runtime appearing, are one `serve.log` line each.
-Outside the daemon, `RuntimeView::gather` (`instances.list`, `status`)
+Outside the daemon, `RuntimeView::gather` (`instances.list`, `ps`)
 answers the same driver view.
 
 ## Bridges

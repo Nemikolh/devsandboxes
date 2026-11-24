@@ -50,7 +50,7 @@ struct Cli {
     #[arg(long, global = true, hide = true)]
     in_process: bool,
 
-    /// Run a command without a name (`ps`, `stats`, `ls`, `status`, `gc`,
+    /// Run a command without a name (`ps`, `ls`, `gc`,
     /// `service ls|rebuild`, `stop|start|rebuild --all`, `port --service
     /// <global-svc>`) on this machine
     /// (`devsandbox machine ls`); a named one takes `<machine>/<name>` instead
@@ -69,12 +69,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// List running sandbox instances
+    /// List running sandbox instances (every machine's too), with their
+    /// CPU/memory usage
     Ps {
-        /// Also show stopped instances
+        /// Also show stopped and missing instances
         #[arg(short, long)]
         all: bool,
-        /// Output JSON instead of a table
+        /// Output the full snapshot (sandboxes, instances, services) as JSON
         #[arg(long)]
         json: bool,
     },
@@ -283,19 +284,6 @@ enum Command {
         /// `<machine>/<instance>` (a bare `<instance>` when only one
         /// placement has that name)
         name: String,
-    },
-    /// Show CPU/memory usage of running devsandbox containers
-    Stats {
-        /// Output JSON instead of a table
-        #[arg(long)]
-        json: bool,
-    },
-    /// Machine-readable snapshot of sandboxes, instances, and services
-    Status {
-        /// Emit JSON; mandatory for now (plain `status` is reserved for a
-        /// future human summary)
-        #[arg(long, required = true)]
-        json: bool,
     },
     /// Run a feature's update now (e.g. a tool's new release into the dir its
     /// sandboxes mount read-only)
@@ -1042,7 +1030,10 @@ fn main() -> Result<()> {
 
     match command {
         Command::Ls { json } => commands::ls::ls(&cli.dir, json),
-        Command::Ps { all, json } => commands::ps::ps(all, json),
+        #[cfg(unix)]
+        Command::Ps { all, json } => commands::ps::ps(&cli.dir, all, json, !machines.is_empty()),
+        #[cfg(not(unix))]
+        Command::Ps { all, json } => commands::ps::ps(&cli.dir, all, json, false),
         // Placement is the daemon's: here, `--place` can only say it isn't.
         Command::Run { sandbox, name, branch, base, profile, env, dispatcher, json, reprobe, detach, place, fail_on_ask } => {
             if detach {
@@ -1178,8 +1169,6 @@ fn main() -> Result<()> {
                 anyhow::bail!("`devsandbox fetch` needs devsandbox serve, which is unix-only for now")
             }
         }
-        Command::Stats { json } => commands::stats::stats(json),
-        Command::Status { json: _ } => commands::status::status(&cli.dir),
         Command::Update { name, args } => commands::update::update(&cli.dir, &name, &args),
         Command::Exec { interactive, tty, attach, sessions, end, session, service, reserve_255, name, command } => {
             use commands::exec::Exec;

@@ -631,9 +631,9 @@ there, the error names both sockets.
   its pages by `offset`), `inspect` (`containers.inspect`), `done` /
   `undone` (`instances.done`), `rename` (`instances.rename`), `profile`
   (`instances.setProfile`; without a profile, the `instances.list` row), `--machine
-  m ls` / `status --json` (`instances.list` per config root under the
+  m ls` (`instances.list` per config root under the
   fleet root; `service ls` too, its service rows), `--machine m ps`
-  (`containers.list`) and `stats` (`containers.stats`), printed as the
+  (one `instances.list`), printed as the
   local commands print them ([machines](machines.md#the-cli-clirs),
   `machines::cli::calls`). `--machine m gc [--force]` is the `gc` verb
   per config root (`verbs_client`'s `CliVerb::Gc`), which the machine
@@ -2933,13 +2933,7 @@ never hands the daemon off (below). Under **`worker`**:
   federated push: other machines' rows, their `root` a path there) aren't
   this host's and stay as they are, so is `machines`; the asking peer's
   own were left out by the merge. `instances.resolve`'s matches are cut the same way
-  (`lent::filter_answer`); none left is `not-found`. `containers.list` /
-  `containers.stats` list the whole host's runtime, so their `rows` are
-  cut (`lent::cut_containers`) to the lent instances' containers and the
-  service containers of their config roots: a listing row by its
-  `devsandbox.project` label being one of those roots'
-  `services::project_id` (no label: dropped), a stats row, which has no
-  labels, by its `devsandbox-svc-<project>-` name.
+  (`lent::filter_answer`); none left is `not-found`.
 
 **Hello** on a `Peer` connection never hands the daemon off, whatever
 version it says and even with `force`, under either trust: only a local

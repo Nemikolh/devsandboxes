@@ -75,7 +75,7 @@ export interface AgentPromptSpec {
 export function buildAgentPrompt({ goal, steps, verify }: AgentPromptSpec): string {
   const items = [
     `Read the devsandbox-cli and config-toml-spec skills first (load them if they are installed, otherwise read them from ${SKILLS_URL}). Follow them over your own assumptions: unknown config keys are hard errors.`,
-    "Work out the specifics yourself: the repo is the one you are running in; my devsandbox config dir is the folder holding devsandboxes.toml (devsandbox runs in it, or takes it with `-C`), usually the one whose sandboxes' `folder` points at this repo; `devsandbox ls` there lists its sandboxes and `devsandbox ps -a` the instances and services that exist. Pick names that fit the ones already there. Ask me only for what you cannot determine.",
+    "Work out the specifics yourself: the repo is the one you are running in; my devsandbox config dir is the folder holding devsandboxes.toml (devsandbox runs in it, or takes it with `-C`), usually the one whose sandboxes' `folder` points at this repo; `devsandbox ls` there lists its sandboxes, `devsandbox ps -a` the instances that exist and `devsandbox service ls` the services. Pick names that fit the ones already there. Ask me only for what you cannot determine.",
     ...steps,
     'Validate with `devsandbox ls` in the config dir and fix every error it reports before going on.',
     ...verify,

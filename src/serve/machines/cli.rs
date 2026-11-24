@@ -49,8 +49,8 @@ use crate::{Command, ServiceCommand};
 /// What `--machine` does with a command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MachineUse {
-    /// API calls through the daemon (`ps`, `stats`, and per registered
-    /// root `ls`, `status`, `service ls`): [`calls::use_of`] says which.
+    /// API calls through the daemon (`ps`, and per registered root `ls`,
+    /// `service ls`): [`calls::use_of`] says which.
     Calls,
     /// A daemon verb (`stop/start/rebuild --all`, `service rebuild`, `gc`):
     /// `verbs_client` forwards it.
@@ -68,11 +68,7 @@ pub(crate) enum MachineUse {
 pub(crate) fn machine_use(command: Option<&Command>) -> MachineUse {
     let Some(command) = command else { return MachineUse::Refused("the dashboard") };
     match command {
-        Command::Ps { .. }
-        | Command::Stats { .. }
-        | Command::Ls { .. }
-        | Command::Status { .. }
-        | Command::Service { cmd: ServiceCommand::Ls { .. } } => MachineUse::Calls,
+        Command::Ps { .. } | Command::Ls { .. } | Command::Service { cmd: ServiceCommand::Ls { .. } } => MachineUse::Calls,
         Command::Gc { .. } | Command::Service { cmd: ServiceCommand::Rebuild { .. } } => MachineUse::Verb,
         Command::Rebuild { all: true, .. } | Command::Stop { all: true, .. } | Command::Start { all: true, .. } => {
             MachineUse::Verb
@@ -710,7 +706,10 @@ pub(crate) fn route(machine: Option<&str>, in_process: bool, machines: &[String]
                     let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr());
                     let call = &mut |method: &str, params| conn.call(method, params);
                     let code = match u {
-                        calls::Use::Ps { .. } | calls::Use::Stats { .. } => calls::listing(call, &u, &m, &mut out)?,
+                        calls::Use::Ps { .. } => {
+                            let root = info.root_or_default(None).or_else(|e| info.entry.roots.first().cloned().ok_or(e))?;
+                            calls::listing(call, &u, &m, &root, &mut out)?
+                        }
                         _ => calls::per_root(call, &u, &m, &info.entry.roots, &mut out, &mut err)?,
                     };
                     Ok(Routed::Exit(code))
@@ -1048,7 +1047,7 @@ mod tests {
     #[test]
     fn each_nameless_command_has_its_use() {
         let once = |args: &[&str]| machine_use(Some(&command(args)));
-        for args in [&["ps", "--json"][..], &["stats"], &["ls"], &["status", "--json"], &["service", "ls"]] {
+        for args in [&["ps", "--json"][..], &["ls"], &["service", "ls"]] {
             assert_eq!(once(args), MachineUse::Calls, "{args:?}");
         }
         assert_eq!(once(&["gc", "--force"]), MachineUse::Verb);
@@ -1068,9 +1067,7 @@ mod tests {
         use calls::{Refused, Use};
         let nameless = |args: &[&str]| (machine_use(Some(&command(args))), calls::use_of(&command(args)));
         assert_eq!(nameless(&["ls"]), (MachineUse::Calls, Use::Ls { json: false }));
-        assert_eq!(nameless(&["status", "--json"]), (MachineUse::Calls, Use::Status));
         assert_eq!(nameless(&["ps"]), (MachineUse::Calls, Use::Ps { all: false, json: false }));
-        assert_eq!(nameless(&["stats"]), (MachineUse::Calls, Use::Stats { json: false }));
         assert_eq!(nameless(&["service", "ls"]), (MachineUse::Calls, Use::ServiceLs { json: false }));
         assert_eq!(nameless(&["gc"]), (MachineUse::Verb, Use::Link));
         assert_eq!(nameless(&["port", "--service", "redis", "6379"]), (MachineUse::Port, Use::Link));

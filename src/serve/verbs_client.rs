@@ -1191,7 +1191,7 @@ fn print_detached(verb: &CliVerb, result: &Value, machine: Option<&str>) -> Resu
     let instance = result["instance"].as_str();
     if let CliVerb::Run { json: true, .. } = verb {
         let doc = match (result.get("record"), instance, machine) {
-            (Some(record), _, _) => serde_json::to_string_pretty(&crate::commands::status::Envelope::new(record))?,
+            (Some(record), _, _) => serde_json::to_string_pretty(&crate::commands::Envelope::new(record))?,
             (None, Some(key), None) => crate::commands::run::run_record_json(key)?,
             (None, Some(_), Some(m)) => bail!("{m} sent no run record (its devsandbox is older)"),
             (None, None, _) => bail!("no instance created"),

@@ -34,8 +34,7 @@ use crate::serve::snapshots::LinkState;
 use crate::serve::verbs;
 
 /// The non-verb methods that take a `machine`: the ones naming an
-/// instance, a container or a config root, and the machine-wide container
-/// listings (`containers.list` / `stats`). Any other with `machine` is
+/// instance, a container or a config root. Any other with `machine` is
 /// refused, so a client never gets a local answer it took for a remote one.
 pub const QUICK: &[&str] = &[
     "instances.list",
@@ -51,8 +50,6 @@ pub const QUICK: &[&str] = &[
     "sessions.rm",
     "containers.logs",
     "containers.inspect",
-    "containers.list",
-    "containers.stats",
     "sandboxes.list",
     "sandboxes.get",
     "services.get",

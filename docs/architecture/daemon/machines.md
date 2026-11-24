@@ -655,7 +655,7 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   resolves among this host's placements, `@/<name>` is refused.
   `--machine` refuses it (`machine_use`).
 - **`--machine m`** is for nameless commands (`machine_use`): `ps`,
-  `stats`, `ls`, `status`, `service ls` are API calls
+  `ls`, `service ls` are API calls
   (`MachineUse::Calls`, below); `stop --all`, `rebuild --all`, `start
   --all`, `service rebuild` and `gc` go as verbs (`verbs_client`; `gc` is
   `CliVerb::Gc`, one `gc` request per config root, each after its `==>
@@ -684,8 +684,8 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   terminal's. Nothing is held for the run: the link is always up.
 - **API calls** (`cli::calls`): printed by the local command's own render
   fns (`commands::logs::render_logs`, `inspect::render`, `ls::table` /
-  `ls::render_json`, `status::render`, `done::status_line`,
-  `rename::renamed_line`, `profile::profile_line` / `show_lines`, `ps::render`, `stats::render`,
+  `ls::render_json`, `done::status_line`,
+  `rename::renamed_line`, `profile::profile_line` / `show_lines`, `ps::render`,
   `services::ls_render`), so the output reads the same; `calls::use_of`
   (pure) picks the call, `calls::named` / `calls::per_root` /
   `calls::listing` make them over an injected call; each exits 0, an
@@ -709,7 +709,7 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   `profile <m>/<x> <p>` is `instances.setProfile`, and without `<p>` the
   row's `profile` and `profile_disallowed` (no allowed set: the row has
   none).
-  `--machine m ls [--json]` and `status --json` take each registered root
+  `--machine m ls [--json]` takes each registered root
   for the config roots it stands for (`calls::config_roots`: itself, and
   the config roots under it its listing's instance rows name; a root
   without a config of its own, a fleet root, only those, when it has
@@ -722,10 +722,13 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   trust admits); the snapshot's `error` (the runtime's, resolve failures)
   goes to stderr, a config that doesn't load is the error. The empty line
   names `<root>/devsandboxes.toml`. `--machine m ps [--all] [--json]` is
-  one `containers.list`, `stats [--json]` one `containers.stats`
-  (`calls::listing`): the machine answers its whole runtime's rows cut to
-  what its trust reaches (those instances' containers and their config
-  roots' services, [fleet](fleet.md#the-trust-table)).
+  one full `instances.list` at the machine's default root, else its first
+  (`calls::listing`; a snapshot lists every instance the trust admits,
+  whatever its `dir`), rendered by `ps::render` without a MACHINE column.
+  A bare `ps` with machines adds every machine's rows the same way
+  (`calls::machines_rows`: `machines.list`, then one `instances.list` per
+  machine at its first root, rows tagged `machine`; a failure is a
+  `warning:` line, [snapshot-and-json](../dashboard/snapshot-and-json.md#ps)).
 - **An `exec`** is `PTY` streams to the machine from this process
   (`fleet::pty_client::dial`, over `route::connect`; [fleet](fleet.md#pty)), at the
   instance's root there (the match's, else the machine's default); a dial's

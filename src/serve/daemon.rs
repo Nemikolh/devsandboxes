@@ -2447,7 +2447,7 @@ fn handle(line: &[u8], shared: &Shared, conn: &mut ConnState) -> Option<Response
     };
     let answer = match &reach {
         Some(reach) if lists_roots => answer.map(|v| lent::with_fleet_root(v, reach)),
-        Some(reach) => answer.and_then(|v| lent::filter_answer(&req.method, v, reach, &shared.state)),
+        Some(reach) => answer.and_then(|v| lent::filter_answer(&req.method, v, reach)),
         None => answer,
     };
     Some(match answer {

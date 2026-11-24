@@ -461,11 +461,11 @@ fn orphan_check(
 }
 
 /// `run --json` payload: where the new instance lives, so a programmatic
-/// caller can exec into it or open its folder without a follow-up `status`.
+/// caller can exec into it or open its folder without a follow-up `ps`.
 /// Field names and meanings match [`crate::snapshot::InstanceRow`] where they
 /// overlap, except `worktree`, which is the path here (not a flag): a caller
 /// that just created the instance needs to know where it is. Runtime-derived
-/// fields (status, cpu, drift) are left to `status --json`.
+/// fields (status, cpu, drift) are left to `ps --json`.
 #[derive(Debug, serde::Serialize)]
 pub struct RunRecord {
     /// Instance name (state key); what every `<name>` argument accepts.
@@ -511,7 +511,7 @@ pub fn run_record_json(key: &str) -> Result<String> {
         .instances
         .get(key)
         .with_context(|| format!("instance `{key}` missing from state after run"))?;
-    serde_json::to_string_pretty(&super::status::Envelope::new(RunRecord::new(key, info)))
+    serde_json::to_string_pretty(&super::Envelope::new(RunRecord::new(key, info)))
         .context("serialize run record")
 }
 
@@ -1525,7 +1525,7 @@ mod tests {
     #[test]
     fn run_record_serializes_in_the_envelope() {
         let doc = |key: &str, info: &Instance| {
-            let json = serde_json::to_string(&crate::commands::status::Envelope::new(RunRecord::new(key, info)));
+            let json = serde_json::to_string(&crate::commands::Envelope::new(RunRecord::new(key, info)));
             serde_json::from_str::<serde_json::Value>(&json.unwrap()).unwrap()
         };
         let base = doc("repo", &instance("repo"));

@@ -73,7 +73,7 @@ the feed newest first:
 ## `--json`
 
 `ls` and `show` print the API's views in the envelope
-`{"schema": 1, "data": …}` (`commands::status::Envelope`): `ls` a list of
+`{"schema": 1, "data": …}` (`commands::Envelope`): `ls` a list of
 [thread summaries](api.md#thread-summary), `show` one detail as
 [`inbox.thread.get`](api.md#inboxthreadget) answers it.
 

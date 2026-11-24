@@ -25,8 +25,6 @@ pub mod rm;
 pub mod run;
 pub mod services;
 pub mod start;
-pub mod stats;
-pub mod status;
 pub mod stop;
 pub mod subnet;
 pub mod trust_origin;
@@ -41,6 +39,24 @@ use anyhow::{bail, Context, Result};
 
 use crate::runtime::{backend, NAME_PREFIX};
 use crate::state::{Instance, PhaseView, Progress, State};
+
+/// Current JSON schema version of every `--json` document. Bump on any
+/// breaking payload change.
+pub(crate) const SCHEMA: u32 = 1;
+
+/// Wraps every `--json` payload so consumers can gate on the schema version
+/// before reading `data`.
+#[derive(serde::Serialize)]
+pub(crate) struct Envelope<T: serde::Serialize> {
+    schema: u32,
+    data: T,
+}
+
+impl<T: serde::Serialize> Envelope<T> {
+    pub(crate) fn new(data: T) -> Self {
+        Envelope { schema: SCHEMA, data }
+    }
+}
 
 /// Why `key` isn't a ready instance (docs/architecture/instances/lifecycle.md),
 /// for verbs that need one (`start`; `rebuild --all` and autostart skip with

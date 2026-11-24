@@ -210,7 +210,7 @@ is frozen: no new work on it.
   fallbacks without OSC 52; copying a selection's markdown source; `--all`
   for `:stop`/`:start`/`:rebuild`; `:logs`/`:inspect`; progress for
   `services.rebuild`.
-- **json**: raw-number cpu/mem (schema v2); plain `status` without `--json`.
+- **json**: raw-number cpu/mem (schema v2).
 - **machines**: OS keychain backends for the member key behind `KeyStore`
   (fleet plan decision 52). → [plan](plans/active/fleet.md)
 - **machines**: an agent grant counted as exposure (a granted member can

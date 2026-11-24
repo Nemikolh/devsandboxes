@@ -20,7 +20,7 @@ Code: `src/config.rs` (`Config::profiles`, `Profile`, `check_profile_name`,
 (`handle_with`, `ensure_args`); shown by `src/snapshot.rs`
 (`InstanceRow::profile`, `profile_disallowed`, `SandboxRow::profiles`,
 `allowed_now`),
-`src/commands/ps.rs` (`PsRow`, `join_state`, `cells`),
+`src/commands/ps.rs` (`table_of`),
 `src/commands/inspect.rs` (`profile_line`) and `src/tui/ui.rs`
 (`instance_tree_row`, `profile_detail_line`); switched in the dashboard by
 `src/tui/app/actions.rs` (`switch_profile`, `profile_switch`),
@@ -149,18 +149,15 @@ gone from the config) nothing is flagged. A flagged instance keeps its
 profile; nothing moves it.
 
 - **Snapshots** (`instances.list`, `instances.watch`'s pushes,
-  `status --json`): `InstanceRow::profile` and `profile_disallowed`.
+  `ps --json`): `InstanceRow::profile` and `profile_disallowed`.
   Each `SandboxRow` carries its allowed set (`profiles`, filled by
   `sandbox_rows` while it resolves the sandbox; empty when it doesn't
   resolve), and `snapshot::join` takes it from the row into its
   `SandboxFacts`. A row that didn't resolve isn't in `SandboxFacts`, so
   its instances stay unflagged.
-- **`ps`** (and `containers.list`, which shares `ps::rows`): `PsRow`
-  carries `profile` and `profile_disallowed`. Only for an instance with a
-  profile, `snapshot::allowed_now` loads its `Instance::config_dir`'s
-  config (once per root, best-effort: unreadable, nothing flagged). The
-  table grows a PROFILE column only when some row has a profile; a
-  flagged one reads `<p> (not allowed)`.
+- **`ps`**: the snapshot's rows (`table_of`). The table grows a PROFILE
+  column only when some row has a profile; a flagged one reads
+  `<p> (not allowed)`.
 - **`inspect`**: after the browser sandbox line, on stderr,
   `profile: <p>`, with ` (no longer allowed by the config)` when flagged
   (`profile_line`); nothing for an instance without one.

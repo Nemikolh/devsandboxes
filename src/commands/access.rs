@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::login::{Stdio, Term, approve_or_refuse, data_dir};
-use super::status::Envelope;
+use super::Envelope;
 use super::run::remotes;
 use crate::broker::asks::{self, Answer};
 use crate::config::{Access, Config};

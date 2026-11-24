@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 use super::{container_drifted, subnet};
-use crate::commands::status::Envelope;
+use crate::commands::Envelope;
 use crate::config::{build_hash, short_hash, Build, Config, ResolvedService, ServiceScope};
 use crate::render::{bold_cyan, dim, green, magenta, yellow};
 use crate::runtime::{backend, Backend, ServiceEndpoint, NAME_PREFIX};

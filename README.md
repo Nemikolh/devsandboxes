@@ -31,7 +31,7 @@ devsandbox              # the dashboard
 | Command                                    | Behavior                                                                  |
 | ------------------------------------------ | ------------------------------------------------------------------------- |
 | `devsandbox`                               | TUI dashboard on a TTY; help otherwise                                    |
-| `ls` / `ps [-a]`                           | Sandbox configs / instances                                               |
+| `ls` / `ps [-a]`                           | Sandbox configs / instances with CPU and memory (every machine's too)     |
 | `run [sandbox] [--name] [--branch] [--profile] [--reprobe] [-d]` | Create a fresh instance (picker without args); `--profile` picks one of the sandbox's `profiles`; `--reprobe` re-detects the runtime's user-namespace mode |
 | `start` / `stop <name>\|--all` (`start -d`) | Start / Stop an instance                                                  |
 | `rebuild <name>\|--all [--force] [--reprobe] [-d]` | Recreate from current config when drifted; worktree and state kept (`--reprobe` alone isn't drift: add `--force`) |
@@ -49,7 +49,7 @@ devsandbox              # the dashboard
 | `serve install` / `serve uninstall`        | Run the host daemon from login (it otherwise starts on demand; docs/architecture/daemon/role.md) |
 | `service ls` / `service rebuild`           | List services / recreate one and rewire running sandboxes in place        |
 | `gc [--force]`                             | Reap unreferenced services, orphaned history files and agent links        |
-| `status --json`                            | Full snapshot for scripts; `ps`/`ls`/`stats`/`inspect`/`run`/`inbox` take `--json` |
+| `ps --json`                                | Full snapshot for scripts; `ls`/`inspect`/`run`/`inbox` take `--json` too |
 
 `run`, `rebuild`, `start`, `stop` and `rm` run in the host daemon (`devsandbox serve`, started on demand; Linux and macOS) with your shell's environment, and stream their output back: closing the terminal doesn't stop them, Ctrl-C still cancels. `-d` / `--detach` returns once the instance is registered and prints its name; `devsandbox logs --build <name> --follow` follows the rest.
 

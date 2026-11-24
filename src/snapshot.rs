@@ -1,6 +1,6 @@
 //! UI-independent snapshot collection: joins docker/state/config into a
 //! [`Snapshot`] that the dashboard and any machine-readable consumer share
-//! verbatim. Plain blocking I/O (the daemon's poll, `status`); parsing lives in
+//! verbatim. Plain blocking I/O (the daemon's poll, `ps`); parsing lives in
 //! free functions to stay unit-testable without docker.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -291,7 +291,7 @@ pub struct Snapshot {
 }
 
 /// Pre-extracted service definition fed into [`build_service_rows`]. Keeping the
-/// join pure (no docker, no `ResolvedService`) makes it unit-testable: `collect`
+/// join pure (no docker, no `ResolvedService`) makes it unit-testable: `collect_from`
 /// fills these from `Config::resolve_service`, tests construct them directly.
 struct ServiceInput {
     name: String,
@@ -343,7 +343,7 @@ fn service_source(spec: &crate::config::Service) -> String {
 /// docker state, returning the rows plus one message per service that failed to
 /// resolve (`?` placeholder rows still render). The config resolution is the only
 /// impure-ish part (pure config work, no docker); the docker listing `ps` and the
-/// `instance_services` pairing are passed in so `collect` and `commands::services::ls`
+/// `instance_services` pairing are passed in so `collect_from` and `commands::services::ls`
 /// build the Services view identically and cannot drift. `dir` is the config
 /// root, used to hash each service's dockerfile for drift. `project` scopes
 /// container names; `instance_services` is `(display name, persistent id,
@@ -623,11 +623,11 @@ fn mount_source_uses_instance(mount: &Mount) -> bool {
 /// that resolves gets its real source/folder/services/hash plus any
 /// [`validate_sandbox`] issues; one that fails to resolve gets a placeholder row
 /// (source `?`, empty everything) and its resolve error is returned alongside so
-/// the caller can surface it (`collect` folds these into `Snapshot.error`; `ls
+/// the caller can surface it (`collect_from` folds these into `Snapshot.error`; `ls
 /// --json` ignores them, the `?` row is the signal). Every row gets its
 /// identity notes ([`identity_notes`]), `acked` being the root's acked
 /// finding ids (`State::identity_acks`, read by the caller). Pure config work — no
-/// docker — shared verbatim by [`collect`] and `commands::ls`.
+/// docker — shared verbatim by [`collect_from`] and `commands::ls`.
 pub fn sandbox_rows(dir: &Path, config: &Config, acked: &BTreeSet<String>) -> (Vec<SandboxRow>, Vec<String>) {
     let mut rows = Vec::with_capacity(config.sandboxes.len());
     let mut errors = Vec::new();
@@ -709,15 +709,6 @@ pub fn identity_notes(
             acked: acked.contains(&f.id),
         })
         .collect()
-}
-
-/// Collect a fresh [`Snapshot`]. Blocking; run off the UI thread.
-///
-/// State is the source of truth for which rows exist; the runtime enriches them
-/// with liveness and resource usage. When it or config is unavailable the rows
-/// still render (status `Missing`, no cpu/mem) and `error` is set.
-pub fn collect(dir: &Path) -> Snapshot {
-    collect_with(dir, Depth::Full)
 }
 
 /// How much of the runtime a [`collect_with`] asks, cheapest first. The daemon
@@ -843,9 +834,13 @@ impl RuntimeView {
     }
 }
 
-/// [`collect`] down to `depth` (see [`Depth`]): [`RuntimeView::gather`] +
-/// [`collect_from`]. A state that won't load answers before the runtime is
-/// asked.
+/// A fresh [`Snapshot`] down to `depth` (see [`Depth`]):
+/// [`RuntimeView::gather`] + [`collect_from`]. Blocking. A state that won't
+/// load answers before the runtime is asked.
+///
+/// State is the source of truth for which rows exist; the runtime enriches them
+/// with liveness and resource usage. When it or config is unavailable the rows
+/// still render (status `Missing`, no cpu/mem) and `error` is set.
 pub fn collect_with(dir: &Path, depth: Depth) -> Snapshot {
     match State::load() {
         Ok(state) => join(dir, Ok(state), &RuntimeView::gather(depth)),

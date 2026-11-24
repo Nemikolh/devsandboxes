@@ -20,7 +20,7 @@ Start with `docs/README.md` (reading order and map) and
   `rm`, `ps`, `ls`, `exec`, `done`, `rename`, `trust_origin` (`trust-origin`),
   `profile`, `vscode`, `fetch`, `login`, `access` (`access approve`;
   docs/reference/credentials-cli.md),
-  `inbox`, `logs`, `inspect`, `stats`, `status`, `port`, `machine`,
+  `inbox`, `logs`, `inspect`, `port`, `machine`,
   `update` (a feature's update run now from the newest features image;
   docs/reference/update-cli.md),
   `fleet_link` (hidden `fleet-link`), `services::{gc,ls,rebuild}`); not

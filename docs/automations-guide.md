@@ -12,7 +12,7 @@ autostart = true         # devsandbox starts it once per boot
 # autostart = "runtime"  # the container runtime restarts it on boot
 ```
 
-**`true`**: once per host boot (per config root), the host daemon's start (`devsandbox serve`, started on demand or at login), the first dashboard launch, or the first `devsandbox run` / `devsandbox start` (after it finishes), whichever comes first, starts every stopped instance of each `autostart` sandbox through the full `start` path (services, helper, `postStartCommand`). A sandbox with no instance yet gets one (`run`). Dispatcher-owned children are skipped (see below). Other commands (`ps`, `stop`, `status --json`, …) never trigger it. An instance you stop afterwards stays stopped until the next boot. If the runtime isn't reachable yet (Docker Desktop still starting, `container system start` not run), the pass is skipped and retried on the next trigger.
+**`true`**: once per host boot (per config root), the host daemon's start (`devsandbox serve`, started on demand or at login), the first dashboard launch, or the first `devsandbox run` / `devsandbox start` (after it finishes), whichever comes first, starts every stopped instance of each `autostart` sandbox through the full `start` path (services, helper, `postStartCommand`). A sandbox with no instance yet gets one (`run`). Dispatcher-owned children are skipped (see below). Other commands (`ps`, `stop`, `ls`, …) never trigger it. An instance you stop afterwards stays stopped until the next boot. If the runtime isn't reachable yet (Docker Desktop still starting, `container system start` not run), the pass is skipped and retried on the next trigger.
 
 **`"runtime"`**: the same pass, plus the container is created with `--restart unless-stopped`, so docker/podman bring it back at boot with no devsandbox process running:
 
@@ -133,7 +133,7 @@ Control is served by the host daemon (`devsandbox serve`), which the dashboard, 
 
 ### Done children
 
-A child marked **done** is kept as is (container, worktree, runs), shown dimmed with a `✓` in the dashboard and as `Up … (done)` in `devsandbox ps`, and removed whenever someone decides to. It's how a user says "I've looked at it, carry on" without removing anything.
+A child marked **done** is kept as is (container, worktree, runs), shown dimmed with a `✓` in the dashboard and as `running (done)` in `devsandbox ps`, and removed whenever someone decides to. It's how a user says "I've looked at it, carry on" without removing anything.
 
 - Set by `devsbd done <key>` (e.g. the PR merged), a thread's `done` (below), or `devsandbox done <instance>`. Cleared by `devsandbox undone`, `u` on the thread, or an `ensure` that reuses the child.
 - `devsbd ls` reports `"done": true`. A done child is still a real container: it counts toward `max-instances`. Whether to evict done children to make room is the dispatcher's call; devsandbox never removes them.

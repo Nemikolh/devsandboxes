@@ -58,7 +58,8 @@ running daemon (`connect_running`), else the caller prints a `note:`.
 | `machine add\|ls\|set\|rm` | `machines.*` via `connect`, never in-process | error |
 | a command naming a machine's instance, `--machine` | routed by `machines::cli::route` ([machines.md](machines.md)) | error |
 | `port` | none: forwards in its own process ([forwards.md](forwards.md)) | same |
-| `ls`, `ps`, `logs`, `inspect`, `stats`, … | none: read `state.toml` and the runtime | same |
+| `ps` with machines | `connect` + `machines.list`, an `instances.list` per machine | `warning:` line, this host's rows only |
+| `ls`, `ps`, `logs`, `inspect`, … | none: read `state.toml` and the runtime | same |
 
 ## The dashboard
 

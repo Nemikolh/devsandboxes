@@ -44,7 +44,7 @@ runtime.
 | `kubectl port-forward` | the daemon's forwards (ad-hoc and `forwardPorts`) and `devsandbox port`, tunnelled through the helper, over `TUNNEL` streams to another machine | `serve::forwards`, `commands::port`, `commands::tunnel`; [forwards.md](../architecture/daemon/forwards.md) |
 | `kubectl exec`, `attach` | `devsandbox exec`: a tty exec is a helper session that outlives its client; `exec --attach` resumes one | `commands::exec`, `devsbd/src/sessions.rs`; [Sessions](../architecture/helper/in-container.md#sessions-devsbd-session-newattachlsrmprune) |
 | `kubectl logs` | `devsandbox logs` | `commands::logs` |
-| `kubectl top` | `devsandbox stats` | `commands::stats` |
+| `kubectl top` | `devsandbox ps` (CPU, MEM) | `commands::ps` |
 
 ## No Kubernetes equivalent
 

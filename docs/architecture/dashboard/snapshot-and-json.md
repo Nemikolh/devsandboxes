@@ -1,15 +1,15 @@
 # Snapshot and JSON output
 
 The `Snapshot` is the one model of sandboxes, instances and services that
-the dashboard renders and that `status --json` prints; the other `--json`
+the dashboard renders and that `ps --json` prints; the other `--json`
 verbs share its row types and envelope. Read this before adding a field
 to a row or a `--json` flag.
 
 Code: `src/snapshot.rs` (`Snapshot`, `InstanceRow`, `SandboxRow`,
 `ServiceRow`, `ContainerStatus`, `PhaseRow`, `Depth`, `RuntimeView`,
-`collect`, `collect_with`, `collect_from`, `sandbox_rows`,
-`service_rows`), `src/commands/status.rs` (`Envelope`, `SCHEMA`,
-`status`), `src/commands/{ls,ps,stats,inspect,services,inbox,machine}.rs`,
+`collect_with`, `collect_from`, `sandbox_rows`, `service_rows`),
+`src/commands/mod.rs` (`Envelope`, `SCHEMA`),
+`src/commands/{ls,ps,inspect,services,inbox,machine}.rs`,
 `src/commands/run/mod.rs` (`RunRecord`, `run_record_json`),
 `src/json_stdout.rs` (`JsonStdout`), `src/serve/api.rs`
 (`InstancesList`), `src/tui/data.rs`.
@@ -59,7 +59,8 @@ and drift), `Full` (plus `stats`, which dominates collection time).
 which is how the daemon's one poll serves every watched root
 ([../daemon/host-poll.md](../daemon/host-poll.md)).
 
-Callers: `status --json` (`collect`, `Full`), the daemon's poll
+Callers: `ps` (`RuntimeView::gather(Full)` + `collect_from`, so it
+warns on the runtime's own errors only), the daemon's poll
 (`collect_from`, pushed as `instances.snapshot`), `instances.list`
 (`collect_with` at the requested `depth`). The dashboard collects nothing
 itself.
@@ -73,7 +74,27 @@ owner and key, for the Inbox thread pane). The row types derive
 (`tui::daemon::snapshot_update`); the remote machines' link states ride
 alongside. `src/tui/data.rs` re-exports the types and holds the
 render-side helpers (`Node`, `visible_nodes`, header totals). Parity with
-`status --json` holds by construction: one struct, one serde shape.
+`ps --json` holds by construction: one struct, one serde shape.
+
+## `ps`
+
+`ps` (`commands::ps`) is the Instances tree as a table. `rows` keeps the
+running instances and those a `run`/`rebuild` is materializing (every
+one with `-a`), this host's first, then by machine, each by name.
+`table_of` prints `NAME SANDBOX STATUS UPTIME CPU MEM`: STATUS is
+`InstanceRow::status_label` (` (done)` added for a done instance),
+UPTIME `render::humanize_secs` for a running one; then PROFILE when some
+row has a profile (`<p> (not allowed)` when flagged), and MACHINE when
+machines exist (`LOCAL_MACHINE`, `@`, for this host's rows). Services
+are `service ls`'s.
+
+With machines (`machines::cli::machine_names` not empty), `ps` asks the
+daemon (started on demand) for `machines.list`, then one full
+`instances.list` per machine at its first root
+(`machines::cli::calls::machines_rows`), each row tagged `machine`. A
+machine that fails, or no daemon, is one `warning:` line on stderr; this
+host's rows still print. `--machine m ps` is one `instances.list` on `m`
+rendered by the same `ps::render`.
 
 ## JSON output
 
@@ -82,11 +103,9 @@ number, a breaking change bumps it. Pretty-printed to stdout.
 
 | verb | `data` |
 |---|---|
-| `status --json` (flag required) | `Snapshot` |
+| `ps --json` | `Snapshot`, `instances` cut as the table's (`-a`: all), machines' rows merged |
 | `ls --json` | `SandboxRow`s (`sandbox_rows`, no runtime call) |
 | `service ls --json` | `ServiceRow`s (`service_rows`) |
-| `ps --json` | runtime `ContainerRow`s + `done` + `phase` + `profile` + `profile_disallowed` |
-| `stats --json` | runtime `StatsRow`s |
 | `run --json` | `RunRecord` |
 | `inbox ls --json` / `inbox show --json` | `ThreadSummary`s / `ThreadDetail` |
 
@@ -94,7 +113,7 @@ Not enveloped: `inspect --json` prints the runtime's own inspect document;
 `machine ls --json` prints the daemon's `machines.list` answer as is.
 (`inbox submit --json` is input, not output.)
 
-`status --json` never fails on the runtime: its being down is data
+`ps --json` never fails on the runtime: its being down is data
 (`Snapshot.error`), exit 0. An empty config gives `data: []` for `ls`/`service ls`.
 
 ## `run --json` and clean stdout

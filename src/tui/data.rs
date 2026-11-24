@@ -273,21 +273,7 @@ pub fn sandbox_stats(instances: usize, running: usize) -> String {
     format!("{running}/{instances} running")
 }
 
-/// Humanize an elapsed-seconds duration: `3d4h`, `2h05m`, `12m`, `40s`.
-pub fn humanize_secs(secs: u64) -> String {
-    let days = secs / 86_400;
-    let hours = (secs % 86_400) / 3_600;
-    let mins = (secs % 3_600) / 60;
-    if days > 0 {
-        format!("{days}d{hours}h")
-    } else if hours > 0 {
-        format!("{hours}h{mins:02}m")
-    } else if mins > 0 {
-        format!("{mins}m")
-    } else {
-        format!("{secs}s")
-    }
-}
+pub use crate::render::humanize_secs;
 
 /// How stale a snapshot may be before the header flags it, in seconds. The
 /// daemon pushes every collection, changed or not, every 2s

@@ -21,7 +21,7 @@ import { spawn } from 'node:child_process';
 import * as devsandbox from 'devsandboxes';
 
 const { name, worktree } = await devsandbox.run('web', { dir: './sandboxes', stderr: 'inherit' });
-const { instances } = await devsandbox.status({ dir: './sandboxes' });
+const { instances } = await devsandbox.ps({ dir: './sandboxes', all: true });
 for (const i of instances) console.log(i.name, i.status.state, i.drift);
 
 const { exitCode, stdout } = await devsandbox.exec(name, ['git', 'status']);
@@ -35,8 +35,8 @@ await devsandbox.rm(name, { deleteBranch: true });
 
 | Function                                   | Resolves to                          |
 | ------------------------------------------ | ------------------------------------ |
-| `status()`                                 | `Snapshot` (sandboxes, instances, services) |
-| `ls()` / `ps({ all })` / `stats()`         | `SandboxRow[]` / `ContainerRow[]` / `StatsRow[]` |
+| `ps({ all })`                              | `Snapshot` (sandboxes, instances, services) |
+| `ls()`                                     | `SandboxRow[]`                       |
 | `service.ls()`                             | `ServiceRow[]`                       |
 | `inspect(name)`                            | runtime inspect document (`unknown`) |
 | `run(sandbox, { name, branch, base })`     | `RunRecord` (name, container, workspace, folder, worktree, branch) |
@@ -75,7 +75,7 @@ await api.close();
 | ------------------------------------------------ | ----------- |
 | `inbox.list(view?)` / `inbox.get(thread)`        | `ThreadSummary[]` / `ThreadDetail` |
 | `inbox.markRead` / `act` / `reply` / `done` / `reopen(thread, …)`, `inbox.dismiss` / `markNotifyRead(target)` | `void` |
-| `instances.list(dir)`                            | `InstancesList`: `status()`'s `Snapshot` + `thread_children` |
+| `instances.list(dir)`                            | `InstancesList`: `ps()`'s `Snapshot` + `thread_children` |
 | `forwards.list(dir?)` / `add(params)` / `rm(id)` | `ForwardRow[]` / `ForwardAdded` / `ForwardRemoved` |
 | `call(method, params)`                           | any method's raw `result` |
 | `subscribe(topics)` / `close()`                  | `void` |

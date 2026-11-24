@@ -66,24 +66,43 @@ pub fn classify_json_line(line: &str) -> JsonLine {
     JsonLine::Plain
 }
 
+/// Humanize an elapsed-seconds duration: `3d4h`, `2h05m`, `12m`, `40s`.
+/// Shared by the dashboard's UPTIME column and `ps`'.
+pub fn humanize_secs(secs: u64) -> String {
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let mins = (secs % 3_600) / 60;
+    if days > 0 {
+        format!("{days}d{hours}h")
+    } else if hours > 0 {
+        format!("{hours}h{mins:02}m")
+    } else if mins > 0 {
+        format!("{mins}m")
+    } else {
+        format!("{secs}s")
+    }
+}
+
 /// Fixed-width plain-text table: header row first, two-space gutter, no
-/// trailing padding on the last column. Shared by `ps` and `stats`.
-pub fn table<const N: usize>(headers: &[&str; N], rows: &[[String; N]]) -> String {
-    let mut widths = headers.map(str::len);
+/// trailing padding on the last column.
+/// Every row has `headers.len()` cells.
+pub fn table<R: AsRef<[String]>>(headers: &[&str], rows: &[R]) -> String {
+    let n = headers.len();
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
     for row in rows {
-        for (i, cell) in row.iter().enumerate() {
+        for (i, cell) in row.as_ref().iter().enumerate() {
             widths[i] = widths[i].max(cell.len());
         }
     }
-    let header_row: [String; N] = headers.map(str::to_string);
+    let header_row: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
     let mut out = String::new();
-    for row in std::iter::once(&header_row).chain(rows) {
+    for row in std::iter::once(header_row.as_slice()).chain(rows.iter().map(AsRef::as_ref)) {
         for (i, cell) in row.iter().enumerate() {
             if i > 0 {
                 out.push_str("  ");
             }
             out.push_str(cell);
-            if i + 1 < N {
+            if i + 1 < n {
                 out.extend(std::iter::repeat(' ').take(widths[i] - cell.len()));
             }
         }

@@ -4,7 +4,7 @@ const { spawn } = require('node:child_process');
 const { EventEmitter } = require('node:events');
 const path = require('node:path');
 
-/** JSON envelope version this shim understands (`commands::status::SCHEMA`). */
+/** JSON envelope version this shim understands (`commands::SCHEMA`). */
 const SCHEMA = 1;
 
 /** `<process.platform>-<process.arch>` keys with a published binary package. */
@@ -105,8 +105,6 @@ const unit = () => undefined;
 
 const ls = (opts) => json(['ls'], opts);
 const ps = (opts = {}) => json(['ps', ...(opts.all ? ['--all'] : [])], opts);
-const stats = (opts) => json(['stats'], opts);
-const status = (opts) => json(['status'], opts);
 // The runtime's own inspect document, not enveloped.
 const inspect = (name, opts) => cli(['inspect', name, '--json'], opts).then((r) => JSON.parse(r.stdout));
 
@@ -345,8 +343,6 @@ module.exports = {
   cli,
   ls,
   ps,
-  stats,
-  status,
   inspect,
   run,
   start,

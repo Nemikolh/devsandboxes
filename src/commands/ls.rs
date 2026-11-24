@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use toml::Value;
 
-use crate::commands::status::Envelope;
+use crate::commands::Envelope;
 use crate::config::Config;
 use crate::render::{bold_cyan, dim, green, magenta, yellow};
 

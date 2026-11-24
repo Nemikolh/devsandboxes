@@ -353,7 +353,8 @@ its child instance done.
 
 Params: `{"dir": "/abs/path/to/config-root", "depth": "full"}`, `dir`
 the directory `-C` would take. Absolute: the daemon's cwd is `/`. Result:
-the `status --json` snapshot's `data`, without the
+the `ps --json` snapshot's `data` (every instance, not only the
+running ones), without the
 envelope: the API versions itself through `protocol`; plus a top-level
 `thread_children`.
 
@@ -380,7 +381,7 @@ it's from (`null` for an instance older than that record), and
 ([ADR 0049](../decisions/0049-the-authority-signs-a-config-every-member-runs.md)):
 on the authority the name `mesh/roots.toml` binds to it, on a member the
 signed copy the root is exactly (`fleet::mesh::root_id`). Absent for an
-unsigned root, and in `status --json` (the daemon tags rows,
+unsigned root, and in a local `ps --json` (the daemon tags rows,
 `InstancesList::of`). A federated snapshot's rows also carry `machine`
 (*Federated snapshots*).
 
@@ -388,7 +389,7 @@ unsigned root, and in `status --json` (the daemon tags rows,
 thread key, `{"<owner id>": {"<key>": "<instance name>"}}`: the child a
 thread's `child` key names, as the control ops resolve it (a key ambiguous
 across sandboxes is left out). `{}` when there are none or the state
-doesn't read (the snapshot's `error` says why). Not in `status --json`.
+doesn't read (the snapshot's `error` says why). Not in `ps --json`.
 
 On a host with no container runtime installed (its binary isn't on
 `PATH`: a driver) any `depth` is `disk` and nothing is asked of a runtime;
@@ -709,35 +710,6 @@ JSON, parsed (docker and podman: an array of one object; Apple's
 
 Errors: `invalid` (as `containers.logs`), `internal` (the runtime failed,
 or its output isn't JSON).
-
-### `containers.list`
-
-Params: `{"all": false}`, `all` optional (`false`: running ones only).
-Result: `{"rows": […]}`, every `devsandbox-` container, instances and
-services, sorted by name: `ps --json`'s rows (`commands::ps::rows`), each
-the runtime's `name`, `image`, `status`, `state`, `labels`, `host_ports`,
-plus `done` (its instance is marked done; `false` for a service),
-`phase` while its instance is being created or failed (absent once
-ready), `profile` (its instance's, absent when none) and
-`profile_disallowed` (that profile is one its sandbox no longer allows,
-read from the instance's config root; `false` when that doesn't read;
-[profiles](../architecture/instances/profiles.md#shown)). `state.toml` is
-read best-effort: unreadable, no row is done.
-On a link peer's connection under `worker` (*Remote callers*) the rows are
-cut to what it reaches: those instances' containers and their config
-roots' services ([fleet.md](../architecture/daemon/fleet.md#the-trust-table)).
-
-Errors: `invalid` (`all` not a boolean), `internal` (the runtime failed).
-
-### `containers.stats`
-
-Params: `{}`. Result: `{"rows": [{"name": "devsandbox-web", "cpu":
-"1.50%", "mem": "20MiB / 1GiB"}, …]}`, the running `devsandbox-`
-containers' usage as the runtime renders it, sorted by name: `stats
---json`'s rows (`commands::stats::rows`). Cut on a fleet control plane's
-connection as `containers.list`'s.
-
-Errors: `internal` (the runtime failed).
 
 ## Sandboxes
 
@@ -1633,7 +1605,7 @@ machine, each with 15 s to answer:
 `instances.procs`, `instances.signal`, `instances.rename`,
 `instances.setProfile`, `instances.done`, `instances.buildLog`, `sessions.list`, `sessions.rm`,
 `containers.logs`,
-`containers.inspect`, `containers.list`, `containers.stats`, `sandboxes.list`, `sandboxes.get`, `services.get`,
+`containers.inspect`, `sandboxes.list`, `sandboxes.get`, `services.get`,
 and every verb (*Verbs on a machine*).
 
 `forwards.add` with `machine` isn't forwarded: the daemon serves it, binding

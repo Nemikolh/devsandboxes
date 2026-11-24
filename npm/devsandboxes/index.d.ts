@@ -12,7 +12,7 @@ export declare const SCHEMA: 1;
 /**
  * Container liveness; `text` is the runtime's raw status (e.g. "Up 3 minutes").
  * `unknown`: the runtime wasn't asked (`instances.list` with `depth: 'disk'`);
- * never in `status()`.
+ * never in `ps()`.
  */
 export type ContainerStatus =
   | { state: 'running'; text: string }
@@ -30,7 +30,7 @@ export type PhaseRow =
   | { state: 'in-flight'; step: string }
   | { state: 'failed'; step: string; error: string };
 
-/** One instance (`status().instances`). */
+/** One instance (`ps().instances`). */
 export interface InstanceRow {
   name: string;
   sandbox: string;
@@ -64,7 +64,7 @@ export interface InstanceRow {
   machine?: string;
 }
 
-/** One `[sandbox.*]` from devsandboxes.toml (`ls()`, `status().sandboxes`). */
+/** One `[sandbox.*]` from devsandboxes.toml (`ls()`, `ps().sandboxes`). */
 export interface SandboxRow {
   name: string;
   /** `image X`, `dockerfile Y`, or `?` when the sandbox failed to resolve. */
@@ -103,7 +103,7 @@ export interface IdentityNote {
   acked: boolean;
 }
 
-/** One `[services.*]` from devsandboxes.toml (`service.ls()`, `status().services`). */
+/** One `[services.*]` from devsandboxes.toml (`service.ls()`, `ps().services`). */
 export interface ServiceRow {
   name: string;
   scope: 'global' | 'isolated';
@@ -125,7 +125,7 @@ export interface ServiceRow {
   machine?: string;
 }
 
-/** Full snapshot (`status()`), the same data the TUI renders. */
+/** Full snapshot (`ps()`), the same data the TUI renders. */
 export interface Snapshot {
   instances: InstanceRow[];
   sandboxes: SandboxRow[];
@@ -344,33 +344,6 @@ export interface RunRecord {
   branch: string | null;
 }
 
-/** One container from the runtime listing (`ps()`). */
-export interface ContainerRow {
-  name: string;
-  image: string;
-  /** Human status (`Up 3 minutes`, `Exited (0) 1 hour ago`, …). */
-  status: string;
-  /** `running`, or anything else (stopped/exited/created…). */
-  state: string;
-  labels: Record<string, string>;
-  host_ports: string[];
-  /** The container's instance is marked done (`false` for service containers). */
-  done: boolean;
-  /** The container's instance is still being created, or failed; absent once ready. */
-  phase?: PhaseRow;
-  /** The container's instance's profile; absent when it has none (and for service containers). */
-  profile?: string;
-  /** As {@link InstanceRow.profile_disallowed}. */
-  profile_disallowed: boolean;
-}
-
-/** Resource usage of one running container (`stats()`), pre-rendered. */
-export interface StatsRow {
-  name: string;
-  cpu: string;
-  mem: string;
-}
-
 // ---------------------------------------------------------------------------
 // Options & results
 
@@ -423,12 +396,11 @@ export declare function cli(args: readonly string[], opts?: CliOptions): Promise
 
 /** Sandbox configs in devsandboxes.toml. */
 export declare function ls(opts?: CommonOptions): Promise<SandboxRow[]>;
-/** Running devsandbox containers (`all` includes stopped ones). */
-export declare function ps(opts?: CommonOptions & { all?: boolean }): Promise<ContainerRow[]>;
-/** CPU/memory of running devsandbox containers. */
-export declare function stats(opts?: CommonOptions): Promise<StatsRow[]>;
-/** Sandboxes, instances, and services in one snapshot. */
-export declare function status(opts?: CommonOptions): Promise<Snapshot>;
+/**
+ * Sandboxes, instances, and services in one snapshot (`ps --json`): `instances` the running ones
+ * (and those being created), every one with `all`; with machines registered, theirs too (`machine` set).
+ */
+export declare function ps(opts?: CommonOptions & { all?: boolean }): Promise<Snapshot>;
 /** The runtime's own inspect document (docker/podman: an array of containers). */
 export declare function inspect<T = unknown>(name: string, opts?: CommonOptions): Promise<T>;
 
@@ -1581,16 +1553,6 @@ export interface ContainerLogs {
   text: string;
 }
 
-/** `containers.list`'s answer: `ps --json`'s rows, sorted by name. */
-export interface ContainersList {
-  rows: ContainerRow[];
-}
-
-/** `containers.stats`' answer: `stats --json`'s rows, sorted by name. */
-export interface ContainersStats {
-  rows: StatsRow[];
-}
-
 /** `sandboxes.get`'s answer: the sandbox's config as TOML text. */
 export interface SandboxConfig {
   /** The table as written, `extends` included. */
@@ -2000,10 +1962,6 @@ export interface ApiMethods {
   'containers.logs': { params: { container: string; lines?: number; machine?: string }; result: ContainerLogs };
   /** `devsandbox-…` containers only: the runtime's inspect JSON (docker's: an array of one object). */
   'containers.inspect': { params: { container: string; machine?: string }; result: unknown };
-  /** Every `devsandbox-…` container, instances and services (running only unless `all`), as `ps` lists them. */
-  'containers.list': { params: { all?: boolean; machine?: string }; result: ContainersList };
-  /** The running `devsandbox-…` containers' CPU/memory, as `stats` shows them. */
-  'containers.stats': { params: { machine?: string }; result: ContainersStats };
   /**
    * The config root's sandboxes, sorted; `[]` without a config file. `machines`: then every
    * machine's listed roots' (5 s; one that doesn't answer adds nothing, see `machines.list`).

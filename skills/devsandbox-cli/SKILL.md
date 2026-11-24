@@ -180,23 +180,24 @@ machine; `<machine>/<name>` and `@/<name>` (this host) qualify it.
    included. Keys are colour-highlighted on a TTY only; piped output (or
    `--json`) is plain JSON, safe to parse.
 
-5. **`ps [-a] [--json]`** — list instances (joined from state + runtime). `-a` includes
-   stopped ones. Columns: NAME, IMAGE, STATUS (plus PROFILE when an instance
-   has one).
+5. **`ps [-a] [--json]`** — list instances, as the dashboard shows them: the running
+   ones (and those still being created); `-a` adds stopped and missing ones. Columns:
+   NAME, SANDBOX, STATUS, UPTIME, CPU, MEM (plus PROFILE when an instance has one, and
+   MACHINE when machines are registered: `@` is this host). With machines, their
+   instances are listed too; one that doesn't answer is a `warning:` line. `--json` is
+   the full snapshot (sandboxes, instances, services) for scripts. Services aren't
+   listed: see `service ls`.
 
-6. **`stats [--json]`** — one-shot CPU/memory usage of every running `devsandbox-*`
-   container (instances and services). Columns: NAME, CPU, MEM.
-
-7. **`ls [--json]`** — list sandbox _configs_ from `devsandboxes.toml` (NAME, SOURCE, FOLDER,
+6. **`ls [--json]`** — list sandbox _configs_ from `devsandboxes.toml` (NAME, SOURCE, FOLDER,
    SERVICES, EXTENDS). Use to discover what can be `run` and to catch config
    parse/validation errors.
 
-8. **`stop <name>`** / **`stop --all`** — stop the instance container + its isolated service
+7. **`stop <name>`** / **`stop --all`** — stop the instance container + its isolated service
    containers. Idempotent (already-stopped/missing is fine). State survives;
    **`start <name>`** / **`start --all`** (`-d` as for `run`) restarts it,
    services included.
 
-9. **`rebuild <name>`** / **`rebuild --all`** (alias `recreate`; `-d` as for `run`) — recreate the
+8. **`rebuild <name>`** / **`rebuild --all`** (alias `recreate`; `-d` as for `run`) — recreate the
    instance's container from the current config when it has drifted; the
    worktree, branch, instance name, and per-instance state (shell history,
    `${instance}` mounts) are kept and the lifecycle commands re-run. No drift →
@@ -205,7 +206,7 @@ machine; `<machine>/<name>` and `@/<name>` (this host) qualify it.
    rebuilds every drifted instance (every instance with `--force`), skipping
    ones from other config roots. The fix for the config-drift warning.
 
-10. **`rm <name> [--delete-branch | --keep-branch] [--force]`** — remove container, its
+9. **`rm <name> [--delete-branch | --keep-branch] [--force]`** — remove container, its
    worktree, isolated services, per-instance network, and the state entry.
    Managed shell history is **kept** so a rebuilt instance inherits it. Global
    services are left for `gc`. A worktree with uncommitted or untracked changes
@@ -220,11 +221,11 @@ machine; `<machine>/<name>` and `@/<name>` (this host) qualify it.
    off one. The recorded branch is deleted along with it when it is an ancestor.
    Scripts that need a local-only branch gone must pass `--delete-branch`.
 
-11. **`gc [--force]`** — reap shared services no live instance references, orphaned
+10. **`gc [--force]`** — reap shared services no live instance references, orphaned
    networks, orphaned shell-history files (`--force` skips the per-file
    confirm) and agent links. Housekeeping, not part of a normal task loop.
 
-12. Less common:
+11. Less common:
    - **`profile <name> [<profile>]`** — show an instance's profile and what
      its sandbox allows, or switch it (no restart). Exact instance name.
    - **`rename <name> <new>`** — rename an instance (state only; the
@@ -238,8 +239,6 @@ machine; `<machine>/<name>` and `@/<name>` (this host) qualify it.
      to the instance.
    - **`service ls [--json]`** / **`service rebuild <svc>`** — list services /
      recreate one and rewire running sandboxes in place.
-   - **`status --json`** — the full snapshot (sandboxes, instances,
-     services) for scripts.
    - **`inbox ls|show|reply|act|submit|done|reopen`** — Inbox threads
      (docs/reference/inbox-cli.md).
    - **`update <name> [args…]`** — run a feature's update now (e.g. `gh`;
@@ -252,7 +251,7 @@ machine; `<machine>/<name>` and `@/<name>` (this host) qualify it.
      --stdio`** — the host daemon in the foreground, from login, and its API
      relayed over stdin/stdout (plumbing).
 
-13. **`devsandbox`** (no subcommand) — opens the interactive **TUI dashboard** on a
+12. **`devsandbox`** (no subcommand) — opens the interactive **TUI dashboard** on a
     TTY; prints help and exits `2` otherwise. **Not for agents** — it takes over
     the terminal.
 
@@ -314,8 +313,8 @@ approve`.
   `@/test` and `box/test`; rerun with the qualified name. A remote `run`
   prints the instance qualified (`box/api`). Container names in `logs` /
   `inspect` stay local unless qualified.
-- **`--machine <m>`** is only for commands without a name: `ps`, `stats`
-  (once), `ls`, `status --json`, `gc`, `service ls` (once per root of `m`,
+- **`--machine <m>`** is only for commands without a name: `ps`
+  (once), `ls`, `gc`, `service ls` (once per root of `m`,
   each after a `==> m:<root>` line on stderr; `--json` with several roots is
   refused), `stop --all`, `start --all`, `rebuild --all`, `service rebuild
   <svc>`, `port --service <global-svc> <port>` (from `m`'s first root).
@@ -359,15 +358,15 @@ sandbox-off knobs.
 ## Debugging a sandbox
 
 Container name for an instance is `devsandbox-<instance>`; service containers are
-`devsandbox-svc-<project>-…`. `devsandbox ps -a` shows the names. Typical loop:
+`devsandbox-svc-<project>-…`. `devsandbox ps -a` shows the instances,
+`devsandbox service ls` the services' containers. Typical loop:
 
 ```bash
-devsandbox ps -a                  # what exists, what's stopped
+devsandbox ps -a                  # what exists, what's stopped, CPU/memory
 devsandbox logs --build web       # what the last run/rebuild/start printed
 devsandbox logs web               # lifecycle / container output (-n 200 for more)
 devsandbox logs devsandbox-svc-<proj>-database   # a service's output
 devsandbox inspect web            # mounts, networks, env, exit code
-devsandbox stats                  # anything pegging CPU or leaking memory?
 devsandbox exec web sh -c 'env; ls -la'          # poke around inside
 ```
 
