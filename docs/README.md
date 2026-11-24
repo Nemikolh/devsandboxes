@@ -71,6 +71,7 @@ User-facing docs live in `site/` (and the config reference in
   [selection](architecture/dashboard/selection.md),
   [inbox tab](architecture/dashboard/inbox-tab.md),
   [snapshot and json](architecture/dashboard/snapshot-and-json.md)
+- **CLI prompts**: [architecture/cli-prompts.md](architecture/cli-prompts.md)
 - **Reference**: [daemon API](reference/api.md),
   [`devsandbox inbox` CLI](reference/inbox-cli.md),
   [`devsandbox login` / `access` CLI](reference/credentials-cli.md),
