@@ -160,13 +160,11 @@ impl Term for Stdio {
 /// stay one plain `show`, which the tests' `Script` records as is.
 fn styled(text: &str, style: Style) -> String {
     const CREATE: &str = "Create the token at ";
-    text.split_inclusive('\n')
+    style
+        .lines(text)
+        .split_inclusive('\n')
         .map(|line| {
-            if let Some(rest) = line.strip_prefix("warning:") {
-                format!("{}{rest}", style.warn("warning:"))
-            } else if let Some(rest) = line.strip_prefix("note:") {
-                format!("{}{rest}", style.note("note:"))
-            } else if line.starts_with("approved claim version ") {
+            if line.starts_with("approved claim version ") {
                 let body = line.trim_end_matches('\n');
                 format!("{}{}", style.ok(body), &line[body.len()..])
             } else if let Some(rest) = line.strip_prefix(CREATE) {

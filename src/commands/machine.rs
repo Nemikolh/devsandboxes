@@ -46,6 +46,11 @@ use crate::serve::machines::install::{self, Dest, Plan, Remote, Upgrade};
 
 const HEADERS: [&str; 7] = ["NAME", "TARGET", "ROOTS", "AGENT", "STATE", "VERSION", "CAPACITY"];
 
+/// One line on stderr, its `note:` / `warning:` prefix styled.
+fn say(text: &str) {
+    eprintln!("{}", Style::detect().lines(text));
+}
+
 pub fn add(target: &str, name: Option<&str>, agent: bool, control_plane: bool, auto_install: bool, yes: bool, allow: &AddAllow) -> Result<()> {
     // Checked before anything reaches the machine.
     let flagged = add_patch(target, allow)?;
@@ -57,7 +62,7 @@ pub fn add(target: &str, name: Option<&str>, agent: bool, control_plane: bool, a
     let patch = match allow_step(flagged.is_some(), tty, probed.trust) {
         AllowStep::Flags => flagged,
         AllowStep::Ask => {
-            eprintln!("{}", lists_note(target, &probed.allow));
+            say(&lists_note(target, &probed.allow));
             let checked: Vec<bool> = probed.allow.flags().iter().map(|(_, on)| *on).collect();
             match ask::multi(&format!("Lend placed work on {target}"), &allowance_choices(), &checked)? {
                 Some(picked) => allow_patch(&probed.allow, &picked),
@@ -65,7 +70,7 @@ pub fn add(target: &str, name: Option<&str>, agent: bool, control_plane: bool, a
             }
         }
         AllowStep::Full => {
-            eprintln!("note: {target}'s trust is full, so no allowance applies there: not asking which to add");
+            say(&format!("note: {target}'s trust is full, so no allowance applies there: not asking which to add"));
             None
         }
         AllowStep::Nothing => None,
@@ -83,14 +88,14 @@ pub fn add(target: &str, name: Option<&str>, agent: bool, control_plane: bool, a
     if newly_in_a_fleet(added.fleet.joined) {
         let own: MemberInfo = call(&mut conn, "member.get", Value::Null)?;
         if let Some(hint) = own_allow_hint(&own) {
-            eprintln!("{hint}");
+            say(&hint);
         }
     }
     for note in &added.configs {
-        eprintln!("{note}");
+        say(note);
     }
     if let Some(warning) = added.warning {
-        eprintln!("warning: {warning}");
+        say(&format!("warning: {warning}"));
     }
     Ok(())
 }
@@ -321,7 +326,7 @@ fn ensure_devsandbox(target: &str, auto_install: bool) -> Result<Option<String>>
     let remote = install::check(&entry, None)?;
     let found_command = remote.off_path.then(|| LOCAL_COMMAND.to_string());
     if found_command.is_some() {
-        eprintln!("note: `devsandbox` isn't on {target}'s login PATH, using {LOCAL_COMMAND}");
+        say(&format!("note: `devsandbox` isn't on {target}'s login PATH, using {LOCAL_COMMAND}"));
     }
     let Plan::Install { dest, from } = install::decide(&remote, ours) else {
         return Ok(found_command);
@@ -333,11 +338,11 @@ fn ensure_devsandbox(target: &str, auto_install: bool) -> Result<Option<String>>
     if !install::platform_matches(&remote.os, &remote.arch) {
         let why = platform_mismatch(target, &remote);
         if found.is_none() {
-            eprintln!("warning: found no devsandbox on {target}, and {why}: install it there yourself");
+            say(&format!("warning: found no devsandbox on {target}, and {why}: install it there yourself"));
             return Ok(None);
         }
         // Left as is: the daemon warns about the other version.
-        eprintln!("note: {why}: leaving its devsandbox as it is");
+        say(&format!("note: {why}: leaving its devsandbox as it is"));
         return Ok(found_command);
     }
     match consent(std::io::stdin().is_terminal(), auto_install) {
@@ -372,7 +377,7 @@ fn ensure_devsandbox(target: &str, auto_install: bool) -> Result<Option<String>>
     };
     eprintln!("installed devsandbox {ours} at {installed}");
     if command.is_some() {
-        eprintln!("note: `devsandbox` on {target}'s login PATH isn't that one, so the machine is registered with command = \"{LOCAL_COMMAND}\"");
+        say(&format!("note: `devsandbox` on {target}'s login PATH isn't that one, so the machine is registered with command = \"{LOCAL_COMMAND}\""));
     }
     Ok(command)
 }
@@ -506,7 +511,7 @@ pub fn upgrade(name: &str, yes: bool) -> Result<()> {
     let _: Value = call(&mut connect()?, "machines.cycle", json!({ "name": info.name }))?;
     println!("upgraded {name}: devsandbox {} → {}", label(from.as_deref()), label(Some(ours)));
     if let Some(note) = from.as_deref().and_then(|from| older_note(name, from, ours)) {
-        eprintln!("note: {note}");
+        say(&format!("note: {note}"));
     }
     Ok(())
 }
@@ -560,7 +565,7 @@ pub fn ls(json: bool) -> Result<()> {
     let cells: Vec<[String; 7]> = rows.into_iter().map(cells).collect();
     print!("{}", table(&HEADERS, &cells));
     for note in notes {
-        eprintln!("note: {note}");
+        say(&format!("note: {note}"));
     }
     Ok(())
 }
@@ -598,7 +603,7 @@ pub fn trust(to: Option<Trust>) -> Result<()> {
     };
     println!("{}", trust_line(info.trust));
     if let Some(warning) = info.exposed_by.as_deref().and_then(exposure_warning) {
-        eprintln!("warning: {warning}");
+        say(&format!("warning: {warning}"));
     }
     Ok(())
 }

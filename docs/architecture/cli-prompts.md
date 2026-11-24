@@ -98,6 +98,12 @@ text. Text is styled by `Role`: `Heading` and `Name` bold, `Danger`
 bold red, `Warn` yellow, `Note` cyan, `Ok` and `Added` green, `Removed`
 red, `Dim`, and `Accent` (cyan) for the cursor and the picked answer.
 
+`Style::lines` styles text by prefix: lines starting with `warning:` in
+yellow, `note:` in cyan, line endings kept. `login`'s `styled` delegates
+the generic prefixes to it and adds its own (the token URL in bold,
+`approved claim version …` in green). `machine` prints its `note:` and
+`warning:` stderr through `Style::lines`.
+
 ## Widgets and keys
 
 `Select` shows `? question` (bold) and one line per `Choice`: the label,

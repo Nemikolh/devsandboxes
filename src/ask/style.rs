@@ -96,6 +96,22 @@ impl Style {
     pub fn accent(self, text: &str) -> String {
         self.paint(Role::Accent, text)
     }
+
+    /// Style lines by prefix: `warning:` yellow, `note:` cyan, line endings
+    /// kept. Off: unchanged.
+    pub fn lines(self, text: &str) -> String {
+        text.split_inclusive('\n')
+            .map(|line| {
+                if let Some(rest) = line.strip_prefix("warning:") {
+                    format!("{}{rest}", self.warn("warning:"))
+                } else if let Some(rest) = line.strip_prefix("note:") {
+                    format!("{}{rest}", self.note("note:"))
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -120,5 +136,16 @@ mod tests {
         assert_eq!(on.dim("…"), "\x1b[2m…\x1b[0m");
         assert_eq!(on.paint(Role::Plain, "x"), "x");
         assert_eq!(Style::plain().paint(Role::Danger, "never"), "never");
+    }
+
+    #[test]
+    fn lines_styles_warning_and_note_prefixes() {
+        let on = Style { on: true };
+        let text = "warning: check failed\nnote: use --yes\nplain line\n";
+        assert_eq!(
+            on.lines(text),
+            "\x1b[33mwarning:\x1b[0m check failed\n\x1b[36mnote:\x1b[0m use --yes\nplain line\n"
+        );
+        assert_eq!(Style::plain().lines(text), text);
     }
 }
