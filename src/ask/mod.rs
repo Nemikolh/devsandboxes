@@ -143,8 +143,6 @@ pub fn review(tree: Vec<Node>, question: &str, choices: &[Choice], default: usiz
 /// Ask `question` with `choices` to check, `checked` checked at first;
 /// the checked indexes, ascending, or `None` on a cancel. Leaves one
 /// summary line on stderr.
-// The caller lands with machine add's allowance question.
-#[allow(dead_code)]
 pub fn multi(question: &str, choices: &[Choice], checked: &[bool]) -> Result<Option<Vec<usize>>> {
     let style = Style::detect();
     let mut widget = Multi::new(question, choices.to_vec(), checked);

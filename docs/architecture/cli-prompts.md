@@ -79,9 +79,14 @@ The other commands ask through three helpers in `src/commands/mod.rs`:
 `choices` (Update `u`, Continue as is `c`, Skip this time `s`; Skip
 preselected and a cancel's answer) through `Ui`'s `ask`, which is
 `ask::select` outside the tests; the listing above it has each file in
-bold (`listing`, styled by `Ui`'s `style`). `machine.rs`'s free-text
-`prompt` (the allowances line) stays a line read, its text styled as a
-`Select` question.
+bold (`listing`, styled by `Ui`'s `style`).
+
+`machine add`'s allowance question (`commands::machine::add`, its
+`AllowStep::Ask`) is the one `ask::multi`: one choice per
+`AllowInfo::flags` allowance (`allowance_choices`, labels in the CLI's
+spelling, each with a hint), the ones the machine lends checked; the
+checked set becomes the add's `allow` (`allow_patch`), and a cancel stops
+the add.
 
 ## Styling
 

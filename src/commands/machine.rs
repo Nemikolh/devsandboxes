@@ -22,14 +22,14 @@
 //! (`install::handoff`) and redials this host's link to it
 //! (`machines.cycle`), so the far end's `fleet-link` runs it too.
 
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::ask::Style;
+use crate::ask::{self, Choice, Style};
 use crate::render::table;
 use crate::serve::capacity;
 use crate::serve::client::{self, Conn};
@@ -57,13 +57,11 @@ pub fn add(target: &str, name: Option<&str>, agent: bool, control_plane: bool, a
     let patch = match allow_step(flagged.is_some(), tty, probed.trust) {
         AllowStep::Flags => flagged,
         AllowStep::Ask => {
-            eprintln!("{}", lends_line(target, &probed.allow));
-            let question = allow_question(target);
-            loop {
-                match parse_allow_answer(&prompt(&question)?) {
-                    Ok(patch) => break patch,
-                    Err(e) => eprintln!("{e}"),
-                }
+            eprintln!("{}", lists_note(target, &probed.allow));
+            let checked: Vec<bool> = probed.allow.flags().iter().map(|(_, on)| *on).collect();
+            match ask::multi(&format!("Lend placed work on {target}"), &allowance_choices(), &checked)? {
+                Some(picked) => allow_patch(&probed.allow, &picked),
+                None => bail!("not added: nothing changed"),
             }
         }
         AllowStep::Full => {
@@ -113,7 +111,7 @@ pub struct AddAllow {
 fn add_patch(target: &str, allow: &AddAllow) -> Result<Option<AllowPatch>> {
     let mut patch = AllowPatch::default();
     for key in &allow.flags {
-        set_allowance(&mut patch, key);
+        set_allowance(&mut patch, key, true);
     }
     for bind in &allow.binds {
         let path = Path::new(bind);
@@ -130,8 +128,8 @@ fn add_patch(target: &str, allow: &AddAllow) -> Result<Option<AllowPatch>> {
     Ok((patch != AllowPatch::default()).then_some(patch))
 }
 
-/// Turn on allowance `key` (a wire name from [`AllowInfo::flags`]) in `patch`.
-fn set_allowance(patch: &mut AllowPatch, key: &str) {
+/// Set allowance `key` (a wire name from [`AllowInfo::flags`]) in `patch`.
+fn set_allowance(patch: &mut AllowPatch, key: &str, on: bool) {
     let slot = match key {
         "privileged" => &mut patch.privileged,
         "runtime_socket" => &mut patch.runtime_socket,
@@ -144,7 +142,7 @@ fn set_allowance(patch: &mut AllowPatch, key: &str) {
         "gpus" => &mut patch.gpus,
         _ => unreachable!("`{key}` isn't an allowance"),
     };
-    *slot = Some(true);
+    *slot = Some(on);
 }
 
 /// The on/off allowances as the CLI spells them (`machine allow`'s flags).
@@ -152,8 +150,8 @@ fn allowance_names() -> Vec<String> {
     AllowInfo::default().flags().iter().map(|(key, _)| key.replace('_', "-")).collect()
 }
 
-/// `--allow`'s value, and each item of the add's question: an allowance
-/// as the CLI spells it (`host-network`), answered as its wire name.
+/// `--allow`'s value: an allowance as the CLI spells it (`host-network`),
+/// answered as its wire name.
 pub fn parse_allowance(s: &str) -> Result<&'static str, String> {
     AllowInfo::default()
         .flags()
@@ -168,7 +166,7 @@ pub fn parse_allowance(s: &str) -> Result<&'static str, String> {
 enum AllowStep {
     /// `--allow*` given: those, nothing asked.
     Flags,
-    /// On a TTY: show the machine's and ask which to add.
+    /// On a TTY: ask which the machine lends, its current ones checked.
     Ask,
     /// On a TTY, the machine at `trust = full`: no allowance applies, a note.
     Full,
@@ -186,21 +184,49 @@ fn allow_step(flagged: bool, tty: bool, trust: Trust) -> AllowStep {
     }
 }
 
-fn allow_question(target: &str) -> String {
-    format!(
-        "Allow on {target}, comma-separated ({}; paths and env vars: --allow-bind, --allow-local-env)? Empty adds none: ",
-        allowance_names().join(", ")
-    )
+/// The question's choices, in [`AllowInfo::flags`]' order.
+fn allowance_choices() -> Vec<Choice> {
+    AllowInfo::default().flags().iter().map(|(key, _)| Choice::new(key.replace('_', "-")).hint(allowance_hint(key))).collect()
 }
 
-/// The question's answer as `machines.add`'s `allow` (`None`: empty, none
-/// added); `Err` names an unknown allowance, and the question is asked again.
-fn parse_allow_answer(answer: &str) -> Result<Option<AllowPatch>, String> {
-    let mut patch = AllowPatch::default();
-    for item in answer.split([',', ' ', '\t']).filter(|s| !s.is_empty()) {
-        set_allowance(&mut patch, parse_allowance(item)?);
+fn allowance_hint(key: &str) -> &'static str {
+    match key {
+        "privileged" => "run --privileged containers",
+        "runtime_socket" => "bind a container runtime's socket",
+        "host_network" => "use --network host",
+        "global_services" => "start scope = \"global\" services",
+        "dispatcher" => "run a dispatcher and its control ops",
+        "inbox" => "inbox = true and its control ops",
+        "initialize_command" => "run initializeCommand on the machine",
+        "publish" => "publish ports beyond loopback",
+        "gpus" => "use every NVIDIA GPU",
+        _ => unreachable!("`{key}` isn't an allowance"),
     }
-    Ok((patch != AllowPatch::default()).then_some(patch))
+}
+
+/// The answer (indexes into [`AllowInfo::flags`]) is the set the machine
+/// lends: only the flags it changes are set, so `None` when it changes
+/// nothing.
+fn allow_patch(current: &AllowInfo, checked: &[usize]) -> Option<AllowPatch> {
+    let mut patch = AllowPatch::default();
+    for (i, (key, on)) in current.flags().into_iter().enumerate() {
+        let want = checked.contains(&i);
+        if want != on {
+            set_allowance(&mut patch, key, want);
+        }
+    }
+    (patch != AllowPatch::default()).then_some(patch)
+}
+
+/// The question can't set binds or env vars: shown above it with the
+/// flags that do.
+fn lists_note(target: &str, allow: &AllowInfo) -> String {
+    let flags = "--allow-bind and --allow-local-env set binds and env vars";
+    if allow.binds.is_empty() && allow.local_env.is_empty() {
+        return format!("note: {flags}");
+    }
+    let lists = AllowInfo { binds: allow.binds.clone(), local_env: allow.local_env.clone(), ..Default::default() };
+    format!("note: {}; {flags}", lends_line(target, &lists))
 }
 
 /// `<who> lends placed work: <what>` in one line, `nothing` when no
@@ -1036,16 +1062,6 @@ fn cells(r: MachineRow) -> [String; 7] {
     ]
 }
 
-/// A line read after `? text`, styled like the select widget's question.
-fn prompt(text: &str) -> Result<String> {
-    let style = Style::detect();
-    eprint!("{} {} ", style.accent("?"), style.heading(text.trim_end()));
-    std::io::stderr().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    Ok(answer.trim().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1384,7 +1400,7 @@ mod tests {
         // Every allowance can be set.
         for (key, _) in AllowInfo::default().flags() {
             let mut patch = AllowPatch::default();
-            set_allowance(&mut patch, key);
+            set_allowance(&mut patch, key, true);
             assert_ne!(patch, AllowPatch::default(), "{key}");
         }
     }
@@ -1397,21 +1413,44 @@ mod tests {
         assert_eq!(allow_step(false, true, Trust::Full), AllowStep::Full);
         assert_eq!(allow_step(false, false, Trust::Worker), AllowStep::Nothing);
         assert_eq!(allow_step(false, false, Trust::Full), AllowStep::Nothing);
-        assert_eq!(
-            allow_question("me@box"),
-            "Allow on me@box, comma-separated (privileged, runtime-socket, host-network, global-services, dispatcher, inbox, \
-             initialize-command, publish, gpus; paths and env vars: --allow-bind, --allow-local-env)? Empty adds none: "
-        );
     }
 
     #[test]
-    fn the_answer_adds_the_allowances_it_names() {
-        assert_eq!(parse_allow_answer(""), Ok(None));
-        assert_eq!(parse_allow_answer(" , "), Ok(None));
-        let want = AllowPatch { gpus: Some(true), host_network: Some(true), ..Default::default() };
-        assert_eq!(parse_allow_answer("gpus, host-network"), Ok(Some(want.clone())));
-        assert_eq!(parse_allow_answer("gpus host-network,gpus"), Ok(Some(want)));
-        assert!(parse_allow_answer("gpus, root").unwrap_err().starts_with("`root` isn't an allowance"));
+    fn the_question_offers_every_allowance_as_the_cli_spells_it() {
+        let choices = allowance_choices();
+        let labels: Vec<&str> = choices.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, allowance_names());
+        for c in &choices {
+            assert!(!c.label.contains(' '), "{}", c.label);
+            let hint = c.hint.as_deref().unwrap_or_default();
+            assert!(!hint.is_empty() && hint.len() <= 45, "{}: {hint}", c.label);
+        }
+    }
+
+    #[test]
+    fn the_answer_is_the_set_the_machine_lends() {
+        let index = |name: &str| allowance_names().iter().position(|n| n == name).unwrap();
+        let none = AllowInfo::default();
+        assert_eq!(allow_patch(&none, &[]), None);
+        let want = AllowPatch { host_network: Some(true), gpus: Some(true), ..Default::default() };
+        assert_eq!(allow_patch(&none, &[index("host-network"), index("gpus")]), Some(want));
+        // Binds and env vars are never touched.
+        let lent = AllowInfo { gpus: true, publish: true, binds: vec!["/a".into()], local_env: vec!["T".into()], ..Default::default() };
+        assert_eq!(allow_patch(&lent, &[index("publish"), index("gpus")]), None, "unchanged");
+        let want = AllowPatch { inbox: Some(true), gpus: Some(false), ..Default::default() };
+        assert_eq!(allow_patch(&lent, &[index("inbox"), index("publish")]), Some(want.clone()));
+        // What `machines.add` checks before any write.
+        assert!(want.check().is_ok());
+    }
+
+    #[test]
+    fn the_lists_note_names_the_flags_that_set_them() {
+        assert_eq!(lists_note("box", &AllowInfo { gpus: true, ..Default::default() }), "note: --allow-bind and --allow-local-env set binds and env vars");
+        let allow = AllowInfo { gpus: true, binds: vec!["/a".into()], local_env: vec!["T".into()], ..Default::default() };
+        assert_eq!(
+            lists_note("box", &allow),
+            "note: box lends placed work: binds: /a; local-env: T; --allow-bind and --allow-local-env set binds and env vars"
+        );
     }
 
     #[test]

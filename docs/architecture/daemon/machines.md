@@ -828,20 +828,24 @@ there. `add` prints `added <name> (<target>)`.
 
 `add` also sets which allowances the machine lends work the fleet places
 on it (its worker policy's `[allow]`, as `machine allow` there would;
-[fleet.md](fleet.md#worker-policy)), only ever adding. The flags, for
+[fleet.md](fleet.md#worker-policy)). The flags, for
 scripts and GUIs: repeatable `--allow <allowance>` (comma-separated too;
 the CLI's spelling, `host-network`, parsed by `parse_allowance`),
 `--allow-bind <path>` (absolute, a path on the machine: neither this
 host's `~` nor its current directory means anything there) and
 `--allow-local-env <NAME>`, checked before anything reaches the machine
-(`add_patch`). What happens is `allow_step`'s: any flag, those and no
-question; else on a TTY, after the key is confirmed, `<target> lends
-placed work: <what>` (`lends_line`, the probe's `allow`) and one
-question on stderr (`allow_question`: `Allow on <target>,
-comma-separated (privileged, runtime-socket, …, gpus; paths and env
-vars: --allow-bind, --allow-local-env)? Empty adds none:`), asked again
-after an unknown allowance (`parse_allow_answer`); a machine at `trust =
-full`, where no allowance applies, gets a note instead; off a TTY,
+(`add_patch`); flags only ever add. What happens is `allow_step`'s: any flag,
+those and no question; else on a TTY, after the key is confirmed, a
+note of the binds and env vars the machine lends and the flags that set
+them (`lists_note`), then a checklist on stderr (`ask::multi`: `Lend
+placed work on <target>`, one choice per on/off allowance in the CLI's
+spelling with a hint of what it lets placed work do,
+`allowance_choices`), the ones the probe's `allow` lends checked. The
+answer is the set the machine lends (`allow_patch`): a newly checked
+allowance is turned on, an unchecked one it lent turned off, the rest
+left out, and no change sends no `allow`; a cancel stops the add with
+`not added: nothing changed` (the probe wrote nothing). A machine at
+`trust = full`, where no allowance applies, gets a note instead; off a TTY,
 nothing is asked and nothing changes (an unset allowance is the safe
 default). What's asked or given goes as `machines.add`'s `allow`, and
 the answer's `allow` is printed as a `<name> lends placed work: …` line

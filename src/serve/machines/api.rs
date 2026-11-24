@@ -136,7 +136,7 @@ pub fn call(method: &str, params: Value, ctx: &Ctx, local: bool) -> Option<Answe
 
 /// `machines.probe`'s answer: the machine's devsandbox and its member key (what `machine add` shows the user to
 /// confirm, then passes as `machines.add`'s `key`), its trust and allowances (what `machine add` shows before
-/// asking which to add).
+/// asking what it lends).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Probed {
     pub version: String,
