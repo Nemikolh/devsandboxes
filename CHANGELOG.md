@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.11.1
 
 A call a sandbox's config marks as asked now waits for your answer instead of failing, and tags, releases and ref deletions always ask. Sentry credentials reach only the orgs they name, `devsandbox ps` lists instances like the dashboard, and terminal questions are answered from a list. Existing `sentry` credentials need their orgs, with the sentry feature 1.3.0.
 
