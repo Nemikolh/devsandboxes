@@ -2,9 +2,6 @@
 //! tree above a select), redrawn in place in raw mode, with a plain
 //! line-read fallback off a terminal. See docs/architecture/cli-prompts.md.
 
-// Callers land with the login/access step.
-#![allow(dead_code)]
-
 pub mod fold;
 pub mod review;
 pub mod select;

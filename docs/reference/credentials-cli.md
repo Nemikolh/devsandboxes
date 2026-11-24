@@ -14,13 +14,13 @@ requests*).
 
 Code: `src/main.rs` (`Command::Login`, `AccessCommand`),
 `src/commands/login.rs` (`login_at`, `pick`, `pending_one`, `choose`,
-`obtain`, `create_url`, `check_request`, `read_check`, `check_token`, `Flows`, `Term`, `EchoOff`, `approve_or_refuse`), `src/commands/access.rs` (`approve_at`, `ask_approve`,
+`obtain`, `create_url`, `check_request`, `read_check`, `check_token`, `Flows`, `Term`, `Stdio`, `styled`, `EchoOff`, `approve_or_refuse`, `approved`), `src/commands/access.rs` (`approve_at`, `ask_approve`, `review_pending`, `confirm_revoke`,
 `pick_pending`, `approve_route`, `deny_route`, `pending_text`, `decide_with`, `list_at`, `uses`, `render`, `fences`, `render_fences`, `revoke_at`, `pick_any`,
 `revoke_answer_at`, `forget_at`), `src/credentials/home.rs` (`Entry`, `Rule`, `Source`, `Version`,
 `record_pending`, `update`), `src/credentials/answers.rs` (`Answers`,
 `Remembered`, `lookup`, `forget_instance`), `src/credentials/store.rs` (`Store`,
 `Record`, `OAuthToken`, `Secret`), `src/credentials/oauth/` (the OAuth
-logins: [login](../architecture/credentials/login.md)), `src/credentials/review.rs` (`View`, `diff`, `Diff`),
+logins: [login](../architecture/credentials/login.md)), `src/credentials/review.rs` (`View`, `View::fold`, `diff`, `Diff`, `Diff::fold`),
 `src/credentials/mod.rs` (`check_name`), `src/broker/audit.rs` (`Audit`,
 `Line`).
 
@@ -115,16 +115,37 @@ the token record, never the claim, so it changes no claim version.
 the token's resource owner (`target_name`); refused unless the chosen
 login is a paste with `create`.
 
-Then, in order: a new version's summary (`View::summary`: kind, mode,
-upstreams, each scope with its route count, every `never` route, the
-short version) and the question (`approve_or_refuse`: `--yes` approves;
-off a terminal without `--yes`, refused); for a new credential with
-`--broad`, what it reaches and the same kind of question (a re-login of
-a broad one isn't asked: its reach was agreed when it was made); the
+A claim version is approved after its review, the version as a tree
+(`View::fold`): ``claim `<kind>` (<mode>)`` with its short version, the
+upstreams (inline when one, else listed), `scopes` with each scope's route count, its routes under it,
+and `never` (red) with every route no ask or rule opens. `scopes` and
+`never` start folded, showing their first two lines and `… N more`. On
+a terminal the question is a pick (docs/architecture/cli-prompts.md):
+Approve (`a`) or Refuse (`r`), Refuse preselected; Esc or Ctrl-C
+refuses too. Tab or ↑ past the first answer moves into the tree, where
+→ opens a node and ← closes it. Answered, the tree stays in scrollback
+folded to one line per section, then `? <question> › <answer>`. When it
+can't draw in place (stderr not a terminal, `TERM=dumb`), the tree
+prints unfolded but for each scope's routes (its count shows) and the
+answer is read as a number or hotkey (empty: Refuse).
+`--yes` approves unasked and off a terminal without it the login is
+refused; both print the tree first, the same way.
+
+On stderr, a line starting `warning:` or `note:` has that word in
+yellow or cyan, the token page's URL is bold and `approved claim
+version …` green (`styled`), when stderr is a terminal and `NO_COLOR`
+is unset; the final line on stdout is green under `src/render.rs`'s
+rule.
+
+Then, in order: a new version's review and the question
+(`approve_or_refuse`); for a new credential with `--broad`, a warning of
+what it reaches and the same kind of question, with no review (a re-login
+of a broad one isn't asked: its reach was agreed when it was made); the
 secret (`obtain`), by:
 
 - `paste`: from stdin (`Stdio::secret`: on a terminal, after the claim's
-  paste `hint`, with echo off (`EchoOff`, termios `ECHO` cleared, line
+  paste `hint` as `? <hint>:` (styled as a question), with echo off
+  (`EchoOff`, termios `ECHO` cleared, line
   editing kept); else all of stdin, so `login x < file` works), trimmed,
   empty refused. Stored as a static token. When the claim's paste login
   has a `create` page (not with `--broad`: the page makes a narrow token) (`{"url": …, "permissions": bool}`; https, no query
@@ -220,15 +241,17 @@ replaced`.
 ## `access approve`
 
 `approve_at`: the credential's pending version (`pick_pending`: `--version`
-as a unique prefix, else the only one; none or several refused), shown as
-its diff against the latest approved version (`review::diff`, rendered by
-`Diff::render`: upstreams `+`/`-`, routes added and removed per scope,
-`(new)` and `(dropped)` scopes, `never` routes `+`/`-`, and `also
+as a unique prefix, else the only one; none or several refused), shown
+(`review_pending`) as its diff against the latest approved version
+(`review::diff`, as a tree by `Diff::fold`: upstreams `+` green / `-`
+red, routes added and removed per scope, `(new)` and `(dropped)` scopes
+folded and edited ones open, `never` routes `+`/`-`, open, and `also
 changed:` naming every other pinned field that differs, `mode`, `inject`,
 `login`, `checkShows`, `refusal`, `tokens`, a kept scope's `permissions` and a login's `create`
 page or `scope`, `login.<method>.create` and `login.<method>.scope`
 (a broad login's method read `<method>.broad`), among them), or its
-summary when none is approved. Same question as `login`. Approval moves
+review as `login` shows it when none is approved. Same question as
+`login`; the final line is green on a terminal. Approval moves
 the version from `pending` to the end of `approved`; older approved
 versions stay (instances pinned to them keep working). The secret is
 untouched.
@@ -237,10 +260,10 @@ untouched.
 
 A `run` whose feature brings a claim version its credential hasn't
 approved records it pending, then on a TTY shows the same review and
-asks "Approve this claim for `<credential>`?" (`ask_approve`): yes
-approves it as above and the run goes on (through the daemon: the run is
-rolled back and resent, docs/architecture/daemon/verbs.md, *The CLI
-side*); no refuses the run, naming `devsandbox access approve
+asks "Approve this claim for `<credential>`?" (`ask_approve`, the same
+pick): Approve approves it as above and the run goes on (through the
+daemon: the run is rolled back and resent, docs/architecture/daemon/verbs.md,
+*The CLI side*); Refuse or a cancel refuses the run, naming `devsandbox access approve
 <credential>`, then try again. Off a TTY, with `--json` or `-d`, from the
 dashboard, and for `rebuild` or a machine's run, it refuses without
 asking. A refused `run` is rolled back, so trying again is another `run`
@@ -388,8 +411,9 @@ seconds; `org_fence`: the latest approved claim has an `orgs` field).
 
 ## `access revoke`
 
-`revoke_at`, after showing what goes and asking (`--yes` revokes; off a
-terminal without `--yes`, refused):
+`revoke_at`, after showing what goes and asking (`confirm_revoke`: Revoke
+(`r`), or Drop (`d`) for a version, against Keep (`k`), preselected; a
+cancel keeps; `--yes` revokes; off a terminal without `--yes`, refused):
 
 - Without `--version`: the credential's record leaves the store, then its
   entry leaves `credentials.toml` (the secret first: a failure in

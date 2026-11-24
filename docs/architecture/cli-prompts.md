@@ -25,6 +25,24 @@ choices, default)` are the entry points. Both return
 `Answer::Picked(index)` or `Answer::Cancelled`; callers turn a cancel
 into their own refusal.
 
+## Callers
+
+`login` and `access` ask through their `Term` seam
+(`src/commands/login.rs`: `Term::choose`, `Term::review`; `Stdio` runs
+these entry points, the tests' `Script` answers by choice label and
+records a review's tree as `Fold::plain_lines` prints it):
+
+- `login::approved` (behind `approve_or_refuse`, and `access::ask_approve`
+  for `run`'s question): Approve / Refuse, Refuse preselected, under the
+  claim version's tree (`credentials::review::View::fold`, or
+  `Diff::fold` against the latest approved version); with no tree (the
+  broad-credential question) a plain select.
+- `access::confirm_revoke`: Revoke (or Drop, for a version) / Keep, Keep
+  preselected.
+
+Both treat a cancel as the safe answer. docs/reference/credentials-cli.md
+has what the user sees.
+
 ## Styling
 
 `style::enabled` gates color on stderr: it is a TTY, `NO_COLOR` is
@@ -92,9 +110,11 @@ answer accent), or `? question › cancelled` dimmed.
 ## Plain fallback
 
 Off a terminal (stdin or stderr not a TTY, `TERM=dumb`) or when raw
-mode can't be enabled, the same entry points print the tree as it
-stands with no cursor (`Fold::plain_lines`, collapsed nodes with their
-preview), the question, the choices numbered `1) …`, and
+mode can't be enabled, the same entry points print the tree with no
+cursor and every node open (`Fold::plain_lines`: nothing can be
+expanded there, so a fold would hide lines), except a `brief` node,
+which shows its head alone (a claim's scopes: the route count, not the
+routes), the question, the choices numbered `1) …`, and
 `[1-N, default D] > `. One line is read from stdin: empty picks the
 default, a number or a hotkey picks that choice, end of input cancels,
 anything else is an error.

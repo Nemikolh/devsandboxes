@@ -17,7 +17,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::login::{Stdio, Term, approve_or_refuse, data_dir};
+use super::login::{Stdio, Term, approve_or_refuse, approved, data_dir};
+use crate::ask::{self, Choice, Node};
 use super::Envelope;
 use super::run::remotes;
 use crate::broker::asks::{self, Answer};
@@ -553,15 +554,16 @@ pub(crate) fn revoke_answer_at(data: &Path, id: &str) -> Result<String> {
     }
 }
 
-/// `--yes` revokes; else ask on a terminal, refuse off one.
-fn confirm_revoke(term: &mut dyn Term, yes: bool, question: &str) -> Result<()> {
+/// `--yes` revokes; else ask on a terminal, `revoke` against Keep (the
+/// default; a cancel keeps too), and refuse off one.
+fn confirm_revoke(term: &mut dyn Term, yes: bool, question: &str, revoke: Choice) -> Result<()> {
     if yes {
         return Ok(());
     }
     if !term.tty() {
         bail!("no terminal to confirm on: pass --yes to revoke");
     }
-    if !term.confirm(question)? {
+    if term.choose(question, &[revoke, Choice::new("Keep").hotkey('k')], 1)? != ask::Answer::Picked(0) {
         bail!("not revoked: nothing changed");
     }
     Ok(())
@@ -607,7 +609,7 @@ fn revoke_credential(data: &Path, name: &str, entry: &Entry, uses: &[Use], yes: 
         text.push_str(&format!("instances that lose it: {}\n", instance_list(&losing)));
     }
     term.show(&text);
-    confirm_revoke(term, yes, &format!("Revoke `{name}`?"))?;
+    confirm_revoke(term, yes, &format!("Revoke `{name}`?"), Choice::new("Revoke").hotkey('r'))?;
     // The secret first: an entry left by a failure serves nothing.
     store.remove(name)?;
     home::update(&home::path(data), |h| Ok(h.remove(name).is_some()))?;
@@ -648,7 +650,7 @@ fn revoke_version(
         }
     }
     term.show(&text);
-    confirm_revoke(term, yes, &format!("Drop claim version {short} of `{name}`?"))?;
+    confirm_revoke(term, yes, &format!("Drop claim version {short} of `{name}`?"), Choice::new("Drop").hotkey('d'))?;
     home::update(path, |h| {
         let e = h.get_mut(name).with_context(|| format!("credential `{name}` is gone"))?;
         let before = e.approved.len() + e.pending.len();
@@ -678,16 +680,19 @@ fn pick_any<'a>(name: &str, entry: &'a Entry, prefix: &str) -> Result<(&'static 
 
 pub fn approve(credential: &str, version: Option<&str>, yes: bool) -> Result<()> {
     let done = approve_at(&data_dir()?, credential, version, yes, &mut Stdio)?;
-    println!("{done}");
+    let (first, rest) = done.split_once('\n').map_or((done.as_str(), None), |(a, b)| (a, Some(b)));
+    println!("{}", crate::render::green(first));
+    if let Some(rest) = rest {
+        println!("{rest}");
+    }
     Ok(())
 }
 
 /// Returns the line to print.
 pub(crate) fn approve_at(data: &Path, name: &str, version: Option<&str>, yes: bool, term: &mut dyn Term) -> Result<String> {
     let path = home::path(data);
-    let (pending, text) = review_pending(&path, name, version)?;
-    term.show(&text);
-    approve_or_refuse(term, yes, &format!("Approve this claim version for `{name}`?"))?;
+    let (pending, tree) = review_pending(&path, name, version)?;
+    approve_or_refuse(term, yes, tree, &format!("Approve this claim version for `{name}`?"))?;
     let note = approve_pending(&path, name, &pending)?;
     let done = format!("approved claim version {} for `{name}`", pending.short());
     Ok(match note {
@@ -701,9 +706,8 @@ pub(crate) fn approve_at(data: &Path, name: &str, version: Option<&str>, yes: bo
 /// shows it, approved on a yes. `Ok(false)`: not approved, nothing changed.
 /// The caller has checked there's a terminal to ask on.
 pub(crate) fn ask_approve(path: &Path, name: &str, version: Option<&str>, term: &mut dyn Term) -> Result<bool> {
-    let (pending, text) = review_pending(path, name, version)?;
-    term.show(&text);
-    if !term.confirm(&format!("Approve this claim for `{name}`?"))? {
+    let (pending, tree) = review_pending(path, name, version)?;
+    if !approved(term, tree, &format!("Approve this claim for `{name}`?"))? {
         return Ok(false);
     }
     let note = approve_pending(path, name, &pending)?;
@@ -716,21 +720,20 @@ pub(crate) fn ask_approve(path: &Path, name: &str, version: Option<&str>, term: 
 
 /// The pending version and its review: the diff against the latest
 /// approved version, else the claim's summary.
-fn review_pending(path: &Path, name: &str, version: Option<&str>) -> Result<(Version, String)> {
+fn review_pending(path: &Path, name: &str, version: Option<&str>) -> Result<(Version, Vec<Node>)> {
     let entry = home::load(path)?
         .remove(name)
         .with_context(|| format!("no credential `{name}` in {}", path.display()))?;
     let pending = pick_pending(name, &entry.pending, version)?.clone();
     let new = pending.view()?;
-    let text = match entry.latest_approved() {
+    let tree = match entry.latest_approved() {
         Some(latest) => {
             let old = latest.view()?;
-            let diff = review::diff(&old, &new).render(&old, &new);
-            format!("claim `{}` version {}, against approved {}:\n{diff}", new.kind, pending.short(), latest.short())
+            review::diff(&old, &new).fold(&old, &new, pending.short(), latest.short())
         }
-        None => format!("{}  version {}\n", new.summary(), pending.short()),
+        None => new.fold(pending.short()),
     };
-    Ok((pending, text))
+    Ok((pending, tree))
 }
 
 /// The note to show when the version brings an org fence to a credential
@@ -969,12 +972,17 @@ mod tests {
 
         let err = approve_at(&data, "s", None, false, &mut Script::new(false, &[], None)).unwrap_err();
         assert!(err.to_string().contains("pass --yes"), "{err}");
-        let mut term = Script::new(true, &[false], None);
+        let mut term = Script::new(true, &["Refuse"], None);
         assert!(approve_at(&data, "s", None, false, &mut term).is_err());
-        assert!(term.shown.contains("  never:\n    - "), "{}", term.shown);
+        assert!(term.shown.contains("against approved "), "{}", term.shown);
+        assert!(term.shown.contains("\n▾ never\n  - "), "{}", term.shown);
+        assert!(term.shown.ends_with("Approve this claim version for `s`?"), "{}", term.shown);
+        let mut term = Script::new(true, &[crate::commands::login::tests::ESC], None);
+        let err = approve_at(&data, "s", None, false, &mut term).unwrap_err();
+        assert!(err.to_string().contains("not approved"), "a cancel refuses: {err}");
         assert_eq!(home::load(&path).unwrap()["s"].pending.len(), 1);
 
-        let done = approve_at(&data, "s", Some(&newer.version()[..8]), false, &mut Script::new(true, &[true], None)).unwrap();
+        let done = approve_at(&data, "s", Some(&newer.version()[..8]), false, &mut Script::new(true, &["Approve"], None)).unwrap();
         assert!(done.starts_with("approved claim version"), "{done}");
         let e = &home::load(&path).unwrap()["s"];
         assert!(e.pending.is_empty());
@@ -1420,7 +1428,7 @@ mod tests {
 
         let err = revoke("sentry-work", false, &mut Script::new(false, &[], None)).unwrap_err().to_string();
         assert!(err.contains("pass --yes to revoke"), "{err}");
-        let mut term = Script::new(true, &[false], None);
+        let mut term = Script::new(true, &["Keep"], None);
         let err = revoke("sentry-work", false, &mut term).unwrap_err().to_string();
         assert!(err.contains("not revoked"), "{err}");
         assert!(
@@ -1431,7 +1439,7 @@ mod tests {
         assert!(store.get("sentry-work").unwrap().is_some());
         assert!(home::load(&home::path(&data)).unwrap().contains_key("sentry-work"));
 
-        let mut term = Script::new(true, &[true], None);
+        let mut term = Script::new(true, &["Revoke"], None);
         let done = revoke("sentry-work", false, &mut term).unwrap();
         assert_eq!(done, "revoked `sentry-work`");
         assert!(!term.shown.contains(STATIC) && !done.contains(STATIC));
@@ -1462,7 +1470,7 @@ mod tests {
         let err = revoke(&v0[..8], false, &mut Script::new(false, &[], None)).unwrap_err().to_string();
         assert!(err.contains("pass --yes to revoke"), "{err}");
 
-        let mut term = Script::new(true, &[true], None);
+        let mut term = Script::new(true, &["Drop"], None);
         let done = revoke(&v0[..8], false, &mut term).unwrap();
         assert_eq!(done, format!("dropped approved claim version {} of `sentry-work`", &v0[..12]));
         assert!(

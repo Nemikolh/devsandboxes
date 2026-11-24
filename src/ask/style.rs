@@ -77,14 +77,6 @@ impl Style {
         self.paint(Role::Heading, text)
     }
 
-    pub fn name(self, text: &str) -> String {
-        self.paint(Role::Name, text)
-    }
-
-    pub fn danger(self, text: &str) -> String {
-        self.paint(Role::Danger, text)
-    }
-
     pub fn warn(self, text: &str) -> String {
         self.paint(Role::Warn, text)
     }
@@ -99,14 +91,6 @@ impl Style {
 
     pub fn dim(self, text: &str) -> String {
         self.paint(Role::Dim, text)
-    }
-
-    pub fn added(self, text: &str) -> String {
-        self.paint(Role::Added, text)
-    }
-
-    pub fn removed(self, text: &str) -> String {
-        self.paint(Role::Removed, text)
     }
 
     pub fn accent(self, text: &str) -> String {
@@ -130,11 +114,11 @@ mod tests {
     #[test]
     fn on_wraps_in_sgr_off_returns_the_text() {
         let on = Style { on: true };
-        assert_eq!(on.danger("never"), "\x1b[1;31mnever\x1b[0m");
+        assert_eq!(on.paint(Role::Danger, "never"), "\x1b[1;31mnever\x1b[0m");
         assert_eq!(on.heading("gh"), "\x1b[1mgh\x1b[0m");
-        assert_eq!(on.added("+ a"), "\x1b[32m+ a\x1b[0m");
+        assert_eq!(on.paint(Role::Added, "+ a"), "\x1b[32m+ a\x1b[0m");
         assert_eq!(on.dim("…"), "\x1b[2m…\x1b[0m");
         assert_eq!(on.paint(Role::Plain, "x"), "x");
-        assert_eq!(Style::plain().danger("never"), "never");
+        assert_eq!(Style::plain().paint(Role::Danger, "never"), "never");
     }
 }

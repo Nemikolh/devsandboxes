@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+use crate::ask::{Answer, Choice, Node, Style};
 use crate::broker::head::Header;
 use crate::credentials::claim::{self, Claim, Create, Level, Login, Pinned, Route, Scope, Slot};
 use crate::credentials::home::{self, Entry, Home, Version};
@@ -113,7 +114,9 @@ pub(crate) trait Term {
     /// Whether stdin is a terminal to ask on.
     fn tty(&self) -> bool;
     fn show(&mut self, text: &str);
-    fn confirm(&mut self, question: &str) -> Result<bool>;
+    fn choose(&mut self, question: &str, choices: &[Choice], default: usize) -> Result<Answer>;
+    /// `question` under `tree`, the details it is about.
+    fn review(&mut self, tree: Vec<Node>, question: &str, choices: &[Choice], default: usize) -> Result<Answer>;
     /// The secret from stdin: unechoed on a terminal, else all of it.
     fn secret(&mut self, prompt: &str) -> Result<Secret>;
 }
@@ -126,17 +129,22 @@ impl Term for Stdio {
     }
 
     fn show(&mut self, text: &str) {
-        eprint!("{text}");
+        eprint!("{}", styled(text, Style::detect()));
     }
 
-    fn confirm(&mut self, question: &str) -> Result<bool> {
-        super::confirm(question)
+    fn choose(&mut self, question: &str, choices: &[Choice], default: usize) -> Result<Answer> {
+        crate::ask::select(question, choices, default)
+    }
+
+    fn review(&mut self, tree: Vec<Node>, question: &str, choices: &[Choice], default: usize) -> Result<Answer> {
+        crate::ask::review(tree, question, choices, default)
     }
 
     fn secret(&mut self, prompt: &str) -> Result<Secret> {
         let mut text = String::new();
         if self.tty() {
-            eprint!("{prompt}: ");
+            let style = Style::detect();
+            eprint!("{} {}: ", style.accent("?"), style.heading(prompt));
             std::io::stderr().flush()?;
             let _echo = EchoOff::new()?;
             std::io::stdin().read_line(&mut text)?;
@@ -146,6 +154,29 @@ impl Term for Stdio {
         }
         Ok(Secret::new(text))
     }
+}
+
+/// `text`'s lines styled by what they start with. By prefix so the callers
+/// stay one plain `show`, which the tests' `Script` records as is.
+fn styled(text: &str, style: Style) -> String {
+    const CREATE: &str = "Create the token at ";
+    text.split_inclusive('\n')
+        .map(|line| {
+            if let Some(rest) = line.strip_prefix("warning:") {
+                format!("{}{rest}", style.warn("warning:"))
+            } else if let Some(rest) = line.strip_prefix("note:") {
+                format!("{}{rest}", style.note("note:"))
+            } else if line.starts_with("approved claim version ") {
+                let body = line.trim_end_matches('\n');
+                format!("{}{}", style.ok(body), &line[body.len()..])
+            } else if let Some(rest) = line.strip_prefix(CREATE) {
+                let url = rest.trim_end_matches('\n');
+                format!("{CREATE}{}{}", style.heading(url), &rest[url.len()..])
+            } else {
+                line.to_string()
+            }
+        })
+        .collect()
 }
 
 /// Stdin's terminal with echo off (line editing kept) until dropped.
@@ -188,7 +219,7 @@ pub fn login(args: Args) -> Result<()> {
     let profile = login_profile(existing.as_ref(), &args.profiles);
     let mut flows = Flows::host(profile, &mut Stdio);
     let done = login_at(&data, &args, claims, &mut Stdio, &mut flows)?;
-    println!("{done}");
+    println!("{}", crate::render::green(&done));
     Ok(())
 }
 
@@ -658,16 +689,15 @@ pub(crate) fn login_at(
         .as_ref()
         .filter(|c| existing.as_ref().and_then(|e| e.approved_claim(&c.version)).is_none());
     if let Some(c) = approving {
-        term.show(&format!("{}  version {}\n", shown.summary(), c.short()));
-        approve_or_refuse(term, args.yes, &format!("Approve this claim for `{name}`?"))?;
+        approve_or_refuse(term, args.yes, shown.fold(c.short()), &format!("Approve this claim for `{name}`?"))?;
     }
     // A broad entry's reach was agreed when it was made.
     if args.broad && existing.is_none() {
         term.show(&format!(
-            "`{name}` is broad: its token reaches every repo your account can access. The broker refuses writes \
+            "warning: `{name}` is broad: its token reaches every repo your account can access. The broker refuses writes \
              outside an instance's repo fence; GraphQL reads aren't fenced.\n"
         ));
-        approve_or_refuse(term, args.yes, &format!("Make `{name}` a broad credential?"))?;
+        approve_or_refuse(term, args.yes, Vec::new(), &format!("Make `{name}` a broad credential?"))?;
     }
 
     let record = obtain(login, name, page.as_deref(), args, term, flows)?;
@@ -757,18 +787,29 @@ fn pending_one(name: &str, entry: Option<&Entry>, path: &Path) -> Result<Option<
     }
 }
 
-/// `--yes` approves; else ask on a terminal, refuse off one.
-pub(crate) fn approve_or_refuse(term: &mut dyn Term, yes: bool, question: &str) -> Result<()> {
-    if yes {
-        return Ok(());
-    }
-    if !term.tty() {
+/// `--yes` approves; else ask on a terminal, under `tree` when it has
+/// one, and refuse off one. Unasked, `tree` is still shown: what `--yes`
+/// approved, or what a later `--yes` would.
+pub(crate) fn approve_or_refuse(term: &mut dyn Term, yes: bool, tree: Vec<Node>, question: &str) -> Result<()> {
+    if yes || !term.tty() {
+        let lines = crate::ask::fold::Fold::new(tree).plain_lines(Style::plain());
+        term.show(&lines.iter().map(|l| format!("{l}\n")).collect::<String>());
+        if yes {
+            return Ok(());
+        }
         bail!("no terminal to confirm on: pass --yes to approve");
     }
-    if !term.confirm(question)? {
+    if !approved(term, tree, question)? {
         bail!("not approved: nothing changed");
     }
     Ok(())
+}
+
+/// Approve or Refuse, Refuse preselected; a cancel refuses.
+pub(crate) fn approved(term: &mut dyn Term, tree: Vec<Node>, question: &str) -> Result<bool> {
+    let choices = [Choice::new("Approve").hotkey('a'), Choice::new("Refuse").hotkey('r')];
+    let answer = if tree.is_empty() { term.choose(question, &choices, 1)? } else { term.review(tree, question, &choices, 1)? };
+    Ok(answer == Answer::Picked(0))
 }
 
 #[cfg(test)]
@@ -777,17 +818,27 @@ pub(crate) mod tests {
     use crate::credentials::home::tests::sentry;
     use std::path::PathBuf;
 
-    /// A scripted terminal: answers in order, everything shown kept.
+    /// A scripted answer that cancels the question, as Esc does.
+    pub(crate) const ESC: &str = "<esc>";
+
+    /// A scripted terminal: answers in order, each the label of the choice
+    /// picked (or [`ESC`]); everything shown kept, a review's tree as the
+    /// plain fallback prints it.
     pub(crate) struct Script {
         pub tty: bool,
-        pub answers: Vec<bool>,
+        pub answers: Vec<String>,
         pub secret: Option<String>,
         pub shown: String,
     }
 
     impl Script {
-        pub(crate) fn new(tty: bool, answers: &[bool], secret: Option<&str>) -> Script {
-            Script { tty, answers: answers.to_vec(), secret: secret.map(String::from), shown: String::new() }
+        pub(crate) fn new(tty: bool, answers: &[&str], secret: Option<&str>) -> Script {
+            Script {
+                tty,
+                answers: answers.iter().map(|a| a.to_string()).collect(),
+                secret: secret.map(String::from),
+                shown: String::new(),
+            }
         }
     }
 
@@ -798,9 +849,23 @@ pub(crate) mod tests {
         fn show(&mut self, text: &str) {
             self.shown.push_str(text);
         }
-        fn confirm(&mut self, question: &str) -> Result<bool> {
+        fn choose(&mut self, question: &str, choices: &[Choice], default: usize) -> Result<Answer> {
+            assert!(default < choices.len(), "the default is a choice");
             self.shown.push_str(question);
-            Ok(self.answers.remove(0))
+            let answer = self.answers.remove(0);
+            if answer == ESC {
+                return Ok(Answer::Cancelled);
+            }
+            let labels: Vec<&str> = choices.iter().map(|c| c.label.as_str()).collect();
+            let i = labels.iter().position(|l| *l == answer);
+            Ok(Answer::Picked(i.unwrap_or_else(|| panic!("`{answer}` isn't one of {labels:?}"))))
+        }
+        fn review(&mut self, tree: Vec<Node>, question: &str, choices: &[Choice], default: usize) -> Result<Answer> {
+            for line in crate::ask::fold::Fold::new(tree).plain_lines(Style::plain()) {
+                self.shown.push_str(&line);
+                self.shown.push('\n');
+            }
+            self.choose(question, choices, default)
         }
         fn secret(&mut self, _: &str) -> Result<Secret> {
             Ok(Secret::new(self.secret.take().expect("one secret read")))
@@ -882,7 +947,7 @@ pub(crate) mod tests {
         let mut a = args("sentry-work");
         a.profiles = vec!["work".into()];
         a.method = Some("paste".into());
-        let mut term = Script::new(true, &[true], Some("tok-1\n"));
+        let mut term = Script::new(true, &["Approve"], Some("tok-1\n"));
         let done = login_at(&data, &a, Some(vec![sentry()]), &mut term).unwrap();
         assert!(done.contains("claim version") && done.contains("approved"), "{done}");
         assert!(term.shown.contains("claim `sentry` (intercept)"), "{}", term.shown);
@@ -911,13 +976,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn shown_lines_are_styled_by_what_they_start_with() {
+        let on = Style { on: true };
+        let text = "warning: cannot check\nnote: x\nCreate the token at https://h/new\n  select\napproved claim version v\nplain";
+        assert_eq!(
+            styled(text, on),
+            "\x1b[33mwarning:\x1b[0m cannot check\n\x1b[36mnote:\x1b[0m x\nCreate the token at \x1b[1mhttps://h/new\x1b[0m\n  select\n\
+             \x1b[32mapproved claim version v\x1b[0m\nplain"
+        );
+        assert_eq!(styled(text, Style::plain()), text);
+    }
+
+    #[test]
+    fn approval_picks_between_approve_and_refuse() {
+        let mut term = Script::new(true, &["Approve", "Refuse", ESC], None);
+        assert!(approved(&mut term, Vec::new(), "Q1?").unwrap());
+        assert!(!approved(&mut term, vec![Node::new("detail")], "Q2?").unwrap());
+        assert!(!approved(&mut term, Vec::new(), "Q3?").unwrap(), "a cancel refuses");
+        assert_eq!(term.shown, "Q1?detail\nQ2?Q3?");
+    }
+
+    #[test]
     fn refusals_change_nothing() {
         let data = temp("refuse");
         let err = login_at(&data, &args("sentry-work"), None, &mut Script::new(true, &[], None)).unwrap_err();
         assert!(err.to_string().contains("--feature <ref>"), "{err}");
-        let err = login_at(&data, &args("s"), Some(vec![sentry()]), &mut Script::new(false, &[], Some("t"))).unwrap_err();
+        let mut term = Script::new(false, &[], Some("t"));
+        let err = login_at(&data, &args("s"), Some(vec![sentry()]), &mut term).unwrap_err();
         assert!(err.to_string().contains("pass --yes"), "{err}");
-        let err = login_at(&data, &args("s"), Some(vec![sentry()]), &mut Script::new(true, &[false], Some("t"))).unwrap_err();
+        assert!(term.shown.starts_with("claim `sentry` (intercept) (version "), "what --yes would approve: {}", term.shown);
+        let err = login_at(&data, &args("s"), Some(vec![sentry()]), &mut Script::new(true, &["Refuse"], Some("t"))).unwrap_err();
         assert!(err.to_string().contains("not approved"), "{err}");
         let mut yes = args("s");
         yes.yes = true;
@@ -959,7 +1047,7 @@ pub(crate) mod tests {
             home::record_pending(h, "s", &sentry().canonical())
         })
         .unwrap();
-        let mut term = Script::new(true, &[true], Some("t"));
+        let mut term = Script::new(true, &["Approve"], Some("t"));
         let paste = Args { method: Some("paste".into()), ..args("s") };
         let done = login_at(&data, &paste, None, &mut term).unwrap();
         assert!(done.contains("approved"), "{done}");
@@ -1166,7 +1254,7 @@ pub(crate) mod tests {
         let mut gh = github();
         gh.pinned.login = vec![Login::Paste { hint: None, create: None }, home_device(port), broad_device(port)];
         let a = Args { broad: true, ..args("gh") };
-        let mut term = Script::new(true, &[true, true], None);
+        let mut term = Script::new(true, &["Approve", "Approve"], None);
         let mut f = flows(|_| {}, Box::new(FakeClock::new()));
         let done = super::login_at(&data, &a, Some(vec![gh.clone()]), &mut term, &mut f).unwrap();
         assert!(done.contains("approved"), "{done}");
@@ -1197,7 +1285,7 @@ pub(crate) mod tests {
         let err = login_at(&data, &broad, Some(vec![sentry()]), &mut Script::new(false, &[], Some("t"))).unwrap_err();
         assert!(err.to_string().contains("the `sentry` claim takes no broad token"), "{err}");
         let unconfirmed = Args { broad: true, ..args("gh") };
-        let err = login_at(&data, &unconfirmed, Some(vec![github()]), &mut Script::new(true, &[true, false], Some("gho_x"))).unwrap_err();
+        let err = login_at(&data, &unconfirmed, Some(vec![github()]), &mut Script::new(true, &["Approve", "Refuse"], Some("gho_x"))).unwrap_err();
         assert!(err.to_string().contains("not approved"), "{err}");
         let piped = Args { method: Some("paste".into()), ..args("gh") };
         let err = login_at(&data, &Args { broad: true, ..piped }, Some(vec![github()]), &mut Script::new(false, &[], Some("gho_x")))

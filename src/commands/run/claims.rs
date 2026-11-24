@@ -671,7 +671,7 @@ mod tests {
         let err = check(Unapproved::Ask, &mut no_term()).unwrap_err().to_string();
         assert!(err.contains("run `devsandbox access approve sentry-work`"), "{err}");
 
-        let mut term = Script::new(true, &[false], None);
+        let mut term = Script::new(true, &["Refuse"], None);
         let err = check(Unapproved::Ask, &mut term).unwrap_err();
         assert!(unapproved_stop(&err), "a no is a refusal: {err}");
         let err = err.to_string();
@@ -681,7 +681,7 @@ mod tests {
         assert!(!approved());
         assert_eq!(home::load(&path).unwrap()["sentry-work"].pending.len(), 1);
 
-        check(Unapproved::Ask, &mut Script::new(true, &[true], None)).unwrap();
+        check(Unapproved::Ask, &mut Script::new(true, &["Approve"], None)).unwrap();
         assert!(approved());
         assert!(home::load(&path).unwrap()["sentry-work"].pending.is_empty());
         let _ = std::fs::remove_dir_all(&dir);

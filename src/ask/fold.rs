@@ -14,11 +14,14 @@ pub struct Node {
     pub hint: Option<String>,
     pub children: Vec<Node>,
     pub open: bool,
+    /// Where nothing can be expanded, shown as its head alone: its hint
+    /// says enough, its children would drown the rest.
+    pub brief: bool,
 }
 
 impl Node {
     pub fn new(label: impl Into<String>) -> Node {
-        Node { label: label.into(), role: Role::Plain, hint: None, children: Vec::new(), open: false }
+        Node { label: label.into(), role: Role::Plain, hint: None, children: Vec::new(), open: false, brief: false }
     }
 
     pub fn role(mut self, role: Role) -> Node {
@@ -31,11 +34,6 @@ impl Node {
         self
     }
 
-    pub fn child(mut self, child: Node) -> Node {
-        self.children.push(child);
-        self
-    }
-
     pub fn children(mut self, children: impl IntoIterator<Item = Node>) -> Node {
         self.children.extend(children);
         self
@@ -43,6 +41,11 @@ impl Node {
 
     pub fn opened(mut self) -> Node {
         self.open = true;
+        self
+    }
+
+    pub fn brief(mut self) -> Node {
+        self.brief = true;
         self
     }
 
@@ -64,10 +67,6 @@ pub struct Fold {
 impl Fold {
     pub fn new(roots: Vec<Node>) -> Fold {
         Fold { roots, cursor: 0 }
-    }
-
-    pub fn roots(&self) -> &[Node] {
-        &self.roots
     }
 
     pub fn is_empty(&self) -> bool {
@@ -139,14 +138,17 @@ impl Fold {
     /// The widget's lines, each behind a two-column cursor gutter, and the
     /// line the cursor is on (`0` when `cursor` is off).
     pub fn lines(&self, style: Style, cursor: bool) -> (Vec<String>, usize) {
-        let mut out = Render { style, cursor: cursor.then_some(self.cursor), gutter: true, seen: 0, at: 0, lines: Vec::new() };
+        let mut out =
+            Render { style, cursor: cursor.then_some(self.cursor), gutter: true, expand: false, seen: 0, at: 0, lines: Vec::new() };
         out.walk(&self.roots, 0);
         (out.lines, out.at)
     }
 
-    /// The tree as it stands, no cursor or gutter: the plain fallback's.
+    /// Every node open but brief ones, no cursor or gutter: where nothing
+    /// can be expanded (the plain fallback, `--yes`), a fold would hide
+    /// lines.
     pub fn plain_lines(&self, style: Style) -> Vec<String> {
-        let mut out = Render { style, cursor: None, gutter: false, seen: 0, at: 0, lines: Vec::new() };
+        let mut out = Render { style, cursor: None, gutter: false, expand: true, seen: 0, at: 0, lines: Vec::new() };
         out.walk(&self.roots, 0);
         out.lines
     }
@@ -161,6 +163,7 @@ struct Render {
     style: Style,
     cursor: Option<usize>,
     gutter: bool,
+    expand: bool,
     seen: usize,
     at: usize,
     lines: Vec<String>,
@@ -177,11 +180,12 @@ impl Render {
             }
             let mark = if here { format!("{} ", self.style.accent("❯")) } else { pad.to_string() };
             let indent = "  ".repeat(depth);
-            self.lines.push(format!("{mark}{indent}{}", head(node, node.is_open(), self.style)));
-            if node.children.is_empty() {
+            let open = if self.expand { !node.brief } else { node.is_open() };
+            self.lines.push(format!("{mark}{indent}{}", head(node, open, self.style)));
+            if node.children.is_empty() || (self.expand && node.brief) {
                 continue;
             }
-            if node.is_open() {
+            if open {
                 self.walk(&node.children, depth + 1);
                 continue;
             }
@@ -221,7 +225,7 @@ mod tests {
         Fold::new(vec![
             Node::new("credential gh").role(Role::Name),
             Node::new("scope repo").hint("3 routes").children(["GET /a", "GET /b", "POST /c"].map(Node::new)),
-            Node::new("never").role(Role::Danger).child(Node::new("DELETE /repo")),
+            Node::new("never").role(Role::Danger).children([Node::new("DELETE /repo")]),
         ])
     }
 

@@ -60,9 +60,9 @@ linked from `docs/README.md`.
 
 ## Step 2: `login` and `access approve`
 
-- `credentials::review::View::fold()` and `Diff::fold()` build the tree
-  (`summary()` / `render()` stay: they're the plain path and tests rely on
-  them). Kind and credential name bold, upstreams plain, each scope a
+- `credentials::review::View::fold()` and `Diff::fold()` build the tree,
+  replacing `summary()` / `render()`: the plain path prints the tree
+  unfolded (scopes `brief`: their count, not their routes). Kind and credential name bold, upstreams plain, each scope a
   node (routes as children, count as hint), `never` in the danger style,
   folded with a preview; a diff's added lines green `+`, removed red `-`.
 - `login::Term` gains `review(fold, question, choices) -> Result<usize>`

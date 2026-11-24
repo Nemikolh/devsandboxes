@@ -6,10 +6,12 @@
 //! remote host sends, so a version reads the same whichever way it arrived.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value};
+
+use crate::ask::Node;
+use crate::ask::style::Role;
 
 /// Fields read on their own; every other pinned field is compared whole.
 const READ: &[&str] = &["upstreams", "mode", "scopes", "never", "login"];
@@ -85,32 +87,48 @@ impl View {
         })
     }
 
-    pub fn summary(&self) -> String {
-        let mut out = format!("claim `{}` ({})\n", self.kind, self.mode);
-        let up: Vec<&str> = self.upstreams.iter().map(String::as_str).collect();
-        let _ = writeln!(out, "  upstreams: {}", up.join(", "));
-        if self.scopes.is_empty() {
-            let _ = writeln!(out, "  scopes: none");
+    /// What a version asks, as a prompt's tree: scopes and `never` fold to
+    /// a preview, each scope opening to its routes.
+    pub fn fold(&self, version: &str) -> Vec<Node> {
+        let mut tree = vec![self.heading().hint(format!("version {version}"))];
+        tree.push(match self.upstreams.len() {
+            0 => Node::new("upstreams: none"),
+            1 => Node::new(format!("upstreams: {}", self.upstreams.first().expect("one"))),
+            n => Node::new("upstreams").hint(format!("{n} hosts")).children(self.upstreams.iter().map(Node::new)).opened(),
+        });
+        tree.push(if self.scopes.is_empty() {
+            Node::new("scopes: none")
         } else {
-            let _ = writeln!(out, "  scopes:");
-            for (name, routes) in &self.scopes {
-                let _ = writeln!(out, "    {name} ({})", count(routes.len()));
-            }
-        }
-        if self.never.is_empty() {
-            let _ = writeln!(out, "  never: none");
+            Node::new("scopes").hint(plural(self.scopes.len(), "scope")).children(
+                self.scopes
+                    .iter()
+                    .map(|(name, routes)| {
+                        Node::new(name).role(Role::Name).hint(count(routes.len())).children(routes.iter().map(Node::new)).brief()
+                    }),
+            )
+        });
+        tree.push(if self.never.is_empty() {
+            Node::new("never: none")
         } else {
-            let _ = writeln!(out, "  never (no ask or rule opens them):");
-            for route in &self.never {
-                let _ = writeln!(out, "    {route}");
-            }
-        }
-        out
+            Node::new("never")
+                .role(Role::Danger)
+                .hint(format!("{}, no ask or rule opens them", count(self.never.len())))
+                .children(self.never.iter().map(Node::new))
+        });
+        tree
+    }
+
+    fn heading(&self) -> Node {
+        Node::new(format!("claim `{}` ({})", self.kind, self.mode)).role(Role::Heading)
     }
 }
 
 fn count(n: usize) -> String {
-    if n == 1 { "1 route".into() } else { format!("{n} routes") }
+    plural(n, "route")
+}
+
+fn plural(n: usize, what: &str) -> String {
+    if n == 1 { format!("1 {what}") } else { format!("{n} {what}s") }
 }
 
 fn array<'a>(claim: &'a Map<String, Value>, name: &str) -> Result<&'a [Value]> {
@@ -161,13 +179,9 @@ impl Change {
         self.added.is_empty() && self.removed.is_empty()
     }
 
-    fn render(&self, out: &mut String) {
-        for a in &self.added {
-            let _ = writeln!(out, "    + {a}");
-        }
-        for r in &self.removed {
-            let _ = writeln!(out, "    - {r}");
-        }
+    fn nodes(&self) -> impl Iterator<Item = Node> + '_ {
+        let added = self.added.iter().map(|a| Node::new(format!("+ {a}")).role(Role::Added));
+        added.chain(self.removed.iter().map(|r| Node::new(format!("- {r}")).role(Role::Removed)))
     }
 }
 
@@ -211,29 +225,29 @@ pub fn diff(old: &View, new: &View) -> Diff {
 }
 
 impl Diff {
-    pub fn render(&self, old: &View, new: &View) -> String {
-        let mut out = String::new();
+    /// The diff as a prompt's tree, `new`'s `version` against `old`'s
+    /// `approved`. Edited scopes, upstreams and `never` start open;
+    /// a new or dropped scope folds, its lines all one sign.
+    pub fn fold(&self, old: &View, new: &View, version: &str, approved: &str) -> Vec<Node> {
+        let mut tree = vec![new.heading().hint(format!("version {version}, against approved {approved}"))];
         if !self.upstreams.is_empty() {
-            out.push_str("  upstreams:\n");
-            self.upstreams.render(&mut out);
+            tree.push(Node::new("upstreams").children(self.upstreams.nodes()).opened());
         }
         for (name, change) in &self.scopes {
-            let note = match (old.scopes.contains_key(name), new.scopes.contains_key(name)) {
-                (false, _) => " (new)",
-                (_, false) => " (dropped)",
-                _ => "",
-            };
-            let _ = writeln!(out, "  scope {name}{note}:");
-            change.render(&mut out);
+            let node = Node::new(format!("scope {name}")).children(change.nodes());
+            tree.push(match (old.scopes.contains_key(name), new.scopes.contains_key(name)) {
+                (false, _) => node.hint("new"),
+                (_, false) => node.hint("dropped"),
+                _ => node.opened(),
+            });
         }
         if !self.never.is_empty() {
-            out.push_str("  never:\n");
-            self.never.render(&mut out);
+            tree.push(Node::new("never").role(Role::Danger).children(self.never.nodes()).opened());
         }
         if !self.changed.is_empty() {
-            let _ = writeln!(out, "  also changed: {}", self.changed.join(", "));
+            tree.push(Node::new(format!("also changed: {}", self.changed.join(", "))));
         }
-        out
+        tree
     }
 }
 
@@ -257,15 +271,42 @@ mod tests {
         View::parse(&claim::parse("sentry", claim).unwrap().canonical()).unwrap()
     }
 
+    /// The tree as the plain fallback prints it, one string.
+    fn plain(tree: Vec<Node>) -> String {
+        crate::ask::fold::Fold::new(tree).plain_lines(crate::ask::Style::plain()).iter().map(|l| format!("{l}\n")).collect()
+    }
+
+    fn tree_open(tree: &[Node], label: &str) -> bool {
+        tree.iter().find(|n| n.label == label).expect("a node so labeled").open
+    }
+
     #[test]
     fn the_sentry_claim_summarizes() {
         let v = view(&sentry_json());
         assert_eq!(v.kind, "sentry");
-        let s = v.summary();
-        assert!(s.starts_with("claim `sentry` (intercept)\n  upstreams: de.sentry.io, sentry.io, us.sentry.io\n"), "{s}");
-        assert!(s.contains("    issues.read (13 routes)\n    issues.write (5 routes)\n"), "{s}");
-        assert!(s.contains("    seer (1 route)\n"), "{s}");
-        assert!(s.contains("  never (no ask or rule opens them):\n    DELETE /api/0/organizations/{org}/\n"), "{s}");
+        let tree = v.fold("abc");
+        let scopes = &tree[2];
+        let s = plain(tree.clone());
+        assert!(
+            s.starts_with("claim `sentry` (intercept) (version abc)\n▾ upstreams (3 hosts)\n  de.sentry.io\n  sentry.io\n  us.sentry.io\n▾ scopes (14 scopes)\n  ▸ alerts.read (5 routes)\n  ▸ alerts.write (6 routes)\n"),
+            "plain: each scope its head alone: {s}"
+        );
+        let hint = |name: &str| scopes.children.iter().find(|c| c.label == name).and_then(|c| c.hint.clone());
+        assert_eq!(hint("issues.read").as_deref(), Some("13 routes"));
+        assert_eq!(hint("issues.write").as_deref(), Some("5 routes"));
+        assert_eq!(hint("seer").as_deref(), Some("1 route"));
+        assert_eq!(scopes.children.iter().find(|c| c.label == "seer").unwrap().children.len(), 1);
+        assert!(s.contains("\n▾ never (13 routes, no ask or rule opens them)\n  DELETE /api/0/organizations/{org}/\n"), "{s}");
+        assert_eq!(s.lines().skip_while(|l| !l.starts_with("▾ never")).count(), 14, "plain: every never route: {s}");
+        assert_eq!(tree[3].role, Role::Danger);
+        assert!(!scopes.open && !tree[3].open, "scopes and never fold");
+
+        let mut bare = sentry_json();
+        bare["upstreams"] = json!(["sentry.io"]);
+        bare["scopes"] = json!({});
+        bare["never"] = json!([]);
+        bare.as_object_mut().unwrap().remove("orgs");
+        assert_eq!(plain(view(&bare).fold("v")), "claim `sentry` (intercept) (version v)\nupstreams: sentry.io\nscopes: none\nnever: none\n");
     }
 
     #[test]
@@ -292,10 +333,21 @@ mod tests {
         assert_eq!(d.never.added, ["POST /api/0/organizations/{org}/integrations/"]);
         assert!(d.never.removed.is_empty());
         assert_eq!(d.changed, ["refusal", "scopes.org.read.permissions"]);
-        let text = d.render(&old, &new);
-        assert!(text.starts_with("  upstreams:\n    + eu.sentry.io\n    - de.sentry.io\n  scope debug.read (new):\n"), "{text}");
-        assert!(text.contains("  scope uploads (dropped):\n    - "), "{text}");
-        assert!(text.ends_with("  also changed: refusal, scopes.org.read.permissions\n"), "{text}");
+        let tree = d.fold(&old, &new, "v2", "v1");
+        assert_eq!((tree[1].children[0].role, tree[1].children[1].role), (Role::Added, Role::Removed));
+        let text = plain(tree);
+        assert!(
+            text.starts_with(
+                "claim `sentry` (intercept) (version v2, against approved v1)\n▾ upstreams\n  + eu.sentry.io\n  - de.sentry.io\n\
+                 ▾ scope debug.read (new)\n  + GET /api/0/projects/{org}/{project}/files/dsyms/\n\
+                 ▾ scope org.read\n  + GET /api/0/organizations/{org}/members/\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("\n▾ scope uploads (dropped)\n  - "), "{text}");
+        assert!(!tree_open(&d.fold(&old, &new, "v2", "v1"), "scope uploads"), "a dropped scope folds on a terminal");
+        assert!(text.contains("\n▾ never\n  + POST /api/0/organizations/{org}/integrations/\n"), "{text}");
+        assert!(text.ends_with("\nalso changed: refusal, scopes.org.read.permissions\n"), "{text}");
 
         assert_eq!(diff(&old, &old), Diff::default());
         let mut private = old_json.clone();
