@@ -47,6 +47,34 @@ records a review's tree as `Fold::plain_lines` prints it):
 All treat a cancel as the safe answer (for the method pick: no login). docs/reference/credentials-cli.md
 has what the user sees.
 
+The other commands ask through three helpers in `src/commands/mod.rs`:
+
+- `confirm(prompt)`: Yes (`y`) / No (`n`), No preselected, a cancel is
+  No; `false` without asking when stdin isn't a terminal. `rm`'s branch
+  question (`rm::question`, also asked by the verb client's confirm
+  round, `serve/verbs_client.rs` `run`) and `services::gc`'s `delete
+  shell history …?`.
+- `pick(prompt, options)`: one choice per option, the first
+  preselected, a cancel is a `cancelled` error. The instance ambiguity
+  (`commands::resolve_instance`, the verb client's `Ui::pick`,
+  `serve/machines/cli.rs` `resolve_and_route`), `run`'s sandbox pick and
+  `exec`'s session pick (`exec::choose_session`, also from
+  `serve/machines/cli.rs` `session_exec`).
+- `choose(question, &[(label, hotkey)], default)`: `None` on a cancel;
+  the caller gates on a TTY. `machine.rs`: the key fingerprint
+  (`confirm_key`: the fingerprint line in bold above it, Trust / Refuse),
+  the install (`ensure_devsandbox`: Copy / Don't add it, or Replace /
+  Keep) and `upgrade` (Replace / Keep), each with the second answer
+  preselected and a cancel taken as it.
+
+`serve/verbs_client/identity.rs` `prompt` asks `QUESTION` with
+`choices` (Update `u`, Continue as is `c`, Skip this time `s`; Skip
+preselected and a cancel's answer) through `Ui`'s `ask`, which is
+`ask::select` outside the tests; the listing above it has each file in
+bold (`listing`, styled by `Ui`'s `style`). `machine.rs`'s free-text
+`prompt` (the allowances line) stays a line read, its text styled as a
+`Select` question.
+
 ## Styling
 
 `style::enabled` gates color on stderr: it is a TTY, `NO_COLOR` is

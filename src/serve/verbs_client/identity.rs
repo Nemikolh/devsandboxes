@@ -2,9 +2,9 @@
 //! prompt*): before `run`/`start`/`rebuild` is sent, the target sandbox's
 //! un-acked identity findings (`config.findings`, whatever `call` reaches:
 //! the daemon, a machine through it, or [`local_call`] with no daemon) are
-//! listed, and the user picks `[u]pdate` (`config.migrate`), `[c]ontinue as
-//! is` (`config.ack`; a root user in a TOML config is kept by `config.migrate
-//! {keep}`, which writes `identity = "image"`), or `[s]kip this time`. One
+//! listed, and the user picks Update (`config.migrate`), Continue as is
+//! (`config.ack`; a root user in a TOML config is kept by `config.migrate
+//! {keep}`, which writes `identity = "image"`), or Skip this time. One
 //! prompt covers every root of an `--all`. Nothing here blocks a verb: a
 //! root that can't be read is left out (the verb reports its own errors),
 //! and a failed update is a warning, but for a file changed meanwhile.
@@ -21,12 +21,27 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{Call, CliVerb, Fed, Reply, Ui, reply, routed};
+use crate::ask::{self, Style};
 use crate::serve::api;
 use crate::serve::machines::cli::found_of;
 use crate::serve::machines::{Where, parse_name};
 use crate::serve::proto::Response;
 
-pub(super) const QUESTION: &str = "[u]pdate / [c]ontinue as is (don't ask again) / [s]kip this time: ";
+pub(super) const QUESTION: &str = "Update these to work under identity = \"host\"?";
+
+/// [`QUESTION`]'s answers, in [`CHOICES`]' order.
+pub(super) fn choices() -> Vec<ask::Choice> {
+    vec![
+        ask::Choice::new("Update").hotkey('u'),
+        ask::Choice::new("Continue as is").hotkey('c').hint("don't ask again"),
+        ask::Choice::new("Skip this time").hotkey('s'),
+    ]
+}
+
+const CHOICES: [Choice; 3] = [Choice::Update, Choice::Keep, Choice::Skip];
+
+/// Skip, preselected and a cancel's answer: nothing written.
+const SKIP: usize = 2;
 
 /// One config root to ask about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,14 +165,10 @@ pub(crate) enum Choice {
     Skip,
 }
 
-/// An answer to [`QUESTION`]; `None`: ask again. An empty one (Enter, or
-/// stdin's end) is a skip.
-fn choice(answer: &str) -> Option<Choice> {
-    match answer.trim().to_ascii_lowercase().as_str() {
-        "u" | "update" => Some(Choice::Update),
-        "c" | "continue" => Some(Choice::Keep),
-        "s" | "skip" | "" => Some(Choice::Skip),
-        _ => None,
+fn choice(answer: ask::Answer) -> Choice {
+    match answer {
+        ask::Answer::Picked(i) => CHOICES[i],
+        ask::Answer::Cancelled => CHOICES[SKIP],
     }
 }
 
@@ -171,12 +182,8 @@ pub(super) fn prompt(asks: Vec<Ask>, call: &mut Call, ui: &mut Ui) -> Result<()>
     if groups.is_empty() {
         return Ok(());
     }
-    (ui.say)(&listing(&groups).join("\n"));
-    let choice = loop {
-        if let Some(c) = choice(&(ui.ask)(QUESTION)?) {
-            break c;
-        }
-    };
+    (ui.say)(&listing(&groups, ui.style).join("\n"));
+    let choice = choice((ui.ask)(QUESTION, &choices(), SKIP)?);
     answer(&groups, choice, call, &mut *ui.say)
 }
 
@@ -219,11 +226,14 @@ pub(crate) fn gather(asks: Vec<Ask>, call: &mut Call) -> Vec<Group> {
 }
 
 /// What the prompt shows above [`QUESTION`], a line each: per group, the
-/// file, then its findings indented.
-pub(crate) fn listing(groups: &[Group]) -> Vec<String> {
+/// file (in bold), then its findings indented.
+pub(crate) fn listing(groups: &[Group], style: Style) -> Vec<String> {
     let mut out = Vec::new();
     for g in groups {
-        out.push(format!("{} assumes root in the container, which breaks under identity = \"host\":", g.label()));
+        out.push(format!(
+            "{} assumes root in the container, which breaks under identity = \"host\":",
+            style.heading(&g.label())
+        ));
         for f in &g.findings {
             out.push(format!("  {}", f.line()));
         }
@@ -354,13 +364,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn answers_read_case_blind_and_empty_skips() {
-        assert_eq!(choice("u\n"), Some(Choice::Update));
-        assert_eq!(choice(" Update "), Some(Choice::Update));
-        assert_eq!(choice("C"), Some(Choice::Keep));
-        assert_eq!(choice("s"), Some(Choice::Skip));
-        assert_eq!(choice(""), Some(Choice::Skip), "Enter, or stdin's end");
-        assert_eq!(choice("y"), None);
+    fn answers_map_to_choices_and_a_cancel_skips() {
+        let labels: Vec<String> = choices().into_iter().map(|c| c.label).collect();
+        assert_eq!(labels, ["Update", "Continue as is", "Skip this time"]);
+        assert_eq!(choice(ask::Answer::Picked(0)), Choice::Update);
+        assert_eq!(choice(ask::Answer::Picked(1)), Choice::Keep);
+        assert_eq!(choice(ask::Answer::Picked(SKIP)), Choice::Skip);
+        assert_eq!(choice(ask::Answer::Cancelled), Choice::Skip);
     }
 
     #[test]

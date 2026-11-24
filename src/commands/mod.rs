@@ -33,10 +33,11 @@ pub mod tunnel;
 pub mod update;
 pub mod vscode;
 
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
+use crate::ask::{self, Answer, Choice};
 use crate::runtime::{backend, NAME_PREFIX};
 use crate::state::{Instance, PhaseView, Progress, State};
 
@@ -257,33 +258,32 @@ pub(crate) fn drift_decision(
     config_drift || build_drift
 }
 
-/// Yes/no prompt on stderr; `false` on a non-TTY. Shared by `rm` and `gc`.
+/// Yes / No on stderr, No preselected; a cancel is No. `false` without
+/// asking when stdin isn't a terminal: callers rely on that to never block.
 pub(crate) fn confirm(prompt: &str) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
         return Ok(false);
     }
-    eprint!("{prompt} [y/N] ");
-    std::io::stderr().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+    Ok(choose(prompt, &[("Yes", 'y'), ("No", 'n')], 1)? == Some(0))
 }
 
-/// Numbered menu on stderr; returns the selected index.
+/// One of `options` on stderr, the first preselected; a cancel is an error.
 pub(crate) fn pick(prompt: &str, options: &[&str]) -> Result<usize> {
-    eprintln!("{prompt}:");
-    for (i, option) in options.iter().enumerate() {
-        eprintln!("  {}) {option}", i + 1);
+    let choices: Vec<Choice> = options.iter().map(|o| Choice::new(*o)).collect();
+    match ask::select(prompt, &choices, 0)? {
+        Answer::Picked(i) => Ok(i),
+        Answer::Cancelled => bail!("cancelled"),
     }
-    eprint!("> ");
-    std::io::stderr().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    let choice: usize = answer.trim().parse().context("invalid selection")?;
-    if choice == 0 || choice > options.len() {
-        bail!("selection out of range");
-    }
-    Ok(choice - 1)
+}
+
+/// `question` with `(label, hotkey)` answers, `default` preselected;
+/// `None`: cancelled. Asks whatever stdin is: callers gate on a TTY.
+pub(crate) fn choose(question: &str, choices: &[(&str, char)], default: usize) -> Result<Option<usize>> {
+    let choices: Vec<Choice> = choices.iter().map(|(label, key)| Choice::new(*label).hotkey(*key)).collect();
+    Ok(match ask::select(question, &choices, default)? {
+        Answer::Picked(i) => Some(i),
+        Answer::Cancelled => None,
+    })
 }
 
 #[cfg(test)]

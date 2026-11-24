@@ -29,6 +29,7 @@ use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use crate::ask::Style;
 use crate::render::table;
 use crate::serve::capacity;
 use crate::serve::client::{self, Conn};
@@ -245,8 +246,9 @@ fn confirm_key(target: &str, fingerprint: &str, tty: bool, yes: bool) -> Result<
         }
         Consent::Refuse => bail!("{}", key_refusal(target, fingerprint)),
         Consent::Ask => {
-            eprintln!("{shown}");
-            if is_yes(&prompt("Is that the machine's key (`devsandbox machine key` there)? [y/N] ")?) {
+            eprintln!("{}", Style::detect().heading(&shown));
+            let question = "Is that the machine's key (`devsandbox machine key` there)?";
+            if super::choose(question, &[("Trust", 't'), ("Refuse", 'r')], 1)? == Some(0) {
                 Ok(())
             } else {
                 bail!("{target}'s key not confirmed: nothing added")
@@ -316,7 +318,11 @@ fn ensure_devsandbox(target: &str, auto_install: bool) -> Result<Option<String>>
         Consent::Install => {}
         Consent::Refuse => bail!("{}", refusal(target, found, from.as_deref(), ours)),
         Consent::Ask => {
-            if !is_yes(&prompt(&question(target, found, from.as_deref(), ours))?) {
+            let answers = match found {
+                None => [("Copy", 'c'), ("Don't add it", 'n')],
+                Some(_) => [("Replace", 'r'), ("Keep", 'k')],
+            };
+            if super::choose(&question(target, found, from.as_deref(), ours), &answers, 1)? != Some(0) {
                 if found.is_none() {
                     bail!("no devsandbox on {target}, so it isn't added");
                 }
@@ -378,19 +384,15 @@ fn refusal(target: &str, found: Option<&str>, from: Option<&str>, ours: &str) ->
     }
 }
 
-/// The `[y/N]` question on a TTY.
+/// The install question on a TTY.
 fn question(target: &str, found: Option<&str>, from: Option<&str>, ours: &str) -> String {
     match found {
-        None => format!("devsandbox isn't on {target}'s PATH. Copy this one ({ours}) to {LOCAL_COMMAND} there? [y/N] "),
+        None => format!("devsandbox isn't on {target}'s PATH. Copy this one ({ours}) to {LOCAL_COMMAND} there?"),
         Some(path) => format!(
-            "{target} runs devsandbox {} at {path}. Replace it with this one ({ours})? [y/N] ",
+            "{target} runs devsandbox {} at {path}. Replace it with this one ({ours})?",
             from.unwrap_or("(unknown version)")
         ),
     }
-}
-
-fn is_yes(answer: &str) -> bool {
-    answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
 }
 
 fn platform_mismatch(target: &str, remote: &Remote) -> String {
@@ -463,7 +465,7 @@ pub fn upgrade(name: &str, yes: bool) -> Result<()> {
         Consent::Install => {}
         Consent::Refuse => bail!("{what}: pass --yes to replace it without a TTY to confirm on"),
         Consent::Ask => {
-            if !is_yes(&prompt(&format!("{what}. Replace it? [y/N] "))?) {
+            if super::choose(&format!("{what}. Replace it?"), &[("Replace", 'r'), ("Keep", 'k')], 1)? != Some(0) {
                 bail!("nothing changed on {name}");
             }
         }
@@ -1034,8 +1036,10 @@ fn cells(r: MachineRow) -> [String; 7] {
     ]
 }
 
+/// A line read after `? text`, styled like the select widget's question.
 fn prompt(text: &str) -> Result<String> {
-    eprint!("{text}");
+    let style = Style::detect();
+    eprint!("{} {} ", style.accent("?"), style.heading(text.trim_end()));
     std::io::stderr().flush()?;
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
@@ -1148,12 +1152,6 @@ mod tests {
         assert_eq!(consent(false, false), Consent::Refuse);
         assert_eq!(consent(true, true), Consent::Install);
         assert_eq!(consent(false, true), Consent::Install);
-        for yes in ["y", "Y", "yes", "YES"] {
-            assert!(is_yes(yes), "{yes}");
-        }
-        for no in ["", "n", "no", "yep", "y es"] {
-            assert!(!is_yes(no), "{no}");
-        }
     }
 
     #[test]
@@ -1172,15 +1170,15 @@ mod tests {
         );
         assert_eq!(
             question("box", None, None, "1.0.0"),
-            "devsandbox isn't on box's PATH. Copy this one (1.0.0) to ~/.local/bin/devsandbox there? [y/N] "
+            "devsandbox isn't on box's PATH. Copy this one (1.0.0) to ~/.local/bin/devsandbox there?"
         );
         assert_eq!(
             question("box", Some("/b/devsandbox"), Some("0.9.0"), "1.0.0"),
-            "box runs devsandbox 0.9.0 at /b/devsandbox. Replace it with this one (1.0.0)? [y/N] "
+            "box runs devsandbox 0.9.0 at /b/devsandbox. Replace it with this one (1.0.0)?"
         );
         assert_eq!(
             question("box", Some("/b/devsandbox"), None, "1.0.0"),
-            "box runs devsandbox (unknown version) at /b/devsandbox. Replace it with this one (1.0.0)? [y/N] "
+            "box runs devsandbox (unknown version) at /b/devsandbox. Replace it with this one (1.0.0)?"
         );
         let mismatch = Remote { os: "FreeBSD".into(), arch: "riscv64".into(), path: None, off_path: false, version: None, hello: None, sha256: None };
         let why = platform_mismatch("box", &mismatch);

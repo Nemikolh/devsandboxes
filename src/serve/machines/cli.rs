@@ -300,7 +300,7 @@ pub(crate) fn labels(found: &[Found]) -> Vec<String> {
         .collect()
 }
 
-/// A numbered pick among options; the chosen index.
+/// A pick among options; the chosen index.
 pub(crate) type Pick<'a> = dyn FnMut(&str, &[String]) -> Result<usize> + 'a;
 
 /// One match among `found`: `None` when there's none; several pick on a TTY

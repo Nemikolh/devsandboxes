@@ -133,7 +133,7 @@ impl App {
             self.status = None;
         }
         let question = "update these to work under identity = \"host\"?".to_string();
-        let body = identity::listing(&groups);
+        let body = identity::listing(&groups, crate::ask::Style::plain());
         self.modal = Modal::Confirm(ConfirmModal::new(question, body, Confirmed::IdentityOffer(groups)));
     }
 

@@ -129,19 +129,22 @@ for `--all`, every root of the machine for `--all --machine`), it calls
 machine's) and keeps the un-acked findings of those sandboxes
 (`verbs_client::identity::prompt`). If any, on a TTY and not under `run
 --json`, one prompt lists each one's edit line (or "fix by hand") per
-config file and asks `[u]pdate / [c]ontinue as is (don't ask again) /
-[s]kip this time` (Enter skips):
+config file (the file in bold) and asks `Update these to work under
+identity = "host"?` with Update (`u`), Continue as is (`c`, "don't ask
+again") and Skip this time (`s`), Skip preselected and a cancel's answer
+(`identity::choices`, through `Ui`'s `ask`, `ask::select` outside the
+tests):
 
-- `u`: `config.migrate {root, ids, fileHash}` with the findings that have
+- Update: `config.migrate {root, ids, fileHash}` with the findings that have
   an edit, then `updated devsandboxes.toml (N edits); now drifted: a, b →
   devsandbox rebuild <name>`. A `conflict` (the file changed meanwhile)
   stops the verb, to be re-run; `unsupported` (YAML) prints the edits to
   make by hand; any other error is a `warning:`. A file none of whose
   findings has an edit gets `<file>: nothing to update automatically;
   fix the entries above by hand` instead, and no `config.migrate`;
-- `c`: `config.ack`, but a root user in a TOML config, which
+- Continue as is: `config.ack`, but a root user in a TOML config, which
   `config.migrate {keep}` keeps in the file as `identity = "image"`;
-- `s`: nothing.
+- Skip this time: nothing.
 
 The verb is then sent, on the config as it now is. Nothing here blocks a
 verb otherwise: a root whose findings can't be read is left out. The

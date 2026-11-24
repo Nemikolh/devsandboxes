@@ -198,14 +198,9 @@ pub(crate) fn run(dir: &Path, verb: CliVerb, fed: &Fed) -> Result<Done> {
             crate::commands::pick(prompt, &refs)
         },
         offer_example: &mut || crate::commands::run::offer_example_config(&root),
-        ask: &mut |question| {
-            eprint!("{question}");
-            std::io::stderr().flush()?;
-            let mut answer = String::new();
-            std::io::stdin().read_line(&mut answer)?;
-            Ok(answer)
-        },
+        ask: &mut |question, choices, default| crate::ask::select(question, choices, default),
         say: &mut |text| eprintln!("{text}"),
+        style: crate::ask::Style::detect(),
     };
     let mut conn = match endpoint::socket_dir().and_then(|socket| client::connect(&socket, "cli")) {
         Ok(conn) => conn,
@@ -318,6 +313,8 @@ pub(crate) fn caller_env(vars: impl IntoIterator<Item = (OsString, OsString)>) -
     vars.into_iter().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect()
 }
 
+type AskFn<'a> = dyn FnMut(&str, &[crate::ask::Choice], usize) -> Result<crate::ask::Answer> + 'a;
+
 /// The prompts, injectable for the tests.
 struct Ui<'a> {
     /// stdin is a TTY: prompts may ask.
@@ -327,15 +324,16 @@ struct Ui<'a> {
     /// would show it (colour, docker build's progress). Not for `run
     /// --json`, whose stdout is the record.
     term: Option<TtySize>,
-    /// A numbered pick among `options`; the chosen index.
+    /// A pick among `options`; the chosen index.
     pick: &'a mut dyn FnMut(&str, &[String]) -> Result<usize>,
     /// `run` on a config without sandboxes (`offer_example_config`).
     offer_example: &'a mut dyn FnMut() -> Result<()>,
-    /// The identity prompt's question: shown, then a line read (empty at
-    /// stdin's end).
-    ask: &'a mut dyn FnMut(&str) -> Result<String>,
+    /// The identity prompt's question: `choices`, `default` preselected.
+    ask: &'a mut AskFn<'a>,
     /// A line for the user (stderr).
     say: &'a mut dyn FnMut(&str),
+    /// The identity listing's styling.
+    style: crate::ask::Style,
     /// This host has a container runtime (`runtime::installed`): `run`'s
     /// pick offers its rows ([`choose_sandbox`]).
     runs_here: bool,
@@ -1525,11 +1523,18 @@ mod tests {
                 *offered.borrow_mut() = true;
                 Ok(())
             },
-            ask: &mut |question| {
+            // `reply` is a hotkey; empty picks the default.
+            ask: &mut |question, choices, default| {
                 said.borrow_mut().push(format!("? {question}"));
-                Ok(reply.unwrap_or_else(|| panic!("asked: {question}")).to_string())
+                let reply = reply.unwrap_or_else(|| panic!("asked: {question}")).trim().to_ascii_lowercase();
+                let at = match reply.chars().next() {
+                    None => default,
+                    Some(c) => choices.iter().position(|ch| ch.key == Some(c)).unwrap_or_else(|| panic!("no choice `{c}`")),
+                };
+                Ok(crate::ask::Answer::Picked(at))
             },
             say: &mut |text| said.borrow_mut().push(text.to_string()),
+            style: crate::ask::Style::plain(),
         };
         let env = BTreeMap::from([("A".to_string(), "1".to_string())]);
         let prep = prepare(verb, Path::new("/cfg"), env, fed, &mut call, &mut ui);

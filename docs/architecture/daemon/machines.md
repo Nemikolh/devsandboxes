@@ -798,8 +798,9 @@ to the probe. Otherwise, a machine whose `uname` fails
 it has no devsandbox, and is left as it is when it has another version
 (the daemon's version warning still applies). A devsandbox found only
 through the `~/.local/bin` fallback (`off_path`) makes the machine's
-`command` `LOCAL_COMMAND`, installed over or not. Then `consent`: `--auto-install` installs, a TTY asks `[y/N]` on
-stderr, no TTY is an error pointing at `--auto-install` (`refusal`).
+`command` `LOCAL_COMMAND`, installed over or not. Then `consent`: `--auto-install` installs, a TTY asks on stderr
+(`commands::choose`: Copy / Don't add it for a missing devsandbox,
+Replace / Keep for another version, the second preselected), no TTY is an error pointing at `--auto-install` (`refusal`).
 Declined, a missing devsandbox is an error and nothing is added; another
 version carries on as it is. `install::install` copies `exe::devsandbox()`
 there and a second `install::check` decides (`rechecked`): `devsandbox` on
@@ -813,9 +814,10 @@ login `PATH` resolves, an error naming what it resolves to. That
 
 `add` then always calls `machines.probe` (the remote's version and its
 `member.get`'s `key`, `fingerprint`, `trust` and `allow`). It prints `<target>'s key
-fingerprint is SHA256:…` on stderr and has it confirmed (`confirm_key`,
-over `consent`): `--yes` takes it, a TTY asks `[y/N]` (to compare with
-`devsandbox machine key` run there), no TTY without `--yes` is an error
+fingerprint is SHA256:…` on stderr (bold on a terminal) and has it
+confirmed (`confirm_key`, over `consent`): `--yes` takes it, a TTY asks
+Trust / Refuse, Refuse preselected (to compare with `devsandbox machine
+key` run there), no TTY without `--yes` is an error
 naming the fingerprint and the flag (`key_refusal`). The confirmed key
 goes to `machines.add` as `key`. `add` picks no config roots: a
 machine's are the ones its own daemon lists (its `roots.list`), and a
@@ -993,8 +995,8 @@ another semver. It asks `machines.get` for the machine's `target` and
 since the copy is over ssh), then `install::check` of that `command`
 (always named, so no `~/.local/bin` fallback) and
 `install::decide_upgrade`. Same build and bytes: it prints `<name> already runs
-devsandbox <build>`. Otherwise `consent` over `--yes` (`[y/N]` on a
-TTY, an error off one without it), `install::install` over the found
+devsandbox <build>`. Otherwise `consent` over `--yes` (Replace / Keep, Keep
+preselected, on a TTY; an error off one without it), `install::install` over the found
 path, a second `install::check` that must now say this build and its sha256, then
 `install::handoff` (the daemon there hands off to the copy) and
 `machines.cycle` (this host's link to the machine ends and redials at
