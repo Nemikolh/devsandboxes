@@ -185,7 +185,9 @@ edit and a focused terminal take modified keys as their own.
   question still apply); on an in-flight row it asks to cancel the build
   (`instances.cancel`) instead.
 - `o`: VS Code (`spawn_code`, reading `state.toml` locally); refused for
-  a machine's row.
+  a machine's row. A launch refused for credential claims comes back as
+  `OpDone::LeakRefused` and opens a yes/no modal (`App::code_refused`),
+  a yes resending it allowed ([ssh-agent.md](../helper/ssh-agent.md)).
 - `P`: switch the instance's profile within its sandbox row's
   `profiles` (`remote::instance_sandbox`: a machine's row its machine's
   sandbox row; `actions.rs` `profile_switch`): with two allowed, the

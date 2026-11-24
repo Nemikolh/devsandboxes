@@ -456,11 +456,19 @@ is frozen: no new work on it.
   request, is git-gateway step 5). A destination key's forwarding hops
   aren't checked, only the login's own bind; an agent certificate isn't
   matched by its underlying key; ecdsa nistp521, `ssh-rsa` (SHA-1),
-  certificate and security-key host keys can't bind. The dashboard's `o`
-  refuses an instance with a claim and has no override (only
-  `devsandbox vscode --allow-credential-leak`).
+  certificate and security-key host keys can't bind.
   → [ssh-agent](architecture/helper/ssh-agent.md#key-filtering);
-  `devsbd::agent_filter::Filter`, `commands::vscode::leak_refusal`
+  `devsbd::agent_filter::Filter`
+- VS Code on an instance with a claim: the `code` env overrides miss a
+  window already open on the same folder (reused with its old env),
+  windows VS Code restores or reopens itself, and the Docker credential
+  helper, gpg and a copied gitconfig. A VS Code that wasn't running
+  starts with the overrides, so its later local windows have no agent or
+  git credential helper until it restarts. The running-windows check is
+  Linux only: elsewhere such an instance always needs
+  `--allow-credential-leak` (or a yes in the dashboard).
+  → [ssh-agent](architecture/helper/ssh-agent.md#key-filtering);
+  `commands::vscode::leak_overrides`, `commands::vscode::leak_refusal`
 - `access.pending` and `access.decide` take local clients only, and
   `login` and `access approve <credential>|ls|revoke` are local commands
   with no `credentials.*` API methods, so no approver answers from

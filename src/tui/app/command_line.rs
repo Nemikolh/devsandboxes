@@ -24,7 +24,9 @@ fn resolve_action(s: &crate::snapshot::Snapshot, action: PromptAction, services:
             PromptAction::Run { sandbox: resolve(s, &sandbox, Kind::Sandbox)?, name, branch, base, place }
         }
         PromptAction::Exec { instance, argv } => PromptAction::Exec { instance: inst(instance)?, argv },
-        PromptAction::Code { instance, goto } => PromptAction::Code { instance: inst(instance)?, goto },
+        PromptAction::Code { instance, goto, allow_credential_leak } => {
+            PromptAction::Code { instance: inst(instance)?, goto, allow_credential_leak }
+        }
         PromptAction::Rename { instance, new_name } => PromptAction::Rename { instance: inst(instance)?, new_name },
         PromptAction::Profile { instance, profile } => PromptAction::Profile { instance: inst(instance)?, profile },
         PromptAction::Rm { instance, force, delete_branch } => PromptAction::Rm { instance: inst(instance)?, force, delete_branch },

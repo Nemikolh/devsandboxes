@@ -34,8 +34,10 @@ pub enum PromptAction {
     Run { sandbox: String, name: Option<String>, branch: Option<String>, base: Option<String>, place: bool },
     Exec { instance: String, argv: Vec<String> },
     /// `goto`: also open a file at a line in the window (`--goto`, an Inbox
-    /// `vscode` action's path/line/col).
-    Code { instance: String, goto: Option<Goto> },
+    /// `vscode` action's path/line/col). `allow_credential_leak`: open an
+    /// instance with a credential claim anyway (`--allow-credential-leak`,
+    /// a yes to the leak modal).
+    Code { instance: String, goto: Option<Goto>, allow_credential_leak: bool },
     Rename { instance: String, new_name: String },
     /// `profile <instance> <profile>` (and `P`): `instances.setProfile`, a
     /// one-shot call on the daemon worker, no suspend.
@@ -415,6 +417,7 @@ fn parse_line(line: &str) -> Result<PromptAction, String> {
         "code" => Ok(PromptAction::Code {
             instance: args.positionals.remove(0),
             goto: args.value("--goto").map(Goto::parse).transpose()?,
+            allow_credential_leak: args.flag("--allow-credential-leak"),
         }),
         "rm" => Ok(PromptAction::Rm {
             instance: args.positionals.remove(0),
@@ -692,13 +695,18 @@ mod tests {
 
     #[test]
     fn parse_code_and_rm() {
-        assert_eq!(parse_line("code box"), Ok(PromptAction::Code { instance: "box".into(), goto: None }));
+        assert_eq!(parse_line("code box"), Ok(PromptAction::Code { instance: "box".into(), goto: None, allow_credential_leak: false }));
         assert_eq!(
             parse_line("code box --goto src/a.rs:3:4"),
             Ok(PromptAction::Code {
                 instance: "box".into(),
                 goto: Some(Goto { path: "src/a.rs".into(), line: Some(3), col: Some(4) }),
+                allow_credential_leak: false,
             })
+        );
+        assert_eq!(
+            parse_line("code --allow-credential-leak box"),
+            Ok(PromptAction::Code { instance: "box".into(), goto: None, allow_credential_leak: true })
         );
         assert!(parse_line("code box --goto ../x").is_err());
         assert_eq!(parse_line("rm box"), Ok(PromptAction::Rm { instance: "box".into(), force: false, delete_branch: None }));

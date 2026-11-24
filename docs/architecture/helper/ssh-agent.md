@@ -161,10 +161,40 @@ The filter sits where the relay ends, on the instance's host: a remote
 instance's agent arrives there over `AGENT` streams and is filtered by
 that host's bridge, against that host's `known_hosts` and config.
 
-VS Code's attach brings its own credential helper, agent and askpass, so
-`devsandbox vscode` refuses an instance with any credential claim unless
-`--allow-credential-leak` (then warns), and the dashboard's `o` refuses it
-(`commands::vscode::leak_refusal`).
+VS Code's attach brings its own credential helper, agent and askpass:
+Dev Containers forwards the agent at its local extension host's
+`SSH_AUTH_SOCK`, and its credential helper runs the host's `git
+credential` with the extension host's env. For an instance with any
+credential claim, `commands::vscode::launch` spawns `code` with
+`commands::vscode::leak_overrides`: `SSH_AUTH_SOCK=/nonexistent`, a
+`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` entry setting
+`credential.helper` empty (which resets every configured helper) and
+`GIT_ASKPASS=/bin/false`. These are set, not unset: a window's env is
+VS Code's own overlaid with the `code` CLI's, on macOS too (`open
+--env`).
+
+An override only reaches extension hosts VS Code starts after it, and a
+running VS Code reuses its windows, so the launch first checks the ones
+already running (`commands::vscode::ext_hosts_safety`, Linux only): the
+current user's processes whose `/proc/<pid>/environ` holds
+`VSCODE_ESM_ENTRYPOINT=vs/workbench/api/node/extensionHostProcess`, each
+needing every override (`verdict`). None running, or all carrying them:
+the instance opens with no question. Otherwise, and always off Linux
+where nothing is checked, `devsandbox vscode` refuses it unless
+`--allow-credential-leak` (then warns), saying on Linux that another
+VS Code window is running with the user's logins
+(`commands::vscode::leak_refusal`). The dashboard's `o` and `:code` get
+the refusal as `commands::vscode::LeakRefused` and ask whether to open
+anyway (`App::code_refused`), a yes resending the launch allowed;
+`:code --allow-credential-leak` skips the question. The overrides apply
+in every case, allowed included.
+
+What they don't cover: a window already open on the same folder, reused
+with its own env; windows VS Code restores or reopens by itself; the
+Docker credential helper, gpg and a copied gitconfig. When VS Code
+wasn't running, its main process starts with the overrides, so its later
+local windows have no agent or git credential helper until VS Code
+restarts.
 
 ## What works where
 

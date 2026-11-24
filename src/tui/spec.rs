@@ -73,8 +73,11 @@ pub const SPECS: &[CommandSpec] = &[
     CommandSpec {
         name: "code",
         aliases: &[],
-        usage: "code <instance> [--goto path[:line[:col]]]",
-        flags: &[FlagSpec { name: "--goto", value: Some(ArgValue::Free) }],
+        usage: "code <instance> [--goto path[:line[:col]]] [--allow-credential-leak]",
+        flags: &[
+            FlagSpec { name: "--goto", value: Some(ArgValue::Free) },
+            FlagSpec { name: "--allow-credential-leak", value: None },
+        ],
         positionals: &[ArgValue::Instance],
         trailing: false,
     },
@@ -292,7 +295,13 @@ mod tests {
     fn parse_code_and_rm() {
         assert_eq!(parse("code box").unwrap().positionals, vec!["box".to_string()]);
         assert_eq!(parse("rm box").unwrap().positionals, vec!["box".to_string()]);
-        assert_eq!(parse("code"), Err("usage: code <instance> [--goto path[:line[:col]]]".into()));
+        assert_eq!(
+            parse("code"),
+            Err("usage: code <instance> [--goto path[:line[:col]]] [--allow-credential-leak]".into())
+        );
+        assert!(!parse("code box").unwrap().flag("--allow-credential-leak"));
+        assert!(parse("code box --allow-credential-leak").unwrap().flag("--allow-credential-leak"));
+        assert!(parse("code --allow-credential-leak box").unwrap().flag("--allow-credential-leak"));
         assert_eq!(parse("code a b"), Err("unexpected argument `b`".into()));
         assert_eq!(parse("rm"), Err("usage: rm [--force] <instance>".into()));
         assert!(!parse("rm box").unwrap().flag("--force"));

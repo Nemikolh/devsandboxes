@@ -24,6 +24,7 @@
 
 ### Fixed
 
+- **VS Code no longer hands a claimed sandbox your logins when it can avoid it.** `devsandbox vscode` and the dashboard's `o` start `code` without your ssh-agent or git credential helper for an instance with a credential claim, and open it without asking when no other VS Code window could leak them (checked on Linux). Otherwise the dashboard now asks before opening, and `:code` takes `--allow-credential-leak` like the CLI.
 - **A misspelled top-level table is an error**: `[sandboxx.web]` used to load
   as an empty config with no warning; now `devsandbox` names the unknown
   table, as it already did for unknown keys inside a sandbox.

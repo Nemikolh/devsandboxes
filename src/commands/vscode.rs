@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 use super::resolve_instance;
 use crate::config::Config;
@@ -167,22 +168,130 @@ pub fn goto_in(container: &str, workspace: &str, goto: &Goto) -> GotoOutcome {
 
 /// CLI entry point: open VS Code attached to the instance `name` resolves to
 /// (same as `o` in the dashboard), at `goto` when given. An instance with
-/// a credential claim opens only with `allow_credential_leak`, warned.
+/// a credential claim opens only when no VS Code window can leak
+/// ([`launch`]), else only with `allow_credential_leak`, warned.
 pub fn vscode(dir: &Path, name: &str, goto: Option<&Goto>, allow_credential_leak: bool) -> Result<()> {
     let state = State::load()?;
     let key = resolve_instance(&state, name)?;
     let info = &state.instances[&key];
-    if allow_credential_leak && let Some(why) = credential_leak(&key, &info.claims) {
+    if allow_credential_leak
+        && let Some(why) = credential_leak(&key, &info.claims)
+        && ext_hosts_safety() != Safety::Safe
+    {
         eprintln!("warning: {why}");
     }
     println!("{}", launch(dir, &key, info, goto, allow_credential_leak)?);
     Ok(())
 }
 
-/// [`launch`]'s refusal of an instance with `claims`, unless `allowed`.
-fn leak_refusal(instance: &str, claims: &[InstanceClaim], allowed: bool) -> Option<String> {
-    let why = credential_leak(instance, claims).filter(|_| !allowed)?;
-    Some(format!("{why}; `devsandbox vscode --allow-credential-leak {instance}` opens it anyway"))
+/// [`launch`]'s refusal of an instance with a credential claim: the
+/// dashboard tells it from other errors to offer the open anyway.
+#[derive(Debug)]
+pub struct LeakRefused {
+    pub message: String,
+    /// A running extension host lacks [`leak_overrides`] (else unverified).
+    pub exposed: bool,
+}
+
+impl fmt::Display for LeakRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LeakRefused {}
+
+/// [`launch`]'s refusal of an instance with `claims`, unless `allowed` or
+/// the running extension hosts are `safety`-checked safe.
+fn leak_refusal(instance: &str, claims: &[InstanceClaim], allowed: bool, safety: Safety) -> Option<String> {
+    let why = credential_leak(instance, claims).filter(|_| !allowed && safety != Safety::Safe)?;
+    let anyway = format!("`devsandbox vscode --allow-credential-leak {instance}` opens it anyway");
+    Some(match safety {
+        Safety::Exposed => format!(
+            "{why}; another VS Code window is running with your logins (its window would be reused): close VS Code first, or {anyway}"
+        ),
+        _ => format!("{why}; {anyway}"),
+    })
+}
+
+/// The env `code` gets for an instance with a claim, cutting what Dev
+/// Containers hands an attached container: it forwards the agent at the
+/// local extension host's `SSH_AUTH_SOCK` (any non-empty value; empty or
+/// unset isn't enough, since a window's env is VS Code's own overlaid with
+/// the CLI's), and its git credential helper runs host `git credential`
+/// with the extension host's env, where the `GIT_CONFIG_*` entry resets
+/// every configured helper and `GIT_ASKPASS` stops an inherited prompt.
+pub fn leak_overrides() -> [(&'static str, &'static str); 5] {
+    [
+        ("SSH_AUTH_SOCK", "/nonexistent"),
+        ("GIT_CONFIG_COUNT", "1"),
+        ("GIT_CONFIG_KEY_0", "credential.helper"),
+        ("GIT_CONFIG_VALUE_0", ""),
+        ("GIT_ASKPASS", "/bin/false"),
+    ]
+}
+
+/// Whether the local VS Code extension hosts already running would leak
+/// to a new attach: `code` reuses a running VS Code, whose windows'
+/// extension hosts keep the env they started with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Safety {
+    /// None running, or every one started with [`leak_overrides`].
+    Safe,
+    /// One started without them.
+    Exposed,
+    /// Not checkable on this platform.
+    Unverified,
+}
+
+/// The local extension hosts' marker in their environ.
+const EXT_HOST_ENTRYPOINT: (&str, &str) = ("VSCODE_ESM_ENTRYPOINT", "vs/workbench/api/node/extensionHostProcess");
+
+/// [`Safety`] over the environs of this user's processes.
+fn verdict<'a>(environs: impl IntoIterator<Item = &'a HashMap<String, String>>) -> Safety {
+    let (key, value) = EXT_HOST_ENTRYPOINT;
+    let exposed = environs
+        .into_iter()
+        .filter(|env| env.get(key).is_some_and(|v| v == value))
+        .any(|env| leak_overrides().iter().any(|(k, v)| env.get(*k).is_none_or(|got| got != v)));
+    if exposed { Safety::Exposed } else { Safety::Safe }
+}
+
+/// One `/proc/<pid>/environ`: NUL-separated `KEY=VALUE`s, non-UTF-8 lossy.
+fn parse_environ(bytes: &[u8]) -> HashMap<String, String> {
+    bytes
+        .split(|&b| b == 0)
+        .filter_map(|entry| {
+            let entry = String::from_utf8_lossy(entry);
+            let (k, v) = entry.split_once('=')?;
+            Some((k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// [`verdict`] over the current uid's processes; unreadable ones (gone,
+/// another user's) are skipped.
+#[cfg(target_os = "linux")]
+fn ext_hosts_safety() -> Safety {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Safety::Unverified;
+    };
+    let environs: Vec<HashMap<String, String>> = entries
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit())))
+        .filter(|e| e.metadata().is_ok_and(|m| m.uid() == uid))
+        .filter_map(|e| std::fs::read(e.path().join("environ")).ok())
+        .map(|bytes| parse_environ(&bytes))
+        .collect();
+    verdict(&environs)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ext_hosts_safety() -> Safety {
+    Safety::Unverified
 }
 
 /// Why attaching VS Code to an instance with `claims` hands the sandbox
@@ -208,8 +317,9 @@ fn credential_leak(instance: &str, claims: &[InstanceClaim]) -> Option<String> {
 /// <abs>[:line[:col]] [--wait SECS]`*): the host `code` always runs first,
 /// since it opens or focuses the window the in-container CLI needs. Blocks up
 /// to [`GOTO_TIMEOUT`] then. Returns a one-line status. Shared with the TUI's
-/// `o` so both open identically; an instance with a credential claim is
-/// refused unless `allow_credential_leak`.
+/// `o` so both open identically. An instance with a credential claim gets
+/// `code` with [`leak_overrides`], and is refused ([`LeakRefused`]) unless
+/// the running extension hosts check safe or `allow_credential_leak`.
 pub fn launch(
     dir: &Path,
     instance: &str,
@@ -217,8 +327,10 @@ pub fn launch(
     goto: Option<&Goto>,
     allow_credential_leak: bool,
 ) -> Result<String> {
-    if let Some(why) = leak_refusal(instance, &info.claims, allow_credential_leak) {
-        bail!("{why}");
+    let leaks = credential_leak(instance, &info.claims).is_some();
+    let safety = if leaks { ext_hosts_safety() } else { Safety::Safe };
+    if let Some(message) = leak_refusal(instance, &info.claims, allow_credential_leak, safety) {
+        return Err(LeakRefused { message, exposed: safety == Safety::Exposed }.into());
     }
     // Extensions come from the resolved sandbox, read from the instance's own
     // config root: state is global, so `dir` (the cwd by default) may be
@@ -265,8 +377,11 @@ pub fn launch(
     let uri = format!("vscode-remote://{authority}/{path}");
     // Detached and silent: the dashboard calls this while it owns the
     // terminal, so `code`'s own chatter must not land on the screen.
-    std::process::Command::new("code")
-        .args([flag, &uri])
+    let mut code = std::process::Command::new("code");
+    if leaks {
+        code.envs(leak_overrides());
+    }
+    code.args([flag, &uri])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -402,7 +517,7 @@ mod tests {
     #[test]
     fn an_instance_with_claims_needs_the_leak_flag() {
         assert_eq!(credential_leak("repo", &[]), None);
-        assert_eq!(leak_refusal("repo", &[], false), None);
+        assert_eq!(leak_refusal("repo", &[], false, Safety::Unverified), None);
         let claims = vec![InstanceClaim {
             kind: "github".into(),
             feature: "./gh".into(),
@@ -415,9 +530,42 @@ mod tests {
         }];
         let why = credential_leak("repo", &claims).unwrap();
         assert!(why.contains("(github)") && why.contains("ssh-agent"), "{why}");
-        let refused = leak_refusal("repo", &claims, false).unwrap();
+        let refused = leak_refusal("repo", &claims, false, Safety::Unverified).unwrap();
         assert!(refused.contains("--allow-credential-leak repo"), "{refused}");
-        assert_eq!(leak_refusal("repo", &claims, true), None);
+        assert!(!refused.contains("another VS Code window"), "{refused}");
+        let refused = leak_refusal("repo", &claims, false, Safety::Exposed).unwrap();
+        assert!(refused.contains("another VS Code window") && refused.contains("--allow-credential-leak repo"), "{refused}");
+        assert_eq!(leak_refusal("repo", &claims, true, Safety::Exposed), None);
+        assert_eq!(leak_refusal("repo", &claims, false, Safety::Safe), None);
+        assert_eq!(leak_refusal("repo", &[], false, Safety::Exposed), None);
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn environ_parses_nul_separated_pairs() {
+        let parsed = parse_environ(b"A=1\0B=x=y\0EMPTY=\0junk\0");
+        assert_eq!(parsed, env(&[("A", "1"), ("B", "x=y"), ("EMPTY", "")]));
+    }
+
+    #[test]
+    fn only_ext_hosts_without_the_overrides_are_exposed() {
+        let host = [EXT_HOST_ENTRYPOINT];
+        let bare_host = env(&host);
+        let mut covered: Vec<(&str, &str)> = host.to_vec();
+        covered.extend(leak_overrides());
+        let covered = env(&covered);
+        let mut agent_only = covered.clone();
+        agent_only.insert("SSH_AUTH_SOCK".into(), "/run/agent.sock".into());
+        let other = env(&[("SSH_AUTH_SOCK", "/run/agent.sock")]);
+
+        assert_eq!(verdict([]), Safety::Safe);
+        assert_eq!(verdict([&other]), Safety::Safe);
+        assert_eq!(verdict([&covered, &other]), Safety::Safe);
+        assert_eq!(verdict([&covered, &bare_host]), Safety::Exposed);
+        assert_eq!(verdict([&agent_only]), Safety::Exposed);
     }
 
     #[test]

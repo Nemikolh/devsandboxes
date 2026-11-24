@@ -2,6 +2,7 @@
 //! forward) and the pending-request queue `tui::mod` drains onto background
 //! threads.
 
+use crate::commands::vscode::Goto;
 use crate::snapshot::{InstanceRow, PhaseRow};
 use crate::tui::data::ContainerStatus;
 use crate::tui::prompt::PromptAction;
@@ -202,7 +203,22 @@ impl App {
             self.status = Some(not_yet_code(m, &row.name));
             return;
         }
-        self.pending_action = Some(PromptAction::Code { instance: row.name.clone(), goto: None });
+        self.pending_action = Some(PromptAction::Code { instance: row.name.clone(), goto: None, allow_credential_leak: false });
+    }
+
+    /// The event loop's VS Code launch for `instance` was refused for its
+    /// credential claims: ask whether to open it anyway. `exposed`: a
+    /// running VS Code window lacks the overrides (else unverifiable here).
+    pub fn code_refused(&mut self, instance: String, goto: Option<Goto>, note: Option<String>, exposed: bool) {
+        let question = format!(
+            "`{instance}` has credential claims: VS Code's attach gives it your host's git logins and ssh-agent. Open anyway?"
+        );
+        let body = if exposed {
+            vec!["another VS Code window is running with your logins: close VS Code first to open it safely".into()]
+        } else {
+            Vec::new()
+        };
+        self.modal = Modal::Confirm(ConfirmModal::new(question, body, Confirmed::CodeLeak { instance, goto, note }));
     }
 
     /// `s` (Instances tab): stop the running instance under the cursor, or
@@ -529,7 +545,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('o')));
         assert_eq!(
             app.take_pending_action(),
-            Some(PromptAction::Code { instance: "inst0".into(), goto: None }),
+            Some(PromptAction::Code { instance: "inst0".into(), goto: None, allow_credential_leak: false }),
         );
     }
 
@@ -542,7 +558,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('o')));
         assert_eq!(
             app.take_pending_action(),
-            Some(PromptAction::Code { instance: "orphan0".into(), goto: None }),
+            Some(PromptAction::Code { instance: "orphan0".into(), goto: None, allow_credential_leak: false }),
         );
     }
 
@@ -552,6 +568,44 @@ mod tests {
         app.set_snapshot(snapshot_with(1)); // cursor on Sandbox(0)
         app.on_key(key(KeyCode::Char('o')));
         assert_eq!(app.take_pending_action(), None);
+    }
+
+    #[test]
+    fn a_leak_refused_code_asks_and_y_resends_it_allowed() {
+        let mut app = new_app();
+        app.set_snapshot(snapshot_with(1));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char('o')));
+        assert_eq!(
+            app.take_pending_action(),
+            Some(PromptAction::Code { instance: "inst0".into(), goto: None, allow_credential_leak: false }),
+        );
+        let goto = super::Goto::parse("a.rs:3").unwrap();
+        app.code_refused("inst0".into(), Some(goto.clone()), Some("note".into()), true);
+        let Modal::Confirm(view) = &app.modal else { panic!("no modal") };
+        assert!(view.question.starts_with("`inst0` has credential claims"), "{}", view.question);
+        assert_eq!(view.body.len(), 1);
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(
+            app.take_pending_action(),
+            Some(PromptAction::Code { instance: "inst0".into(), goto: Some(goto), allow_credential_leak: true }),
+        );
+        assert_eq!(app.code_note.take().as_deref(), Some("note"));
+    }
+
+    #[test]
+    fn a_leak_refused_code_declined_queues_nothing() {
+        for answer in [KeyCode::Char('n'), KeyCode::Esc] {
+            let mut app = new_app();
+            app.code_refused("inst0".into(), None, Some("note".into()), false);
+            let Modal::Confirm(view) = &app.modal else { panic!("no modal") };
+            assert!(view.body.is_empty());
+            app.on_key(key(answer));
+            assert!(matches!(app.modal, Modal::None), "{answer:?}");
+            assert_eq!(app.take_pending_action(), None, "{answer:?}");
+            assert_eq!(app.code_note, None, "{answer:?}");
+        }
     }
 
     #[test]

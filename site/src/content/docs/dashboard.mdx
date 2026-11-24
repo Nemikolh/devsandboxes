@@ -68,7 +68,7 @@ Each sandbox is listed with its instances under it. Repeat instances show their 
 
 ## VS Code
 
-`o` or `devsandbox vscode web-2` opens VS Code attached to the instance, with the sandbox's extensions. It needs the Dev Containers extension and `code` on your `PATH`. An instance with a credential claim doesn't open: VS Code's attach hands it your host's git logins and whole ssh-agent. `devsandbox vscode --allow-credential-leak web-2` opens it anyway.
+`o` or `devsandbox vscode web-2` opens VS Code attached to the instance, with the sandbox's extensions. It needs the Dev Containers extension and `code` on your `PATH`. VS Code's attach hands a container your host's git logins and whole ssh-agent, so for an instance with a credential claim devsandbox launches `code` with the agent and git's credential helpers switched off. That only reaches windows VS Code opens afterwards: on Linux, if a VS Code window is already running without them, the instance doesn't open (elsewhere it never opens unasked, since that can't be checked). Close VS Code first, answer `y` to the dashboard's question, or pass `--allow-credential-leak` (`devsandbox vscode --allow-credential-leak web-2`, `:code web-2 --allow-credential-leak`). Not covered: a window already open on the same folder (reused as it is), windows VS Code restores itself, the Docker credential helper, gpg, or a copied gitconfig. If VS Code wasn't running, it starts with the agent and git helpers off, so your other local windows lack them until you restart VS Code.
 
 <Try>`↓` `o` to open it on `web-2`.</Try>
 

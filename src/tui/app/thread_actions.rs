@@ -102,7 +102,7 @@ impl App {
         match verb {
             Deferred::Code { goto, note } => {
                 self.code_note = note;
-                self.pending_action = Some(PromptAction::Code { instance: name.to_string(), goto });
+                self.pending_action = Some(PromptAction::Code { instance: name.to_string(), goto, allow_credential_leak: false });
             }
             Deferred::Terminal => self.open_instance_terminal(name),
             Deferred::Forward(req) => self.request_port(req),
@@ -449,12 +449,12 @@ mod tests {
         let goto = Goto { path: "src/a.rs".into(), line: Some(3), col: Some(5) };
         assert_eq!(
             app.pending_action.take(),
-            Some(PromptAction::Code { instance: "inst1".into(), goto: Some(goto) })
+            Some(PromptAction::Code { instance: "inst1".into(), goto: Some(goto), allow_credential_leak: false })
         );
         assert_eq!(app.code_note, None);
 
         app.on_key(key(KeyCode::Char('4')));
-        assert_eq!(app.pending_action.take(), Some(PromptAction::Code { instance: "inst1".into(), goto: None }));
+        assert_eq!(app.pending_action.take(), Some(PromptAction::Code { instance: "inst1".into(), goto: None, allow_credential_leak: false }));
         assert_eq!(app.code_note.take().as_deref(), Some("--goto dropped (goto column needs a line)"));
 
         app.on_key(key(KeyCode::Char('2')));
@@ -462,12 +462,12 @@ mod tests {
 
         // No path: nothing to say about it.
         app.on_key(key(KeyCode::Char('3')));
-        assert_eq!(app.pending_action.take(), Some(PromptAction::Code { instance: "inst1".into(), goto: None }));
+        assert_eq!(app.pending_action.take(), Some(PromptAction::Code { instance: "inst1".into(), goto: None, allow_credential_leak: false }));
         assert_eq!(app.code_note, None);
 
         // Fixed `o`: the same target, no goto.
         app.on_key(key(KeyCode::Char('o')));
-        assert_eq!(app.pending_action.take(), Some(PromptAction::Code { instance: "inst1".into(), goto: None }));
+        assert_eq!(app.pending_action.take(), Some(PromptAction::Code { instance: "inst1".into(), goto: None, allow_credential_leak: false }));
         assert_eq!(app.inbox.focus, InboxFocus::Thread);
     }
 
@@ -595,7 +595,7 @@ mod tests {
         // Running with no phase: the verb runs, once.
         snapshot_up(&mut app, 1, None);
         let goto = Goto { path: "a.rs".into(), line: Some(2), col: None };
-        assert_eq!(app.pending_action.take(), Some(PromptAction::Code { instance: "inst1".into(), goto: Some(goto) }));
+        assert_eq!(app.pending_action.take(), Some(PromptAction::Code { instance: "inst1".into(), goto: Some(goto), allow_credential_leak: false }));
         assert_eq!(app.after_start, None, "run once");
         snapshot_up(&mut app, 1, None);
         assert_eq!(app.pending_action, None);
@@ -696,7 +696,7 @@ mod tests {
         assert_eq!(take_start(&mut app).as_deref(), Some("inst0"));
         answer_start(&mut app, "inst0", false);
         snapshot_up(&mut app, 0, None);
-        assert_eq!(app.pending_action.take(), Some(PromptAction::Code { instance: "inst0".into(), goto: None }));
+        assert_eq!(app.pending_action.take(), Some(PromptAction::Code { instance: "inst0".into(), goto: None, allow_credential_leak: false }));
     }
 
     #[test]

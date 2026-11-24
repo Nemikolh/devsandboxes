@@ -9,6 +9,7 @@ use ratatui::text::Line;
 
 use crate::broker::asks::Answer;
 use crate::build_log::Tail;
+use crate::commands::vscode::Goto;
 use crate::config::SandboxText;
 use crate::snapshot::PhaseRow;
 use crate::tui::data::{ContainerStatus, InstanceRow, Node};
@@ -143,7 +144,7 @@ Logs, build log and this help
 Command prompt (:)
   run <sandbox> [--name n] [--branch b] [--base ref]
   exec <instance> <cmd…>
-  code <instance> [--goto path[:line[:col]]]
+  code <instance> [--goto path[:line[:col]]] [--allow-credential-leak]
   rm <instance>   rename <instance> <new-name>
   profile <instance> <profile>
   stop <instance>   start <instance>
@@ -349,7 +350,7 @@ impl ConfirmModal {
     /// The help bar's keys for this question.
     pub fn keys_hint(&self) -> &'static str {
         match self.action {
-            Confirmed::CancelBuild(_) => "y/enter yes · n/esc no",
+            Confirmed::CancelBuild(_) | Confirmed::CodeLeak { .. } => "y/enter yes · n/esc no",
             Confirmed::RmBranch { .. } => "y/enter yes · n no · esc cancel",
             Confirmed::Identity { .. } => "u update · c continue as is · s/esc skip",
             Confirmed::IdentityOffer(_) => "u update · c continue as is · l/esc later",
@@ -363,7 +364,7 @@ impl ConfirmModal {
     /// The choices line the modal shows under the question.
     pub fn choices(&self) -> &'static str {
         match self.action {
-            Confirmed::CancelBuild(_) | Confirmed::RmBranch { .. } => "[y] yes  [n] no",
+            Confirmed::CancelBuild(_) | Confirmed::RmBranch { .. } | Confirmed::CodeLeak { .. } => "[y] yes  [n] no",
             Confirmed::Identity { .. } => "[u] update  [c] continue as is (don't ask again)  [s] skip this time",
             Confirmed::IdentityOffer(_) => "[u] update  [c] continue as is  [l] later",
             Confirmed::Profile { .. } => "[enter] switch  [esc] cancel",
@@ -407,6 +408,10 @@ pub(super) enum Confirmed {
     Attach { instance: String, sessions: Vec<(String, String)>, cursor: usize },
     /// Permission request `id`; a `presence` one is never answered always.
     Access { id: String, presence: bool },
+    /// The VS Code launch refused for `instance`'s credential claims: a
+    /// yes resends it allowed, with its `goto` and `note`
+    /// ([`App::code_note`]).
+    CodeLeak { instance: String, goto: Option<Goto>, note: Option<String> },
 }
 
 /// The session picker's body: one `session ls` line per session (it says
@@ -793,6 +798,11 @@ impl App {
                     (Confirmed::RmBranch { instance, .. }, None) => {
                         self.status = Some(format!("rm {instance}: cancelled"));
                     }
+                    (Confirmed::CodeLeak { instance, goto, note }, Some(true)) => {
+                        self.code_note = note;
+                        self.pending_action = Some(PromptAction::Code { instance, goto, allow_credential_leak: true });
+                    }
+                    (Confirmed::CodeLeak { .. }, _) => {}
                     (
                         Confirmed::Identity { .. }
                         | Confirmed::IdentityOffer(_)

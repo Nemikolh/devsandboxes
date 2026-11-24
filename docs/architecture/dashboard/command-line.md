@@ -103,7 +103,9 @@ The event loop takes `App::pending_action`
   stdio, then waits for a key ([terminal.md](terminal.md) for the
   in-dashboard terminal instead).
 - `code`: VS Code launch on a background thread (`spawn_code`); refused
-  for a machine's instance.
+  for a machine's instance. A refusal for credential claims asks as
+  `o`'s does ([tabs-and-actions.md](tabs-and-actions.md));
+  `--allow-credential-leak` opens without asking.
 - `rename`: `instances.rename` on the daemon worker's connection.
 - `profile`: `instances.setProfile` the same way (`Cmd::SetProfile`, with
   `machine` for a machine's instance), its answer a status line

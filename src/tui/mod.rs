@@ -311,9 +311,9 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
                     let (machine, name) = remote::split(&instance);
                     app.status = Some(app::not_yet_code(machine.unwrap_or_default(), name));
                 }
-                PromptAction::Code { instance, goto } => {
+                PromptAction::Code { instance, goto, allow_credential_leak } => {
                     app.status = Some("opening VS Code…".into());
-                    codes.push(spawn_code(dir.clone(), instance, goto, app.code_note.take()));
+                    codes.push(spawn_code(dir.clone(), instance, goto, app.code_note.take(), allow_credential_leak));
                 }
                 // `instances.rename`, no suspend; the answer is a status line
                 // (`DaemonUpdate::Renamed`), the renamed row comes with a push.
@@ -477,8 +477,13 @@ fn run(terminal: &mut Term, mut app: App) -> Result<()> {
         }
 
         codes.retain_mut(|rx| match rx.try_recv() {
-            Ok(done) => {
-                app.status = Some(done.status);
+            Ok(OpDone::Status(status)) => {
+                app.status = Some(status);
+                false
+            }
+            Ok(OpDone::LeakRefused { instance, goto, note, exposed }) => {
+                app.status = None;
+                app.code_refused(instance, goto, note, exposed);
                 false
             }
             Err(TryRecvError::Empty) => true,
@@ -591,31 +596,51 @@ fn wait_for_key() {
 }
 
 /// Launch VS Code attached to `instance` (a snapshot row name, which equals
-/// the state instance key), at `goto` when given. Returns a one-line status
-/// for the help-bar.
-fn launch_code(dir: &Path, instance: &str, goto: Option<&Goto>) -> String {
+/// the state instance key), at `goto` when given. `Ok`: a one-line status
+/// for the help-bar; `Err`: the launch's refusal for credential claims.
+fn launch_code(
+    dir: &Path,
+    instance: &str,
+    goto: Option<&Goto>,
+    allow_credential_leak: bool,
+) -> Result<String, commands::vscode::LeakRefused> {
     let state = match crate::state::State::load() {
         Ok(s) => s,
-        Err(e) => return format!("code: {e:#}"),
+        Err(e) => return Ok(format!("code: {e:#}")),
     };
     let Some(info) = state.instances.get(instance) else {
-        return format!("code: unknown instance `{instance}`");
+        return Ok(format!("code: unknown instance `{instance}`"));
     };
-    commands::vscode::launch(dir, instance, info, goto, false).unwrap_or_else(|e| format!("{e:#}"))
+    match commands::vscode::launch(dir, instance, info, goto, allow_credential_leak) {
+        Ok(status) => Ok(status),
+        Err(e) => match e.downcast::<commands::vscode::LeakRefused>() {
+            Ok(refused) => Err(refused),
+            Err(e) => Ok(format!("{e:#}")),
+        },
+    }
 }
 
 /// Spawn a detached thread running [`launch_code`] (a goto blocks while the
 /// helper waits for the window) and reporting its status, with `note` (the
-/// Inbox action's caveats, [`App::code_note`]) appended.
-fn spawn_code(dir: PathBuf, instance: String, goto: Option<Goto>, note: Option<String>) -> Receiver<OpDone> {
+/// Inbox action's caveats, [`App::code_note`]) appended; a refusal for
+/// credential claims carries the launch back for the dashboard to offer.
+fn spawn_code(
+    dir: PathBuf,
+    instance: String,
+    goto: Option<Goto>,
+    note: Option<String>,
+    allow_credential_leak: bool,
+) -> Receiver<OpDone> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let outcome = launch_code(&dir, &instance, goto.as_ref());
-        let status = match note {
-            Some(note) => format!("{outcome} · {note}"),
-            None => outcome,
+        let done = match launch_code(&dir, &instance, goto.as_ref(), allow_credential_leak) {
+            Ok(outcome) => OpDone::Status(match note {
+                Some(note) => format!("{outcome} · {note}"),
+                None => outcome,
+            }),
+            Err(refused) => OpDone::LeakRefused { instance, goto, note, exposed: refused.exposed },
         };
-        let _ = tx.send(OpDone { status });
+        let _ = tx.send(done);
     });
     rx
 }
@@ -974,9 +999,11 @@ fn copy_on_host(text: &[u8]) {
 }
 
 /// Result of a background VS Code launch, drained by the event loop.
-struct OpDone {
+enum OpDone {
     /// One-line outcome for the help-bar status.
-    status: String,
+    Status(String),
+    /// Refused for the instance's credential claims ([`App::code_refused`]).
+    LeakRefused { instance: String, goto: Option<Goto>, note: Option<String>, exposed: bool },
 }
 
 
