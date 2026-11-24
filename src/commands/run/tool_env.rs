@@ -150,15 +150,21 @@ pub(super) fn tool_env(
 /// the wrapper on a root plan), or off with why and that the knobs are set
 /// ([`tool_env`]'s rule).
 pub(crate) fn summary(root_plan: bool, sandbox: Option<&BrowserSandbox>) -> String {
-    let why = match (root_plan, sandbox) {
-        (false, Some(BrowserSandbox::On)) => return "browser sandbox: on".into(),
-        (true, Some(BrowserSandbox::On)) => {
-            return format!("browser sandbox: on (through {})", crate::devsbd::BROWSER_WRAPPER);
-        }
-        (_, Some(BrowserSandbox::Off(why))) => why.as_str(),
-        (_, None) => "unknown: the userns check didn't run",
-    };
-    format!("browser sandbox: off ({why}); sandbox-off knobs set")
+    match sandbox {
+        Some(on @ BrowserSandbox::On) => format!("browser sandbox: {}", label(root_plan, on)),
+        Some(off) => format!("browser sandbox: {}; sandbox-off knobs set", label(root_plan, off)),
+        None => "browser sandbox: off (unknown: the userns check didn't run); sandbox-off knobs set".into(),
+    }
+}
+
+/// [`summary`]'s state alone (`on`, `on (through …)`, `off (<why>)`), what
+/// the dashboard's Detail panel shows.
+pub(crate) fn label(root_plan: bool, sandbox: &BrowserSandbox) -> String {
+    match (root_plan, sandbox) {
+        (false, BrowserSandbox::On) => "on".into(),
+        (true, BrowserSandbox::On) => format!("on (through {})", crate::devsbd::BROWSER_WRAPPER),
+        (_, BrowserSandbox::Off(why)) => format!("off ({why})"),
+    }
 }
 
 #[cfg(test)]
@@ -317,6 +323,8 @@ mod tests {
             summary(false, None),
             "browser sandbox: off (unknown: the userns check didn't run); sandbox-off knobs set"
         );
+        assert_eq!(label(false, &BrowserSandbox::On), "on");
+        assert_eq!(label(true, &BrowserSandbox::Off("seccomp".into())), "off (seccomp)");
     }
 
     #[test]

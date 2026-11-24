@@ -78,7 +78,7 @@ pub(crate) fn fetch_trusted_origin(state: &Path, repo: &Path, refs: Refs) -> Res
     let url = match trust {
         Trust::Fetch(url) | Trust::Pin(url) => url,
         Trust::Mismatch { pinned, current } => {
-            eprintln!("{}", mismatch_warning(repo, &pinned, &current));
+            super::notes::noted!("{}", mismatch_warning(repo, &pinned, &current));
             return Ok(Fetched::Untrusted);
         }
     };

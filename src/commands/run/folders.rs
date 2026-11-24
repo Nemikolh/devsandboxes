@@ -40,7 +40,7 @@ pub(super) fn mount_folders(
         let context = || format!("`folders` entry `{}` ({})", entry.target, host.display());
         if let Some(fm) = reusable(prior, &entry.target, host, entry.mode) {
             if let Some(wt) = fm.worktree.as_deref().filter(|wt| !wt.exists()) {
-                eprintln!("warning: worktree `{}` is missing; recreating it", wt.display());
+                super::notes::noted!("warning: worktree `{}` is missing; recreating it", wt.display());
                 super::check_repo(host).with_context(context)?;
                 // Its record is locked: `add` won't take the path otherwise.
                 unlock_worktree(host, wt);

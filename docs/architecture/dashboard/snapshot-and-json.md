@@ -25,8 +25,10 @@ state and `Snapshot.error` says why.
   `missing`, `unknown` before the runtime was asked), uptime, cpu/mem as
   the runtime's preformatted strings, folders, services, `drift`,
   `instance_id`, `dispatcher`, `done`, `profile` (absent when none),
-  `profile_disallowed`, `phase` (`PhaseRow`, absent once ready), `root`,
-  `machine`.
+  `profile_disallowed`, `browser_sandbox` (`tool_env::label` of the
+  recorded check, `null` when unknown), `github_repos`, `build_notes`
+  (`Instance::build_notes`), `phase` (`PhaseRow`, absent once ready),
+  `root`, `machine`.
 - `SandboxRow`: every configured sandbox, resolved or not (source `?`):
   source, folder, services, `extends`, config/build hashes, `issues`,
   `identity`, `dispatcher`, `worktree_branch`, `profiles`, `root`,

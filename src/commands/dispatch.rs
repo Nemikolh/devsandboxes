@@ -1701,6 +1701,7 @@ folder = "."
             claims: Vec::new(),
             progress: None,
             github_repos: Vec::new(),
+            build_notes: Vec::new(),
             git_env: Default::default(),
             created_unix: 0,
         }

@@ -242,7 +242,7 @@ pub(super) fn write_workspace_file(
     match backend().run_checked(&["exec", container, sh, "-c", &script, "sh", &json, &path]) {
         Ok(()) => Some(path),
         Err(e) => {
-            eprintln!("warning: cannot write {path} in `{container}`: {e:#}");
+            super::notes::noted!("warning: cannot write {path} in `{container}`: {e:#}");
             None
         }
     }

@@ -54,6 +54,12 @@ export interface InstanceRow {
   profile?: string;
   /** `profile` is one its sandbox no longer allows (the config changed since); `false` when the sandbox doesn't resolve. */
   profile_disallowed: boolean;
+  /** Whether Chromium's sandbox works for its exec user: `on`, `on (through …)` or `off (<why>)`; `null` when unknown (no helper, or not checked yet). */
+  browser_sandbox: string | null;
+  /** The `owner/repo`s of its GitHub fence recorded from its folders' remotes (the config's `access.github.repos` aside). */
+  github_repos: string[];
+  /** What its last `run`, `rebuild` or `start` printed worth keeping (identity, browser sandbox, GitHub fence, `warning:`/`note:` lines), a failed one's included. */
+  build_notes: string[];
   /** Still being created, or failed; absent once ready. Shown instead of `status` while set. */
   phase?: PhaseRow;
   /** The config root it was made from; `null` for instances older than that record. */

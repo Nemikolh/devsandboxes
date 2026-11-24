@@ -54,23 +54,34 @@ impl Tracker {
         self.record(|i| i.progress = Some(progress))
     }
 
-    /// Done: the instance is ready. Unless cancelled meanwhile: a Ctrl-C'd
+    /// Done: the instance is ready, with the notes this thread's capture
+    /// collected (`super::notes`). Unless cancelled meanwhile: a Ctrl-C'd
     /// `docker exec` may still exit 0, so the last step's success proves
     /// nothing.
     pub(crate) fn finish(&self) -> Result<()> {
         super::cancel::check()?;
-        self.record(|i| i.progress = None)
+        let notes = super::notes::collected();
+        self.record(|i| {
+            i.progress = None;
+            i.build_notes = notes;
+        })
     }
 
-    /// Mark the record `failed` at the current phase with `error`. Best
-    /// effort: the caller is already returning `error`, which must win.
+    /// Mark the record `failed` at the current phase with `error`, and the
+    /// notes collected so far, as [`Tracker::finish`]. Best effort: the
+    /// caller is already returning `error`, which must win.
     pub(crate) fn fail(&self, error: &anyhow::Error) {
         let progress = Progress {
             phase: Phase::Failed { at: self.phase.label().to_string() },
             error: Some(format!("{error:#}")),
             ..self.progress()
         };
-        if let Err(e) = self.record(|i| i.progress = Some(progress)) {
+        let notes = super::notes::collected();
+        let recorded = self.record(|i| {
+            i.progress = Some(progress);
+            i.build_notes = notes;
+        });
+        if let Err(e) = recorded {
             eprintln!("warning: cannot record the failure in state: {e:#}");
         }
     }

@@ -119,6 +119,8 @@ fn rebuild_instance(
 ) -> Result<()> {
     let instance_id = state.instances.get(key).expect("key came from state").instance_id.clone();
     let log = crate::build_log::open(&instance_id);
+    // One per instance under `--all`; recorded by `Tracker::finish`/`fail`.
+    let _notes = run::notes::Capture::start();
     log.outcome(recreate(dir, config, sandbox, key, reprobe, state))
 }
 
@@ -268,6 +270,7 @@ mod tests {
             claims: Vec::new(),
             progress: None,
             github_repos: Vec::new(),
+            build_notes: Vec::new(),
             git_env: Default::default(),
             created_unix: 0,
         }

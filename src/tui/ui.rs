@@ -1843,7 +1843,9 @@ fn draw_instances(frame: &mut Frame, app: &App, area: Rect) {
             }
             _ => None,
         };
-        let lines = detail_lines(Some(snapshot), selected, agent_count, sessions, &app.machines);
+        // `fit_detail` only changes the height: this is the width it draws at.
+        let width = usize::from(detail_area.width.saturating_sub(2));
+        let lines = detail_lines(Some(snapshot), selected, agent_count, sessions, &app.machines, width);
         let (top, detail_area) = fit_detail(top, detail_area, terms_area, lines.len());
         let table_area = draw_status_lines(frame, Some(snapshot), top);
         draw_tree(frame, app, snapshot, &nodes, table_area, panel_focused);
@@ -2250,13 +2252,15 @@ fn status_style(status: &ContainerStatus) -> Style {
 /// The Detail panel's lines for the selected tree node: sandbox summary for
 /// sandbox / empty nodes, the existing instance detail for instances, and a
 /// hint for the orphan group. Empty when nothing is selected. Built before the
-/// layout so the panel can be sized to them ([`fit_detail`]).
+/// layout so the panel can be sized to them ([`fit_detail`]), laid out for
+/// the panel's inner `width`.
 fn detail_lines<'a>(
     snapshot: Option<&'a Snapshot>,
     node: Option<Node>,
     agent_count: Option<usize>,
     sessions: Option<crate::tui::procs::SessionCount>,
     machines: &[crate::serve::snapshots::SnapshotMachine],
+    width: usize,
 ) -> Vec<Line<'a>> {
     match (snapshot, node) {
         (Some(s), Some(Node::Sandbox(i))) | (Some(s), Some(Node::Empty(i))) => {
@@ -2269,7 +2273,7 @@ fn detail_lines<'a>(
         | (Some(s), Some(Node::Proc { instance: i, .. })) => match s.instances.get(i) {
             Some(r) => {
                 let mut lines = machine_detail(machines, r.machine.as_deref());
-                lines.extend(instance_detail(r, agent_count, sessions));
+                lines.extend(instance_detail(r, agent_count, sessions, width));
                 lines
             }
             None => Vec::new(),
@@ -2342,10 +2346,14 @@ fn machine_detail(machines: &[crate::serve::snapshots::SnapshotMachine], machine
     vec![Line::from(Span::styled(text, Style::default().fg(Color::Red)))]
 }
 
+/// An instance's Detail at inner `width`: the failed line first, its
+/// `key: value` pairs ([`detail_columns`]), then the drift line and its
+/// build notes ([`build_note_lines`]), full width.
 fn instance_detail(
     r: &InstanceRow,
     agent_count: Option<usize>,
     sessions: Option<crate::tui::procs::SessionCount>,
+    width: usize,
 ) -> Vec<Line<'_>> {
     let mut lines: Vec<Line> = Vec::new();
     // First, so the panel's few rows never clip it: what failed and why.
@@ -2356,27 +2364,110 @@ fn instance_detail(
             Style::default().fg(Color::Red),
         )));
     }
-    lines.extend([
+    let mut pairs = vec![
         kv("container", &r.container),
         kv("workspace", &r.workspace),
         kv("remoteUser", r.remote_user.as_deref().unwrap_or("-")),
         kv("remoteEnv", &r.remote_env_len.to_string()),
         agents_line(r, agent_count),
-    ]);
-    lines.extend(sessions_line(r, sessions));
-    lines.extend(profile_detail_line(r));
+    ];
+    pairs.extend(sessions_line(r, sessions));
+    pairs.extend(profile_detail_line(r));
     if r.worktree {
-        lines.push(kv2("base", &r.base_folder, "worktree", &r.folder));
+        pairs.push(kv("base", &r.base_folder));
+        pairs.push(kv("worktree", &r.folder));
     } else {
-        lines.push(kv("base folder", &r.base_folder));
+        pairs.push(kv("base folder", &r.base_folder));
     }
+    pairs.push(kv("browser sandbox", r.browser_sandbox.as_deref().unwrap_or("-")));
+    let fence = if r.github_repos.is_empty() { "-".to_string() } else { r.github_repos.join(", ") };
+    pairs.push(kv("github fence", &fence));
+    lines.extend(detail_columns(pairs, width));
     if r.drift {
         lines.push(Line::from(Span::styled(
             "drift: config or dockerfile changed since the container was created",
             Style::default().fg(Color::Yellow),
         )));
     }
+    lines.extend(build_note_lines(&r.build_notes, width));
     lines
+}
+
+/// Spaces between the Detail panel's two columns.
+const DETAIL_GAP: usize = 3;
+
+/// `pairs` in two columns (top to bottom, then left to right), each as wide
+/// as its widest pair, when both fit in `width`: nothing is cut, so a long
+/// path makes it one column, one pair per line.
+fn detail_columns(mut pairs: Vec<Line<'_>>, width: usize) -> Vec<Line<'_>> {
+    let right = pairs.split_off(pairs.len().div_ceil(2));
+    let widest = |lines: &[Line]| lines.iter().map(Line::width).max().unwrap_or(0);
+    let left_width = widest(&pairs);
+    if right.is_empty() || left_width + DETAIL_GAP + widest(&right) > width {
+        pairs.extend(right);
+        return pairs;
+    }
+    let mut right = right.into_iter();
+    pairs
+        .into_iter()
+        .map(|left| {
+            let Some(r) = right.next() else { return left };
+            let pad = " ".repeat(left_width - left.width() + DETAIL_GAP);
+            let mut spans = left.spans;
+            spans.push(Span::raw(pad));
+            spans.extend(r.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Rows one build note may take in the Detail panel; the last is cut with `…`.
+const NOTE_ROWS: usize = 3;
+
+/// An instance's build notes, each wrapped to `width` ([`wrap_note`]):
+/// warnings yellow, the rest dim. The browser sandbox's own line is left out:
+/// its pair says it.
+fn build_note_lines(notes: &[String], width: usize) -> Vec<Line<'static>> {
+    notes
+        .iter()
+        .filter(|n| !n.starts_with("browser sandbox: "))
+        .flat_map(|note| {
+            let style = if note.starts_with("warning:") {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().add_modifier(Modifier::DIM)
+            };
+            wrap_note(&note.replace('\n', " "), width, NOTE_ROWS)
+                .into_iter()
+                .map(move |row| Line::from(Span::styled(row, style)))
+        })
+        .collect()
+}
+
+/// `text` in rows of at most `width` chars, broken at spaces where it can,
+/// rows after the first indented two; past `max_rows` the last row is cut
+/// with `…`.
+fn wrap_note(text: &str, width: usize, max_rows: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut rest = text.trim();
+    while !rest.is_empty() {
+        let indent = if rows.is_empty() { "" } else { "  " };
+        let room = width.saturating_sub(indent.len()).max(1);
+        let end = rest.char_indices().nth(room).map_or(rest.len(), |(i, _)| i);
+        if end < rest.len() && rows.len() + 1 >= max_rows {
+            let cut = rest.char_indices().nth(room - 1).map_or(rest.len(), |(i, _)| i);
+            rows.push(format!("{indent}{}…", rest[..cut].trim_end()));
+            break;
+        }
+        let split = if end == rest.len() || rest[end..].starts_with(' ') {
+            end
+        } else {
+            rest[..end].rfind(' ').filter(|&i| i > 0).unwrap_or(end)
+        };
+        rows.push(format!("{indent}{}", &rest[..split]));
+        rest = rest[split..].trim_start();
+    }
+    rows
 }
 
 /// The `agents:` Detail line for an instance. A stopped/missing container shows
@@ -2424,17 +2515,6 @@ fn kv<'a>(key: &'a str, value: &str) -> Line<'a> {
     Line::from(vec![
         Span::styled(format!("{key}: "), Style::default().add_modifier(Modifier::DIM)),
         Span::raw(value.to_string()),
-    ])
-}
-
-/// Two `key: value` pairs on one line (base folder vs worktree).
-fn kv2<'a>(k1: &'a str, v1: &str, k2: &'a str, v2: &str) -> Line<'a> {
-    Line::from(vec![
-        Span::styled(format!("{k1}: "), Style::default().add_modifier(Modifier::DIM)),
-        Span::raw(v1.to_string()),
-        Span::raw("   "),
-        Span::styled(format!("{k2}: "), Style::default().add_modifier(Modifier::DIM)),
-        Span::raw(v2.to_string()),
     ])
 }
 
@@ -3189,6 +3269,7 @@ mod tests {
                 done: false,
                 profile: None,
                 profile_disallowed: false,
+                browser_sandbox: None, github_repos: Vec::new(), build_notes: Vec::new(),
                 phase,
                 root: None,
                 mesh_root: None,
@@ -3306,6 +3387,82 @@ mod tests {
         assert_eq!(tiny.height, 9, "never below the usual height");
         let terms = Some(Rect::new(40, 15, 40, 15));
         assert_eq!(fit_detail(top, detail, terms, 40), (top, detail), "a terminal open: as laid out");
+    }
+
+    /// Wide, the pairs take two columns; narrow (or a pair too long for its
+    /// column), one. The new pairs show, `-` when unknown or empty.
+    #[test]
+    fn detail_pairs_take_two_columns_when_they_fit() {
+        let mut app = phase_app(vec![("web", running(), None)]);
+        let mut s = app.snapshot.clone().unwrap();
+        s.instances[0].browser_sandbox = Some("off (seccomp)".into());
+        s.instances[0].github_repos = vec!["a/b".into(), "c/d".into()];
+        app.set_snapshot(s);
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        let screen = render(&app, 140, 30);
+        let row = screen.lines().find(|l| l.contains("container: devsandbox-web")).unwrap();
+        assert!(row.contains("   agents: "), "{screen}");
+        assert!(screen.lines().any(|l| l.contains("remoteEnv: 0") && l.contains("github fence: a/b, c/d")), "{screen}");
+        assert!(screen.contains("browser sandbox: off (seccomp)"), "{screen}");
+
+        let r = &app.snapshot.as_ref().unwrap().instances[0];
+        let text = |l: &Line| l.spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        let wide = instance_detail(r, None, None, 138);
+        assert_eq!(wide.len(), 4, "8 pairs in 2 columns");
+        let narrow = instance_detail(r, None, None, 40);
+        assert_eq!(narrow.len(), 8, "one per line");
+        assert_eq!(text(&narrow[0]), "container: devsandbox-web");
+
+        let mut bare = r.clone();
+        bare.browser_sandbox = None;
+        bare.github_repos.clear();
+        bare.worktree = true;
+        let lines: Vec<String> = instance_detail(&bare, None, None, 40).iter().map(text).collect();
+        assert!(lines.contains(&"browser sandbox: -".to_string()), "{lines:?}");
+        assert!(lines.contains(&"github fence: -".to_string()), "{lines:?}");
+        assert!(lines.contains(&"base: /f".to_string()) && lines.contains(&"worktree: /f".to_string()), "{lines:?}");
+    }
+
+    /// Build notes follow drift, full width: warnings yellow, the rest dim,
+    /// the browser sandbox line left to its pair; the panel grows to show
+    /// them all.
+    #[test]
+    fn build_notes_show_last_and_the_panel_grows() {
+        let mut app = phase_app(vec![("web", running(), None)]);
+        let mut s = app.snapshot.clone().unwrap();
+        s.instances[0].drift = true;
+        s.instances[0].build_notes = vec![
+            "identity: host (uid 1000)".into(),
+            "browser sandbox: on".into(),
+            "warning: one".into(),
+            "warning: two".into(),
+            "note: three".into(),
+            "warning: four".into(),
+            "warning: last one".into(),
+        ];
+        app.set_snapshot(s);
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        let screen = render(&app, 140, 30);
+        assert!(screen.contains("warning: last one"), "unclipped: {screen}");
+        assert!(!screen.lines().any(|l| l.contains("browser sandbox: on")), "{screen}");
+
+        let r = &app.snapshot.as_ref().unwrap().instances[0];
+        let lines = instance_detail(r, None, None, 138);
+        let text = |l: &Line| l.spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        let at = |needle: &str| lines.iter().position(|l| text(l) == needle).unwrap();
+        assert!(at("identity: host (uid 1000)") > lines.iter().position(|l| text(l).starts_with("drift:")).unwrap());
+        assert_eq!(lines[at("warning: one")].spans[0].style, Style::default().fg(Color::Yellow));
+        assert_eq!(lines[at("note: three")].spans[0].style, Style::default().add_modifier(Modifier::DIM));
+        assert_eq!(lines.len(), 4 + 1 + 6);
+    }
+
+    #[test]
+    fn notes_wrap_at_spaces_and_cut_past_their_rows() {
+        assert_eq!(wrap_note("short", 20, 3), ["short"]);
+        assert_eq!(wrap_note("aaa bbb ccc", 7, 3), ["aaa bbb", "  ccc"]);
+        assert_eq!(wrap_note("aaaaaaaa", 4, 3), ["aaaa", "  aa", "  aa"]);
+        assert_eq!(wrap_note("aaaaaaaaaa", 4, 3), ["aaaa", "  aa", "  a\u{2026}"]);
+        assert_eq!(wrap_note("one two three four five", 9, 2), ["one two", "  three\u{2026}"]);
     }
 
     /// A profile follows the name in the tree (dim, yellow when no longer

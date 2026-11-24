@@ -28,6 +28,8 @@
   devsandbox ps -a
   ```
 
+- **The dashboard's Detail panel keeps what a build said.** An instance's warnings and notes from its last `run`, `rebuild` or `start` (the identity summary, the GitHub fence, every `warning:`) stay on it and show under its details, next to whether the browser sandbox is on and its GitHub fence. The details lay out in two columns when they fit.
+
 ### Fixed
 
 - **VS Code no longer hands a claimed sandbox your logins when it can avoid it.** `devsandbox vscode` and the dashboard's `o` start `code` without your ssh-agent or git credential helper for an instance with a credential claim, and open it without asking when no other VS Code window could leak them (checked on Linux). Otherwise the dashboard now asks before opening, and `:code` takes `--allow-credential-leak` like the CLI.

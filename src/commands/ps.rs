@@ -153,6 +153,7 @@ mod tests {
             done: false,
             profile: None,
             profile_disallowed: false,
+            browser_sandbox: None, github_repos: Vec::new(), build_notes: Vec::new(),
             phase: None,
             root: None,
             mesh_root: None,

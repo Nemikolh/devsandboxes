@@ -50,9 +50,9 @@ pub(crate) fn plan_for(
         }
     }
     plan.seccomp = seccomp.is_some();
-    eprintln!("identity: {}", plan.summary());
+    super::notes::line(format_args!("identity: {}", plan.summary()));
     for line in lines {
-        eprintln!("{line}");
+        super::notes::line(line);
     }
     (plan, seccomp)
 }
@@ -255,7 +255,7 @@ pub(super) fn apply(argv: &[String]) -> Result<String> {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let (home, warnings) = apply_outcome(out.status.success(), &stdout, &stderr)?;
     for warning in warnings {
-        eprintln!("{warning}");
+        super::notes::line(warning);
     }
     Ok(home)
 }

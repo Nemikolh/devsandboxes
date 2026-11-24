@@ -27,7 +27,7 @@ pub(crate) fn folder_key(folder: &Path) -> String {
 pub(crate) fn record(folders: &[&Path]) -> Result<Vec<String>> {
     let (fence, lines) = record_at(&State::path()?, folders, Instance::now(), &mut fence::ssh_hostname)?;
     for line in lines {
-        eprintln!("{line}");
+        super::notes::line(line);
     }
     Ok(fence)
 }
@@ -133,7 +133,7 @@ pub(crate) fn instance_folders(inst: &Instance) -> impl Iterator<Item = &Path> {
 /// mounted before records existed waits for a `run` or `rebuild`.
 pub(crate) fn refresh(key: &str) {
     if let Err(e) = State::path().and_then(|p| refresh_at(&p, key)) {
-        eprintln!("warning: cannot refresh `{key}`'s GitHub fence: {e:#}");
+        super::notes::warn(format_args!("cannot refresh `{key}`'s GitHub fence: {e:#}"));
     }
 }
 

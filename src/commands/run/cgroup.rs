@@ -48,7 +48,7 @@ pub(crate) fn warning(container: &str, path: &str) -> String {
 
 pub(crate) fn warn_if_outside(container: &str) {
     if let Some(path) = outside(container) {
-        eprintln!("{}", warning(container, &path));
+        super::notes::noted!("{}", warning(container, &path));
     }
 }
 

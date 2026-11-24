@@ -133,7 +133,7 @@ pub(super) fn feature_container_opts(
                 }
                 MountDecision::Overridden => {}
                 MountDecision::Skip(reason) => {
-                    eprintln!("warning: feature `{reference}`: {reason}");
+                    super::notes::noted!("warning: feature `{reference}`: {reason}");
                 }
             }
         }

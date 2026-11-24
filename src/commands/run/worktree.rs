@@ -88,7 +88,7 @@ pub(super) fn create_worktree(
         }
     };
     if let Some(r) = base_ref {
-        eprintln!("note: `{branch}` already exists; ignoring worktree base `{r}`");
+        super::notes::noted!("note: `{branch}` already exists; ignoring worktree base `{r}`");
     }
     if source == BranchSource::Local {
         if let Some(at) = checked_out_at(base, branch) {
@@ -237,7 +237,7 @@ pub(crate) fn lock_worktree(base: &Path, worktree: &Path) {
         return;
     };
     if !admin.is_dir() {
-        eprintln!(
+        super::notes::noted!(
             "warning: git's record of worktree `{}` is gone ({} was pruned); git won't work in it \
              until the record is restored",
             worktree.display(),
@@ -259,7 +259,7 @@ pub(crate) fn lock_worktree(base: &Path, worktree: &Path) {
         Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
         Err(e) => format!("{e:#}"),
     };
-    eprintln!("warning: cannot lock worktree `{}`: {why}", worktree.display());
+    super::notes::noted!("warning: cannot lock worktree `{}`: {why}", worktree.display());
 }
 
 /// [`lock_worktree`] for every worktree `info` records: the primary and its
@@ -377,7 +377,7 @@ pub(super) fn copy_worktree_includes(base: &Path, worktree: &Path, patterns: &[S
     let paths = match worktree_include_paths(base, include.as_deref(), patterns) {
         Ok(paths) => paths,
         Err(e) => {
-            eprintln!("warning: cannot apply worktree includes: {e:#}");
+            super::notes::noted!("warning: cannot apply worktree includes: {e:#}");
             return;
         }
     };
@@ -400,13 +400,13 @@ fn copy_include_paths(base: &Path, worktree: &Path, paths: &[String]) {
     let (base_fd, wt_fd) = match roots {
         Ok(fds) => fds,
         Err(e) => {
-            eprintln!("warning: cannot apply worktree includes: {e:#}");
+            super::notes::noted!("warning: cannot apply worktree includes: {e:#}");
             return;
         }
     };
     for rel in paths {
         if let Err(e) = nofollow::copy_entry(&base_fd, &wt_fd, rel) {
-            eprintln!("warning: cannot copy `{rel}` into worktree: {e:#}");
+            super::notes::noted!("warning: cannot copy `{rel}` into worktree: {e:#}");
         }
     }
 }
@@ -415,7 +415,7 @@ fn copy_include_paths(base: &Path, worktree: &Path, paths: &[String]) {
 fn copy_include_paths(base: &Path, worktree: &Path, paths: &[String]) {
     for rel in paths {
         if let Err(e) = copy_entry(&base.join(rel), &worktree.join(rel)) {
-            eprintln!("warning: cannot copy `{rel}` into worktree: {e:#}");
+            super::notes::noted!("warning: cannot copy `{rel}` into worktree: {e:#}");
         }
     }
 }
@@ -694,7 +694,7 @@ pub(super) fn link_shared_files(store: &Path, trees: &[&Path], entries: &[String
     let stores = store.parent().unwrap_or(store);
     // Every check below would silently read as "not gitignored"; say why.
     if let Err(e) = check_repo(base) {
-        eprintln!("warning: worktree-link skipped: {e:#}");
+        super::notes::noted!("warning: worktree-link skipped: {e:#}");
         return Ok(());
     }
     std::fs::create_dir_all(store).with_context(|| format!("cannot create {}", store.display()))?;
@@ -711,7 +711,7 @@ pub(super) fn link_shared_files(store: &Path, trees: &[&Path], entries: &[String
         // Replacing a tracked (or merely untracked) path with a symlink would
         // show up in `git status`; only gitignored, untracked paths qualify.
         if !git_ignores(base, &rel) {
-            eprintln!(
+            super::notes::noted!(
                 "warning: worktree-link `{entry}` skipped: not gitignored (or tracked) in `{}`",
                 base.display()
             );
@@ -719,7 +719,7 @@ pub(super) fn link_shared_files(store: &Path, trees: &[&Path], entries: &[String
         }
         let shared = store.join(&rel);
         if let Err(e) = adopt(&base.join(&rel), &shared, stores) {
-            eprintln!("warning: worktree-link `{entry}`: {e:#}");
+            super::notes::noted!("warning: worktree-link `{entry}`: {e:#}");
             continue;
         }
         if shared.symlink_metadata().is_err() {
@@ -728,13 +728,13 @@ pub(super) fn link_shared_files(store: &Path, trees: &[&Path], entries: &[String
         }
         for tree in trees {
             match link_into(&tree.join(&rel), &shared, stores) {
-                Ok(true) if !git_ignores(tree, &rel) => eprintln!(
+                Ok(true) if !git_ignores(tree, &rel) => super::notes::noted!(
                     "warning: worktree-link `{entry}` shows as untracked in `{}`: a `dir/` \
                      gitignore pattern doesn't match a symlink, drop the trailing `/`",
                     tree.display()
                 ),
                 Ok(_) => {}
-                Err(e) => eprintln!("warning: worktree-link `{entry}` in `{}`: {e:#}", tree.display()),
+                Err(e) => super::notes::noted!("warning: worktree-link `{entry}` in `{}`: {e:#}", tree.display()),
             }
         }
     }
@@ -974,7 +974,7 @@ fn fetch_origin(base: &Path, state_path: &Path) -> Result<()> {
         return Ok(());
     }
     if let Fetched::Failed(stderr) = fetch_trusted_origin(state_path, base, Refs::All { prune: false })? {
-        eprintln!(
+        super::notes::noted!(
             "warning: `git fetch origin` failed in `{}`; worktree may start from a stale ref: {stderr}",
             base.display(),
         );

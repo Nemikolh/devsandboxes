@@ -120,6 +120,19 @@ pub struct InstanceRow {
     /// the sandbox doesn't resolve: unknown isn't disallowed.
     #[serde(default)]
     pub profile_disallowed: bool,
+    /// Whether Chromium's sandbox works for its exec user
+    /// (`commands::run::tool_env::label` of `state::Instance::browser_sandbox`):
+    /// `on`, `on (through …)` or `off (<why>)`; `None` when unknown (no
+    /// helper, or not checked yet).
+    #[serde(default)]
+    pub browser_sandbox: Option<String>,
+    /// The GitHub fence's recorded repos (`state::Instance::github_repos`).
+    #[serde(default)]
+    pub github_repos: Vec<String>,
+    /// What its last `run`/`rebuild`/`start` printed worth keeping
+    /// (`state::Instance::build_notes`).
+    #[serde(default)]
+    pub build_notes: Vec<String>,
     /// Still being materialized, or failed; absent once ready. Takes over
     /// the STATUS column from `status` while set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1057,6 +1070,11 @@ fn instance_row(
         done: inst.done.is_some(),
         profile: inst.profile.clone(),
         profile_disallowed,
+        browser_sandbox: inst.browser_sandbox.as_ref().map(|b| {
+            crate::commands::run::tool_env::label(crate::commands::run::tool_env::root_plan(inst.remote_user.as_deref()), b)
+        }),
+        github_repos: inst.github_repos.clone(),
+        build_notes: inst.build_notes.clone(),
         phase,
         root: inst.config_dir.as_ref().map(|d| d.display().to_string()),
         mesh_root: None,

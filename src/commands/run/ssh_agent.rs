@@ -114,7 +114,7 @@ pub(super) fn ssh_agent_forward(instance_id: &str) -> Result<Option<(String, Str
             SSH_AGENT_TARGET.to_string(),
         ))),
         Err(e) => {
-            eprintln!("warning: ssh-agent forwarding disabled: {e:#}");
+            super::notes::noted!("warning: ssh-agent forwarding disabled: {e:#}");
             Ok(None)
         }
     }

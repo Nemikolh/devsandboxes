@@ -62,9 +62,24 @@ pub(crate) fn start_instance(dir: &Path, key: &str, info: &Instance) -> Result<(
 
 /// Start one instance, its output going to its build log too (one log per
 /// instance under `--all`, and for autostart's starts when the CLI runs it).
+/// Its notes (`run::notes`) replace the instance's `build_notes`, a failed
+/// start's included.
 fn start_one(dir: &Path, key: &str, info: &Instance) -> Result<()> {
     let log = crate::build_log::open(&info.instance_id);
-    log.outcome(start_logged(dir, key, info))
+    let capture = run::notes::Capture::start();
+    let result = start_logged(dir, key, info);
+    let notes = capture.finish();
+    // Best effort, as the start's own outcome must win.
+    let saved = State::update(|state| {
+        if let Some(i) = state.instances.values_mut().find(|i| i.instance_id == info.instance_id) {
+            i.build_notes = notes;
+        }
+        Ok(())
+    });
+    if let Err(e) = saved {
+        eprintln!("warning: cannot record the start's notes in state: {e:#}");
+    }
+    log.outcome(result)
 }
 
 /// [`start_instance`]'s work, inside the build log.
@@ -129,10 +144,10 @@ fn start_logged(dir: &Path, key: &str, info: &Instance) -> Result<()> {
                     match post_start_runner(runtime, hooked) {
                         PostStart::Hook => None,
                         PostStart::HostPredatesHook => {
-                            eprintln!(
-                                "warning: {key} predates the runtime boot hook; recreate with \
+                            run::notes::warn(format_args!(
+                                "{key} predates the runtime boot hook; recreate with \
                                  `devsandbox rebuild --force {key}`"
-                            );
+                            ));
                             Some(cmd)
                         }
                         PostStart::Host => Some(cmd),
@@ -175,7 +190,7 @@ fn start_logged(dir: &Path, key: &str, info: &Instance) -> Result<()> {
 
 fn warn_git(info: &Instance, no_signing_key: bool) {
     for w in run::git_check(info, no_signing_key) {
-        eprintln!("warning: {w}");
+        run::notes::warn(w);
     }
 }
 

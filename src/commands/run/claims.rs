@@ -178,7 +178,7 @@ pub(super) fn wire(
         wired.env.extend(instance::env(claim, record));
         let (files, warnings) = instance::render_files(claim, record, home, owner, targets);
         for w in warnings {
-            eprintln!("warning: {w}");
+            super::notes::noted!("warning: {w}");
         }
         record.files = files;
     }
@@ -187,7 +187,7 @@ pub(super) fn wire(
         let exec_keys = props.remote_env.iter().flat_map(|e| e.keys()).chain(&proxying.run_env_keys);
         let overrides = instance::proxy_overrides(exec_keys);
         if !overrides.is_empty() {
-            eprintln!(
+            super::notes::noted!(
                 "warning: `remoteEnv` or `--env` sets {}: every exec then goes around the credential broker's proxy port",
                 overrides.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", ")
             );
@@ -252,7 +252,7 @@ fn member_cert(hosts: &[String]) -> Option<MemberCert> {
         Ok((Some(pem), grew)) => Some(MemberCert { pem, grew }),
         Ok((None, _)) => None,
         Err(e) => {
-            eprintln!(
+            super::notes::noted!(
                 "warning: the member CA can't cover {}: {e:#}: TLS to them will fail in the sandbox",
                 hosts.join(", ")
             );
@@ -272,7 +272,7 @@ fn member_cert(_: &[String]) -> Option<MemberCert> {
 pub(super) fn install_trust(container: &str, intercept: &mut Intercept, pem: &str) {
     match install_in(container, &intercept.bundle, pem) {
         Ok(()) => intercept.installed = Some(crate::credentials::trust::fingerprint(pem)),
-        Err(e) => eprintln!("{}", install_warning(container, &intercept.bound_hosts(), &e)),
+        Err(e) => super::notes::noted!("{}", install_warning(container, &intercept.bound_hosts(), &e)),
     }
 }
 
@@ -315,7 +315,7 @@ pub(super) fn reinstall_running(except: &str, pem: &str) {
 #[cfg(unix)]
 fn reinstall(key: &str, container: &str, intercept: &Intercept, pem: &str, fingerprint: &str) {
     if let Err(e) = install_in(container, &intercept.bundle, pem) {
-        eprintln!("{}", install_warning(container, &intercept.bound_hosts(), &e));
+        super::notes::noted!("{}", install_warning(container, &intercept.bound_hosts(), &e));
         return;
     }
     let saved = crate::state::State::update(|state| {
@@ -325,7 +325,7 @@ fn reinstall(key: &str, container: &str, intercept: &Intercept, pem: &str, finge
         Ok(())
     });
     if let Err(e) = saved {
-        eprintln!("note: couldn't record the member CA installed in `{container}`: {e:#}");
+        super::notes::noted!("note: couldn't record the member CA installed in `{container}`: {e:#}");
     }
 }
 
@@ -358,7 +358,7 @@ pub(super) fn install_git_config(container: &str, entries: &[(String, String)]) 
     let script = crate::runtime::fixed_path(git::SYSTEM_SCRIPT);
     let args = ["exec", "-i", "-u", "root", container, crate::runtime::SH, "-c", &script];
     if let Err(e) = backend().run_with_stdin(&args, git::system_config(entries).as_bytes()) {
-        eprintln!(
+        super::notes::noted!(
             "warning: couldn't write `{}` in `{container}` ({e:#}): git run with a cleared env there misses \
              the git-host claim's settings",
             git::SYSTEM_FILE
@@ -424,7 +424,7 @@ fn brokered_here(dir: &Path, kept: instance::Found) -> Result<Option<instance::F
     };
     let Some(why) = why else { return Ok(Some(kept)) };
     for (feature, claim) in &kept {
-        eprintln!("warning: feature `{feature}`: the `{}` claim {why}: skipped", claim.kind);
+        super::notes::noted!("warning: feature `{feature}`: the `{}` claim {why}: skipped", claim.kind);
     }
     Ok(None)
 }
@@ -471,7 +471,7 @@ fn check_credentials_at(
             // No home `as` to narrow by yet: the claim's and step 3's refusals only.
             let any = [TokenKind::App, TokenKind::User];
             tokens::pick(claim.pinned.tokens.as_ref(), &any, wanted, kind, named.unwrap_or(kind))?;
-            eprintln!(
+            super::notes::noted!(
                 "warning: feature `{feature}`: no `{kind}` credential here: `devsandbox login {}` stores one; \
                  the sandbox is wired for it, no rebuild needed",
                 named.unwrap_or(kind)
@@ -528,7 +528,7 @@ pub(super) fn warn_foreign_files(container: &str, claims: &[InstanceClaim]) {
         let args =
             ["exec", "-u", &file.owner, container, crate::runtime::SH, "-c", &script, "sh", &file.path, &claim.phantom];
         if backend().output_quiet(&args).is_ok_and(|out| out.trim() == "foreign") {
-            eprintln!(
+            super::notes::noted!(
                 "warning: `{}` is already in the image and not a phantom file: left alone, so the `{}` claim's \
                  tools there won't use the broker",
                 file.path, claim.kind

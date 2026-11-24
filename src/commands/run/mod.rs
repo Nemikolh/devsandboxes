@@ -25,6 +25,7 @@ mod identity;
 mod image;
 mod lifecycle;
 mod mounts;
+pub(crate) mod notes;
 mod origin;
 mod profile;
 mod progress;
@@ -114,6 +115,8 @@ pub fn run(
     // it (docs/architecture/daemon/fleet.md, *Config versions*).
     #[cfg(unix)]
     crate::serve::fleet::mesh::check_root(dir)?;
+    // Recorded on the instance by `Tracker::finish`/`fail`.
+    let _notes = notes::Capture::start();
     // The dispatcher boundary (`commands::dispatch`) checks this too; `run`'s
     // hidden flags are callable directly, so check again before any work.
     if extras.dispatcher.is_some()
@@ -158,7 +161,7 @@ pub fn run(
 
     let ignored = props.ignored();
     if !ignored.is_empty() {
-        eprintln!("warning: ignoring unsupported properties: {}", ignored.join(", "));
+        notes::warn(format_args!("ignoring unsupported properties: {}", ignored.join(", ")));
     }
 
     let folder = sandbox
@@ -191,7 +194,7 @@ pub fn run(
     let last = state.last_profile.get(&project).and_then(|m| m.get(&sandbox_name));
     let profile = choose_profile(&sandbox_name, &allowed, extras.profile.as_deref(), last.map(String::as_str))?;
     if let Some(note) = profile::profile_note(&allowed, profile.as_deref(), extras.profile.is_some()) {
-        eprintln!("{note}");
+        notes::line(note);
     }
     // Only the user's own `--profile` is a choice to remember: a
     // dispatcher's is its parent's, passed through.
@@ -226,10 +229,10 @@ pub fn run(
         .filter(|p| p.exists())
         .collect();
         orphan_check(&container_name, extras.dispatcher.as_deref(), labeled.as_deref(), &leftovers)?;
-        eprintln!(
-            "warning: removing orphaned container `{container_name}`: a child of this dispatcher \
+        notes::warn(format_args!(
+            "removing orphaned container `{container_name}`: a child of this dispatcher \
              no longer in state, with no worktree left"
-        );
+        ));
         let project = services::project_id(&config_dir)?;
         super::rm::remove_container(&container_name, &project, &instance_id);
     }
@@ -291,6 +294,7 @@ pub fn run(
         intercept: None,
         claims: Vec::new(),
         github_repos: Vec::new(),
+        build_notes: Vec::new(),
         git_env: Default::default(),
         progress: None,
         created_unix: Instance::now(),
@@ -601,7 +605,7 @@ pub(crate) fn materialize(
     // subprocesses, autostart), and a skipped prompt too. stderr only.
     let acks = services::project_id(dir).ok().and_then(|p| state.identity_acks.get(&p));
     if let Some(line) = crate::config_identity::warning(&crate::config_identity::identity_findings(config), sandbox_name, acks) {
-        eprintln!("warning: {line}");
+        notes::warn(line);
     }
     let prior = state.instances.get(instance);
     let dispatcher = extras
@@ -668,7 +672,7 @@ pub(crate) fn materialize(
         None,
     )?;
     for warning in warnings {
-        eprintln!("warning: {warning}");
+        notes::warn(warning);
     }
 
     // initializeCommand runs on the host, before anything is created.
@@ -687,7 +691,7 @@ pub(crate) fn materialize(
     if policy.is_some() {
         let includes = copy_includes && (!include_patterns.is_empty() || folder.join(".worktreeinclude").is_file());
         if let Some(warning) = worker_skip_warning(!links.is_empty(), includes) {
-            eprintln!("warning: {warning}");
+            notes::warn(warning);
         }
         links.clear();
         copy_includes = false;
@@ -841,13 +845,13 @@ pub(crate) fn materialize(
         backend().supports_privileged(),
     );
     for warning in warnings {
-        eprintln!("warning: {warning}");
+        notes::warn(warning);
     }
     let volumes: Vec<String> =
         std::iter::once(format!("{}:{workspace}", source.display())).chain(extra_mounts.iter().cloned()).collect();
     let all_binds = binds::binds_of(&volumes, &mounts);
     for warning in binds::warnings(dir, state, instance, instance_id, &all_binds, privileged, !feature.claims.is_empty()) {
-        eprintln!("warning: {warning}");
+        notes::warn(warning);
     }
     let (restart, warnings) = crate::commands::autostart::restart_decision(
         props.autostart,
@@ -855,7 +859,7 @@ pub(crate) fn materialize(
         backend().name(),
     );
     for warning in warnings {
-        eprintln!("warning: {warning}");
+        notes::warn(warning);
     }
     // Who the container runs as (docs/architecture/instances/identity.md).
     let (plan, seccomp) = identity::plan_for(&image, facts::accounts(props, &facts), props, extras.reprobe, privileged);
@@ -902,7 +906,7 @@ pub(crate) fn materialize(
     if let Some(why) =
         ssh_auth_sock.as_ref().and(ssh_agent::mount_refusal(&crate::credentials::instance::git_hosts(&wired.claims)))
     {
-        eprintln!("warning: {why}");
+        notes::warn(why);
         extra_mounts.retain(|m| !m.ends_with(&format!(":{SSH_AGENT_TARGET}")));
         ssh_auth_sock = None;
     }
@@ -938,9 +942,9 @@ pub(crate) fn materialize(
         Ok(arch) => (Some(arch), None),
         Err(reason) => {
             if relay_first {
-                eprintln!("note: ssh-agent forwarding off in `{container}`: {reason}");
+                notes::note(format_args!("ssh-agent forwarding off in `{container}`: {reason}"));
             } else {
-                eprintln!("note: {reason}");
+                notes::note(&reason);
             }
             (None, Some(reason))
         }
@@ -965,10 +969,10 @@ pub(crate) fn materialize(
                 home = Some(account_home);
             }
         } else {
-            eprintln!(
-                "warning: the devsbd helper isn't installed in `{container}`, so `{}` couldn't be fitted to the identity plan",
+            notes::warn(format_args!(
+                "the devsbd helper isn't installed in `{container}`, so `{}` couldn't be fitted to the identity plan",
                 plan.account.as_deref().unwrap_or_default()
-            );
+            ));
         }
     }
     // After the fit: the daemon writes the phantom files as their owner.
@@ -997,7 +1001,7 @@ pub(crate) fn materialize(
         tool_env::image_path(&facts.env),
         &user_keys,
     );
-    eprintln!("{}", tool_env::summary(root_plan, browser_sandbox.as_ref()));
+    notes::line(tool_env::summary(root_plan, browser_sandbox.as_ref()));
     if devsbd_arch.is_some() {
         cgroup::warn_if_outside(&container);
     }
@@ -1043,6 +1047,8 @@ pub(crate) fn materialize(
         claims: wired.claims,
         intercept: wired.intercept,
         github_repos,
+        // So far: `Tracker::finish`/`fail` record the rest.
+        build_notes: notes::collected(),
         git_env,
         done,
         // Still in flight: the lifecycle chain runs after this save.
@@ -1097,7 +1103,7 @@ pub(crate) fn materialize(
     let no_signing_key = !claims::signs_git(props);
     let git_warnings = claims::git_check(inst, no_signing_key);
     for w in &git_warnings {
-        eprintln!("warning: {w}");
+        notes::warn(w);
     }
     // Nothing to run in the container: no bridge to wait for.
     let lifecycle = !shell_rc.is_empty()
@@ -1154,7 +1160,7 @@ pub(crate) fn materialize(
     // Again after the lifecycle commands (dotfiles land there): only what's new.
     if lifecycle {
         for w in claims::git_check(inst, no_signing_key).iter().filter(|w| !git_warnings.contains(w)) {
-            eprintln!("warning: {w}");
+            notes::warn(w);
         }
     }
 
@@ -1262,10 +1268,10 @@ pub(crate) fn warn_on_drift(dir: &Path, container: &str, sandbox: &ResolvedSandb
     let build = sandbox_build_hash(dir, &sandbox.properties);
     if container_drifted(container, &sandbox.config_hash, &build)? {
         let instance = container.strip_prefix(NAME_PREFIX).unwrap_or(container);
-        eprintln!(
-            "warning: config for `{container}` changed since it was created; \
+        notes::warn(format_args!(
+            "config for `{container}` changed since it was created; \
              run `devsandbox rebuild {instance}` to apply changes"
-        );
+        ));
     }
     Ok(())
 }
@@ -1338,7 +1344,7 @@ fn run_container(
     let volumes: Vec<String> = std::iter::once(mount).chain(extra_mounts.iter().cloned()).collect();
     let (identity_args, warning) = identity::create_args(plan, backend().name() == "podman", seccomp, &volumes, mounts);
     if let Some(warning) = warning {
-        eprintln!("warning: {warning}");
+        notes::warn(warning);
     }
     args.extend(identity_args);
     // Runtimes differ in how many networks a container can start on; the
@@ -1498,6 +1504,7 @@ mod tests {
             claims: Vec::new(),
             progress: None,
             github_repos: Vec::new(),
+            build_notes: Vec::new(),
             git_env: Default::default(),
             created_unix: 0,
         }

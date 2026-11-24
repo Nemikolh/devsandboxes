@@ -168,6 +168,12 @@ pub struct Instance {
     /// `access.github.repos` isn't in it: read per call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub github_repos: Vec<String>,
+    /// The notes the last `run`/`rebuild`/`start` printed (the identity
+    /// summary, the browser sandbox, the GitHub fence, `warning:`/`note:`
+    /// lines; `commands::run::notes`), replaced by each, a failed one's
+    /// included, so the dashboard shows them once the build log scrolled by.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build_notes: Vec<String>,
     /// git's command-scope env (`GIT_CONFIG_COUNT`/`_KEY_<n>`/`_VALUE_<n>`)
     /// for every exec, when `remoteEnv` or `--env` set some of it: theirs
     /// merged ahead of a git-host claim's settings, which they'd otherwise
@@ -699,6 +705,7 @@ mod tests {
                     installed: Some("ab".repeat(32)),
                 }),
                 github_repos: vec!["o/r".into()],
+                build_notes: vec!["warning: w".into()],
                 git_env: Default::default(),
                 progress: None,
                 created_unix: Instance::now(),
@@ -739,6 +746,7 @@ mod tests {
         assert_eq!(back.instances["repo-abc1"].intercept, state.instances["repo-abc1"].intercept);
         assert_eq!(back.instances["repo-abc1"].created_unix, state.instances["repo-abc1"].created_unix);
         assert_eq!(back.instances["repo-abc1"].github_repos, ["o/r"]);
+        assert_eq!(back.instances["repo-abc1"].build_notes, ["warning: w"]);
         assert_eq!(back.folder_remotes["/home/u/repository-1"], remotes);
     }
 

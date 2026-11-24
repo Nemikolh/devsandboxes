@@ -51,7 +51,8 @@ created, which `rm` deletes), `shell_history`, `ssh_auth_sock`, `devsbd_arch`,
 and `claims` (credential claims with their phantoms, broker listeners and
 phantom files: [images and features](images-and-features.md#credential-claims)),
 `github_repos` (the GitHub repo fence's snapshot:
-[fence](../credentials/fence.md)), `done`, `progress`, `created_unix`.
+[fence](../credentials/fence.md)), `build_notes` (below), `done`,
+`progress`, `created_unix`.
 `State` also holds `autostart_boot`, `global_forwarded_ports` and
 `last_profile` per project id, and `folder_remotes` per folder, kept past
 `rm` ([fence](../credentials/fence.md)).
@@ -158,6 +159,34 @@ the pid is dead or the boot id changed, so nobody rewrites records.
   kills as usual.
 - `not_ready` / `in_flight` gate other verbs on an in-flight or failed
   instance; `exec` only waits for the container to exist.
+
+## Build notes
+
+The lines of a `run`, `rebuild` or `start` worth seeing after its build
+log scrolled by are kept on the instance as `build_notes`: the identity
+summary and its warnings, the browser sandbox line (`tool_env::summary`),
+the GitHub fence a folder's first run records, and the `warning:` /
+`note:` lines of the materialization and the start. Each site prints
+through `src/commands/run/notes.rs` (`warn`, `note`, `line`, `noted!`),
+which writes stderr as before and collects the line while a `Capture` is
+open on the current thread (thread-local: `devsandbox serve` runs
+autostart's commands in-process; a line printed from another thread isn't
+collected).
+
+Each verb replaces the previous notes with its own, a failed one's
+included:
+
+- `run` opens the capture at its start (before the record exists);
+  `materialize`'s record save takes the notes so far, and
+  `Tracker::finish` / `Tracker::fail` write the full list in the same
+  state write as the final `progress`. A rolled-back run leaves no record.
+- `rebuild` opens one per instance (`rebuild_instance`), recorded the same
+  way.
+- `start` opens one around each instance's start (`start::start_one`) and
+  writes the list after it, whatever the outcome.
+
+The dashboard's Detail panel shows them
+([tabs and actions](../dashboard/tabs-and-actions.md)).
 
 ## start and stop
 

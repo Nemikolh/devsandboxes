@@ -44,7 +44,18 @@ for Instances when the last machine goes. Each keeps its own selected row.
   mesh group with rows from several hosts leaves the MACHINE cell blank
   (`ui.rs` `node_machine`). Collapse state (by `GroupKey::collapse_key`) and
   expanded process layers survive snapshot refreshes. The Detail pane
-  shows the selected row. Done instances render dimmed. An instance's
+  shows the selected row. An instance's (`ui.rs` `instance_detail`, laid
+  out for the panel's inner width): a red `failed at <step>: <error>` line
+  first; then its `key: value` pairs (container, workspace, remoteUser,
+  remoteEnv, agents, sessions, profile, base folder or base and worktree,
+  `browser sandbox`, `github fence`; `-` when unknown or empty), in two
+  columns when both fit at their widest pair with a 3-space gap
+  (`detail_columns`), else one per line; then the yellow drift line and
+  its build notes (`InstanceRow.build_notes`,
+  [lifecycle](../instances/lifecycle.md#build-notes); `build_note_lines`):
+  warnings yellow, the rest dim, each wrapped at spaces to at most three
+  rows, the browser sandbox line left to its pair. The full-width panel
+  grows to the line count (`fit_detail`). Done instances render dimmed. An instance's
   profile follows its name as `[<p>]` and gets a `profile:` Detail line,
   yellow with `(not allowed by the config any more)` when
   `InstanceRow.profile_disallowed` (`ui.rs` `instance_tree_row`,
