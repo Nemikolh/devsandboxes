@@ -292,12 +292,30 @@ fn client_id_required(login: &Login, kind: &str) -> anyhow::Error {
     )
 }
 
+/// A `broad` login only with `broad` (`--broad`), which takes no other but
+/// paste.
+fn fits(login: &Login, broad: bool) -> bool {
+    login.broad() == broad || matches!(login, Login::Paste { .. })
+}
+
+const TTY_ORDER: [&str; 3] = ["device", "browser", "paste"];
+const PIPED_ORDER: [&str; 3] = ["paste", "device", "browser"];
+
+/// The first login of each method in `order` that works here: browser
+/// only where a browser opens, a login needing `--client-id` only with one.
+fn usable<'a>(logins: &'a [Login], order: &[&str], client_id: bool, broad: bool, browser: bool) -> Vec<&'a Login> {
+    order
+        .iter()
+        .filter(|m| browser || **m != "browser")
+        .filter_map(|m| logins.iter().find(|l| fits(l, broad) && method_name(l) == *m))
+        .filter(|l| client_id || !needs_client_id(l))
+        .collect()
+}
+
 /// The login method: `wanted` if the claim lists it, else the first of
-/// the claim's that works here, in this order: off a terminal paste (stdin),
-/// device, browser; on one device, browser, paste. Browser only where a
-/// browser opens, a login needing `--client-id` only with one. A claim's
-/// own order isn't kept (its version sorts them). A `broad` login only
-/// with `broad` (`--broad`), which takes no other but paste.
+/// the claim's that works here ([`usable`]), in this order: off a terminal
+/// paste (stdin), device, browser; on one device, browser, paste. A claim's
+/// own order isn't kept (its version sorts them).
 fn choose<'a>(
     logins: &'a [Login],
     wanted: Option<&str>,
@@ -310,13 +328,13 @@ fn choose<'a>(
     if logins.is_empty() {
         bail!("the `{kind}` claim has no secret to log in (no `inject` slot)");
     }
-    let fits = |l: &&Login| l.broad() == broad || matches!(l, Login::Paste { .. });
+    let fit = |l: &&Login| fits(l, broad);
     let listed = || {
-        let mut names: Vec<&str> = logins.iter().filter(fits).map(method_name).collect();
+        let mut names: Vec<&str> = logins.iter().filter(fit).map(method_name).collect();
         names.dedup();
         names.join(", ")
     };
-    let find = |m: &str| logins.iter().filter(fits).find(|l| method_name(l) == m);
+    let find = |m: &str| logins.iter().filter(fit).find(|l| method_name(l) == m);
     if let Some(m) = wanted {
         let l = find(m).with_context(|| match logins.iter().any(|l| method_name(l) == m) {
             true if broad => format!("the `{kind}` claim's {m} login isn't broad: drop --broad, or log in by {}", listed()),
@@ -331,9 +349,8 @@ fn choose<'a>(
         }
         return Ok(l);
     }
-    let order: &[&str] = if tty { &["device", "browser", "paste"] } else { &["paste", "device", "browser"] };
-    let usable = |l: &&Login| client_id || !needs_client_id(l);
-    if let Some(l) = order.iter().filter(|m| browser || **m != "browser").find_map(|m| find(m).filter(usable)) {
+    let order: &[&str] = if tty { &TTY_ORDER } else { &PIPED_ORDER };
+    if let Some(l) = usable(logins, order, client_id, broad, browser).first() {
         return Ok(l);
     }
     if let Some(l) = order.iter().filter_map(|m| find(m)).find(|l| needs_client_id(l) && !client_id) {
@@ -349,6 +366,43 @@ fn choose<'a>(
         bail!("the `{kind}` claim's only logins are broad (their token reaches every repo your account can access): pass --broad");
     }
     bail!("the `{kind}` claim logs in by {}: {}", listed(), crate::NOT_SUPPORTED_YET)
+}
+
+/// What a terminal's method question offers: [`usable`] in its terminal
+/// order, less what the flags rule out, so a pick never fails their
+/// checks: `--client-id` paste, `--owner` all but a paste with a token
+/// page.
+fn offered(logins: &[Login], client_id: bool, broad: bool, browser: bool, owner: bool) -> Vec<&Login> {
+    let page = |l: &Login| matches!(l, Login::Paste { create: Some(_), .. }) && !broad;
+    let mut offered = usable(logins, &TTY_ORDER, client_id, broad, browser);
+    offered.retain(|l| !(client_id && matches!(l, Login::Paste { .. })) && (!owner || page(l)));
+    offered
+}
+
+fn method_choice(login: &Login) -> Choice {
+    let hint = match login {
+        Login::Device { .. } => "enter a code on the provider's page".to_string(),
+        Login::Browser { .. } => "sign in in this host's browser".to_string(),
+        Login::Paste { hint: Some(hint), .. } => format!("paste {hint}"),
+        Login::Paste { hint: None, .. } => "paste a token".to_string(),
+        Login::GithubAppManifest {} => unreachable!("never usable"),
+    };
+    let name = method_name(login);
+    Choice::new(name).hint(crate::open::printable(&hint)).hotkey(name.chars().next().expect("a name"))
+}
+
+/// `picked` unless `offered` has another to pick, then the user's pick,
+/// `picked` preselected.
+fn pick_method<'a>(term: &mut dyn Term, name: &str, offered: &[&'a Login], picked: &'a Login) -> Result<&'a Login> {
+    if offered.len() < 2 {
+        return Ok(picked);
+    }
+    let choices: Vec<Choice> = offered.iter().map(|l| method_choice(l)).collect();
+    let default = offered.iter().position(|l| std::ptr::eq(*l, picked)).unwrap_or(0);
+    match term.choose(&format!("Log in `{name}` by"), &choices, default)? {
+        Answer::Picked(i) => Ok(offered[i]),
+        Answer::Cancelled => bail!("no login method picked: nothing changed"),
+    }
 }
 
 fn check_client_id(id: &str) -> Result<()> {
@@ -666,7 +720,7 @@ pub(crate) fn login_at(
         }
         check_client_id(id)?;
     }
-    let page = match login {
+    let page_of = |login: &Login| match login {
         // Its page makes a narrow token; a broad paste is a token at hand
         // (`gh auth token`).
         Login::Paste { create: Some(create), .. } if !args.broad => {
@@ -680,7 +734,7 @@ pub(crate) fn login_at(
         _ => None,
     };
     if let Some(owner) = &args.owner {
-        if page.is_none() {
+        if page_of(login).is_none() {
             bail!("--owner is for a paste login that opens a token page; the `{kind}` claim's {} login has none", method_name(login));
         }
         check_owner(owner)?;
@@ -699,6 +753,16 @@ pub(crate) fn login_at(
         ));
         approve_or_refuse(term, args.yes, Vec::new(), &format!("Make `{name}` a broad credential?"))?;
     }
+    // Asked after the approvals: a refused claim never asks for a method.
+    // `--yes` approves; it doesn't pick.
+    let login = match &args.method {
+        None if term.tty() => {
+            let offered = offered(&pinned.login, args.client_id.is_some(), args.broad, flows.browser, args.owner.is_some());
+            pick_method(term, name, &offered, login)?
+        }
+        _ => login,
+    };
+    let page = page_of(login);
 
     let record = obtain(login, name, page.as_deref(), args, term, flows)?;
     crate::credentials::tokens::check_accepted(pinned.tokens.as_ref(), record.access_token().expose(), &kind, args.broad)?;
@@ -823,12 +887,14 @@ pub(crate) mod tests {
 
     /// A scripted terminal: answers in order, each the label of the choice
     /// picked (or [`ESC`]); everything shown kept, a review's tree as the
-    /// plain fallback prints it.
+    /// plain fallback prints it, each question's choices and default in
+    /// `asked`.
     pub(crate) struct Script {
         pub tty: bool,
         pub answers: Vec<String>,
         pub secret: Option<String>,
         pub shown: String,
+        pub asked: Vec<(Vec<Choice>, usize)>,
     }
 
     impl Script {
@@ -838,6 +904,7 @@ pub(crate) mod tests {
                 answers: answers.iter().map(|a| a.to_string()).collect(),
                 secret: secret.map(String::from),
                 shown: String::new(),
+                asked: Vec::new(),
             }
         }
     }
@@ -852,6 +919,7 @@ pub(crate) mod tests {
         fn choose(&mut self, question: &str, choices: &[Choice], default: usize) -> Result<Answer> {
             assert!(default < choices.len(), "the default is a choice");
             self.shown.push_str(question);
+            self.asked.push((choices.to_vec(), default));
             let answer = self.answers.remove(0);
             if answer == ESC {
                 return Ok(Answer::Cancelled);
@@ -1165,6 +1233,86 @@ pub(crate) mod tests {
         assert!(err.starts_with("the `k` claim's only logins are broad") && err.ends_with("pass --broad"), "{err}");
     }
 
+    #[test]
+    fn a_terminal_offers_each_usable_method_the_flags_allow() {
+        let paste = Login::Paste { hint: None, create: None };
+        let page = Login::Paste { hint: None, create: Some(Create { url: "https://h/new".into(), permissions: false }) };
+        let all = [paste.clone(), device(1), browser(1), home_device(1), broad_device(1)];
+        let names = |v: Vec<&Login>| v.into_iter().map(method_name).collect::<Vec<_>>();
+        assert_eq!(names(offered(&all, false, false, true, false)), ["device", "browser", "paste"]);
+        assert_eq!(names(offered(&all, false, false, false, false)), ["device", "paste"], "no browser opens");
+        assert_eq!(names(offered(&all, true, false, true, false)), ["device", "browser"], "--client-id takes no paste");
+        assert_eq!(names(offered(&[paste.clone(), home_device(1)], false, false, true, false)), ["paste"], "no app");
+        assert_eq!(offered(&all, false, true, true, false), [&broad_device(1), &paste], "--broad");
+        assert_eq!(names(offered(&all, false, false, true, true)), Vec::<&str>::new(), "--owner needs a token page");
+        assert_eq!(offered(&[page.clone(), device(1)], false, false, true, true), [&page]);
+        assert!(offered(&[page, device(1)], false, true, true, true).is_empty(), "a broad paste has no page");
+
+        let hinted = Login::Paste { hint: Some("a PAT".into()), create: None };
+        let hints: Vec<_> = [device(1), browser(1), paste, hinted].iter().map(method_choice).collect();
+        let want = [
+            ("device", "enter a code on the provider's page", 'd'),
+            ("browser", "sign in in this host's browser", 'b'),
+            ("paste", "paste a token", 'p'),
+            ("paste", "paste a PAT", 'p'),
+        ];
+        let got: Vec<_> = hints.iter().map(|c| (c.label.as_str(), c.hint.as_deref().unwrap(), c.key.unwrap())).collect();
+        assert_eq!(got, want);
+    }
+
+    /// [`sentry`] logs in by paste or device: a terminal asks which, after
+    /// the approval, device preselected.
+    #[test]
+    fn a_terminal_asks_the_method_among_several() {
+        let data = temp("ask-method");
+        let a = args("s");
+        let mut term = Script::new(true, &["Approve", "paste"], Some("sntryu_1"));
+        let done = login_at(&data, &a, Some(vec![sentry()]), &mut term).unwrap();
+        assert!(done.contains("approved"), "{done}");
+        assert_eq!(Store::in_data(&data).token_now("s").unwrap().unwrap().expose(), "sntryu_1");
+        let (choices, default) = &term.asked[1];
+        let labels: Vec<&str> = choices.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!((labels, *default), (vec!["device", "paste"], 0));
+        assert!(choices[1].hint.as_deref().unwrap().starts_with("paste a user auth token"), "{choices:?}");
+        assert!(term.shown.contains("Approve this claim for `s`?Log in `s` by"), "{}", term.shown);
+
+        // --yes still asks; the pick is honored.
+        let yes = Args { yes: true, ..args("s") };
+        let err = login_at(&data, &yes, None, &mut Script::new(true, &["device"], None)).unwrap_err();
+        assert!(err.to_string().contains("no network in this test"), "the device login: {err}");
+        // --method, or off a terminal: not asked.
+        let paste = Args { method: Some("paste".into()), ..args("s") };
+        let mut term = Script::new(true, &[], Some("sntryu_2"));
+        login_at(&data, &paste, None, &mut term).unwrap();
+        assert!(term.asked.is_empty());
+        let mut term = Script::new(false, &[], Some("sntryu_3"));
+        login_at(&data, &args("s"), None, &mut term).unwrap();
+        assert!(term.asked.is_empty());
+        assert_eq!(Store::in_data(&data).token_now("s").unwrap().unwrap().expose(), "sntryu_3");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn one_usable_method_is_not_asked_and_a_cancel_changes_nothing() {
+        let data = temp("ask-one");
+        let mut c = sentry();
+        c.pinned.login.retain(|l| matches!(l, Login::Paste { .. }));
+        let mut term = Script::new(true, &["Approve"], Some("sntryu_1"));
+        login_at(&data, &args("s"), Some(vec![c]), &mut term).unwrap();
+        assert_eq!(term.asked.len(), 1, "the approval only");
+
+        let fresh = temp("ask-cancel");
+        let mut term = Script::new(true, &["Approve", ESC], Some("sntryu_1"));
+        let err = login_at(&fresh, &args("s"), Some(vec![sentry()]), &mut term).unwrap_err();
+        assert_eq!(err.to_string(), "no login method picked: nothing changed");
+        assert!(!home::path(&fresh).exists() && !Store::in_data(&fresh).path().exists());
+        // Refused: never asked.
+        let mut term = Script::new(true, &["Refuse"], None);
+        login_at(&fresh, &args("s"), Some(vec![sentry()]), &mut term).unwrap_err();
+        assert_eq!(term.asked.len(), 1);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
     fn flows(open: impl FnMut(&str) + 'static, clock: Box<dyn Clock>) -> Flows {
         Flows {
             http: Box::new(|| Ok(crate::credentials::oauth::tests::http())),
@@ -1254,10 +1402,12 @@ pub(crate) mod tests {
         let mut gh = github();
         gh.pinned.login = vec![Login::Paste { hint: None, create: None }, home_device(port), broad_device(port)];
         let a = Args { broad: true, ..args("gh") };
-        let mut term = Script::new(true, &["Approve", "Approve"], None);
+        let mut term = Script::new(true, &["Approve", "Approve", "device"], None);
         let mut f = flows(|_| {}, Box::new(FakeClock::new()));
         let done = super::login_at(&data, &a, Some(vec![gh.clone()]), &mut term, &mut f).unwrap();
         assert!(done.contains("approved"), "{done}");
+        let methods: Vec<&str> = term.asked[2].0.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(methods, ["device", "paste"], "the broad device and paste");
         assert!(term.shown.contains("`gh` is broad: its token reaches every repo your account can access."), "{}", term.shown);
         assert!(term.shown.contains("Make `gh` a broad credential?"), "{}", term.shown);
         let Some(Record::OAuth(rec)) = Store::in_data(&data).get("gh").unwrap() else { panic!("an OAuth record") };

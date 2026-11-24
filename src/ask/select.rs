@@ -15,8 +15,6 @@ impl Choice {
         Choice { label: label.into(), hint: None, key: None }
     }
 
-    // The login method pick hints each method; nothing else hints yet.
-    #[allow(dead_code)]
     pub fn hint(mut self, hint: impl Into<String>) -> Choice {
         self.hint = Some(hint.into());
         self

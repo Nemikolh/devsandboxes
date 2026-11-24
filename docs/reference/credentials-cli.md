@@ -106,6 +106,18 @@ the device code request's or the authorize page's `scope`. `github-app-manifest`
 no `login` (no `inject` slot) has no secret to log in. All of this is
 checked before anything is asked.
 
+On a terminal with no `--method`, when more than one method works here
+(`offered`: those rules, less `paste` with `--client-id` and all but a
+paste with a token page with `--owner`), the user picks it
+(`pick_method`): ``Log in `<name>` by``, a pick of `device` (`d`, "enter
+a code on the provider's page"), `browser` (`b`, "sign in in this host's
+browser") and `paste` (`p`, `paste <hint>` with the claim's paste
+`hint`, else "paste a token"), in the terminal order above, the method
+picked otherwise preselected. `--yes` approves, it doesn't pick: the
+question is still asked. Esc or Ctrl-C ends the login: `no login method
+picked: nothing changed`. Off a terminal, or with one method, nothing
+is asked.
+
 `--client-id` logs in to that OAuth app instead of the claim's (an app
 the home owns: a GitHub App you made), and is required when the claim
 names none; refused with `paste`. It goes into
@@ -141,7 +153,8 @@ Then, in order: a new version's review and the question
 (`approve_or_refuse`); for a new credential with `--broad`, a warning of
 what it reaches and the same kind of question, with no review (a re-login
 of a broad one isn't asked: its reach was agreed when it was made); the
-secret (`obtain`), by:
+method question, so a refused claim is never asked it; the secret
+(`obtain`), by:
 
 - `paste`: from stdin (`Stdio::secret`: on a terminal, after the claim's
   paste `hint` as `? <hint>:` (styled as a question), with echo off

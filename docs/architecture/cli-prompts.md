@@ -39,8 +39,12 @@ records a review's tree as `Fold::plain_lines` prints it):
   broad-credential question) a plain select.
 - `access::confirm_revoke`: Revoke (or Drop, for a version) / Keep, Keep
   preselected.
+- `login::pick_method`: one choice per method `offered` (`device`,
+  `browser`, `paste`, each with a hint and its first letter as hotkey),
+  the method `choose` picks preselected; asked only when there are
+  several.
 
-Both treat a cancel as the safe answer. docs/reference/credentials-cli.md
+All treat a cancel as the safe answer (for the method pick: no login). docs/reference/credentials-cli.md
 has what the user sees.
 
 ## Styling
