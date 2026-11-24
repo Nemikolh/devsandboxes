@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+A call a sandbox's config marks as asked now waits for your answer instead of failing, and tags, releases and ref deletions always ask. Sentry credentials reach only the orgs they name, `devsandbox ps` lists instances like the dashboard, and terminal questions are answered from a list. Existing `sentry` credentials need their orgs, with the sentry feature 1.3.0.
+
 ### Added
 
 - **Permission requests: an asked scope waits for your answer instead of failing.** A call needing a scope in a sandbox's `access.<kind>.ask` (or one in no scope of an unfenced claim) is now held, up to the claim's `hold` (2 minutes by default), while you answer from the dashboard's modal, the desktop popup or `devsandbox access pending|approve|deny`: `--for once` (the default), `instance` (this instance until its `rm`) or `always` (a rule on the credential in `credentials.toml`, which you can also write by hand). A deny is kept, so a retrying agent is refused at once; `devsandbox access revoke R-…` drops a kept answer or rule. An agent refused while a request is pending can run `devsbd access wait R-…` in the sandbox and retry once it's answered. An instance gets at most three open requests, so volume can't wear you down.
@@ -30,12 +32,45 @@
 
 - **The dashboard's Detail panel keeps what a build said.** An instance's warnings and notes from its last `run`, `rebuild` or `start` (the identity summary, the GitHub fence, every `warning:`) stay on it and show under its details, next to whether the browser sandbox is on and its GitHub fence. The details lay out in two columns when they fit.
 
+- **Terminal questions are answered from a list.** Every yes/no and menu on a TTY (`login`'s claim review, machine trust, `rm`, the identity question) is a list you pick from, defaulting to the safe answer, so a stray key can't approve. `login` shows a claim as a folded tree of routes and scopes, and asks which login method to use when several work instead of picking one silently.
+
 ### Fixed
 
 - **VS Code no longer hands a claimed sandbox your logins when it can avoid it.** `devsandbox vscode` and the dashboard's `o` start `code` without your ssh-agent or git credential helper for an instance with a credential claim, and open it without asking when no other VS Code window could leak them (checked on Linux). Otherwise the dashboard now asks before opening, and `:code` takes `--allow-credential-leak` like the CLI.
 - **A misspelled top-level table is an error**: `[sandboxx.web]` used to load
   as an empty config with no warning; now `devsandbox` names the unknown
   table, as it already did for unknown keys inside a sandbox.
+
+<details><summary>Commits</summary>
+
+- f524850 docs(ps): archive the ps-daemon plan, its content now lives in snapshot-and-json
+- 60db185 fix(ps): read the daemon's federated snapshot like the dashboard, since a local collection plus per-machine calls skipped the merge's rules and the poll's cached stats
+- 3c44075 docs(prompts): close the terminal prompts plan, its content now lives in cli-prompts and the credentials reference
+- 29e72e3 feat(prompts): answer every cli yes/no and menu from a list, so machine trust, rm and the identity question read like login's and default to the safe answer
+- 506b0c8 feat(login): ask which login method to use on a terminal when several work, since the silent pick hid that a browser or paste login was there
+- 0d0d8f5 feat(login): review a claim as a folded tree and answer approve/refuse from a list, so never routes and scopes read at a glance and a stray key can't approve
+- f1577df feat(ask): select, fold and review prompts redrawn in place on a tty, so questions can show folded details and take a picked answer instead of a typed y/N
+- 5e94871 docs(prompts): plan styled, foldable, pick-from-list tty prompts
+- 8d7bdb3 feat(tui): keep a build's warnings and notes on the instance and show them in a two-column detail, since they were lost once the build log scrolled by
+- dadaa35 feat(ps): list sandbox instances with their usage like the dashboard, since a raw container listing plus separate stats and status verbs said less with more commands
+- f55a539 fix(vscode): start code without the ssh-agent and git credential helper for a claimed instance, and let the dashboard open one anyway like the cli
+- 08889c0 feat(broker): ask a person for tags, releases and ref deletions whatever the scope allows, since no rule should publish for them
+- d238f50 feat(devsbd): access wait blocks on a permission request, so an agent retries its call once it's answered
+- 76a0b0b feat(tui): a modal answers permission requests as they open, and a desktop popup names the command, so a held call needn't time out
+- 81a8aa9 feat(access): pending, approve and deny answer permission requests from the terminal
+- 8084400 feat(api): list and answer permission requests over access.pending and access.decide, local clients only
+- 1f9e5f8 feat(broker): keep this-instance, always and deny answers, so an answered ask isn't asked again
+- 88865ed feat(broker): hold an asked call for its permission request instead of refusing it, so an answer lets it through
+- f206473 docs(broker): split permission requests into what's built now and what waits on pushes, links and agents
+- 4a7c96d feat(sentry): follow features/sentry 1.3.0's org fence, checked end to end, so existing credentials learn they need orgs
+- 727f9db feat(login): --org names a sentry credential's orgs, checked with the token, and access ls shows them, since a credential naming none has its org routes refused
+- e5b0985 feat(broker): enforce the org fence and cut org lists to it, so a sentry token reaches only the orgs its credential names
+- 731ee26 feat(credentials): a claim can fence an org path variable, so a credential and a config can name the orgs it reaches
+- 1ca365c docs(sentry): plan the org fence, since the shipped claim's tokens reach every org the account is in
+- fc2f518 docs(credentials): record what 0.11.0 shipped with: sentry's claim spans orgs, the broker is http/1.1 only, drains cut broker streams
+- 3ca4b57 fix(config): refuse an unknown top-level table, so a typo like [sandboxx] isn't silently ignored
+- 3028a4b docs(site): close the site refresh and release plan
+</details>
 
 ## 0.11.0
 
