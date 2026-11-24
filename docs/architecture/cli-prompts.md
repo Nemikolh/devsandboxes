@@ -2,19 +2,21 @@
 
 How the CLI asks a question on a terminal: a list of answers picked with
 the arrows or a hotkey, optionally under a tree of details that folds
-open in place. Read this before adding a prompt or changing how one
+open in place, or a checklist of answers to check any number of. Read this before adding a prompt or changing how one
 looks.
 
-Code: `src/ask/mod.rs` (`select`, `review`, `Answer`, `Key`, `Frame`,
-`Raw`, `interactive`, `visible`, `window`, `summary`, `plain_select`,
-`parse_plain`), `src/ask/style.rs` (`enabled`, `Style`, `Role`),
+Code: `src/ask/mod.rs` (`select`, `review`, `multi`, `Answer`, `Key`,
+`Frame`, `Widget`, `Raw`, `interactive`, `visible`, `window`, `summary`,
+`checked_labels`, `plain_select`, `parse_plain`, `plain_multi`,
+`parse_plain_multi`), `src/ask/style.rs` (`enabled`, `Style`, `Role`),
 `src/ask/select.rs` (`Select`, `Choice`, `Outcome`),
+`src/ask/multi.rs` (`Multi`, `Outcome`),
 `src/ask/fold.rs` (`Fold`, `Node`, `PREVIEW`), `src/ask/review.rs`
 (`Review`).
 
 ## Shape
 
-The widgets (`Select`, `Fold`, `Review`) are I/O-free state machines:
+The widgets (`Select`, `Multi`, `Fold`, `Review`) are I/O-free state machines:
 `key(Key)` changes the state, `lines(Style, …)` / `frame(Style)` render
 it as strings. `Key` is the module's own key type, so tests drive them
 without crossterm; `key_of` maps crossterm's `KeyEvent` to it. All
@@ -23,7 +25,13 @@ output goes to stderr, so a command's stdout stays clean for pipes.
 `select(question, choices, default)` and `review(tree, question,
 choices, default)` are the entry points. Both return
 `Answer::Picked(index)` or `Answer::Cancelled`; callers turn a cancel
-into their own refusal.
+into their own refusal. `multi(question, choices, checked)` returns the
+checked indexes, ascending (possibly none), or `None` on a cancel.
+
+The `Widget` trait is what `interactive` runs: `key` returns `None`
+while the question is open, else the widget's own `Outcome` type
+(`select::Outcome` for `Select` and `Review`, `multi::Outcome` for
+`Multi`).
 
 ## Callers
 
@@ -109,6 +117,19 @@ the roots and the children of open nodes; preview lines are not.
 - ↑/↓ and `k`/`j` move; → opens; Space and Enter toggle; ← closes an
   open node, else moves to its parent.
 
+`Multi` shows `? question` and one line per `Choice`, as `Select`
+does, with a mark between the cursor gutter and the label: an accent
+`◉` for a checked choice, `◯` otherwise. A dim key-help line
+follows. `checked` sets the first marks; the cursor starts on the
+first choice.
+
+- ↑/↓ and `k`/`j` move, clamped, as in `Select`.
+- Space toggles the cursor's choice; a choice's hotkey
+  (case-insensitive) toggles that choice, and a hotkey `k` or `j` wins
+  over navigation.
+- Enter answers with the checked set, empty included; Esc and Ctrl-C
+  cancel.
+
 `Review` stacks a `Fold` above a `Select` with a dim key-help line
 below. Focus starts on the choices, at the caller's default (the safe
 answer). Tab switches focus; ↑ on the first choice moves into the tree
@@ -137,7 +158,8 @@ foot. A terminal reporting 0 rows (an unsized pty) is drawn unclamped.
 Once answered, the widget is erased and plain lines are left in
 scrollback: for `review`, each root of the tree collapsed to one line
 (`Fold::summary_lines`); then `? question › answer` (question bold,
-answer accent), or `? question › cancelled` dimmed.
+answer accent), or `? question › cancelled` dimmed. For `multi` the
+answer is the checked labels joined with `, `, or `none`.
 
 ## Plain fallback
 
@@ -150,3 +172,11 @@ routes), the question, the choices numbered `1) …`, and
 `[1-N, default D] > `. One line is read from stdin: empty picks the
 default, a number or a hotkey picks that choice, end of input cancels,
 anything else is an error.
+
+`multi` falls back the same way: the question, the choices numbered
+with `[x]` / `[ ]` for `checked`, and `[numbers or names,
+comma-separated; empty keeps the checked] > `. Empty keeps `checked`;
+else the line, split on commas and whitespace, is exactly the set
+answered, each item a 1-based number or a label (case-insensitive).
+An invalid item prints an error line and the prompt asks again, so a
+typo doesn't end the command; end of input cancels.

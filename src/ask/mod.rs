@@ -1,8 +1,9 @@
-//! Interactive questions on stderr: a select list and a review (a fold
-//! tree above a select), redrawn in place in raw mode, with a plain
+//! Interactive questions on stderr: a select list, a checklist and a
+//! review (a fold tree above a select), redrawn in place in raw mode, with a plain
 //! line-read fallback off a terminal. See docs/architecture/cli-prompts.md.
 
 pub mod fold;
+pub mod multi;
 pub mod review;
 pub mod select;
 pub mod style;
@@ -16,6 +17,7 @@ use crossterm::queue;
 use crossterm::terminal::{self, Clear, ClearType, DisableLineWrap, EnableLineWrap};
 
 pub use fold::Node;
+pub use multi::Multi;
 pub use review::Review;
 pub use select::{Choice, Outcome, Select};
 pub use style::Style;
@@ -52,13 +54,21 @@ pub struct Frame {
 }
 
 trait Widget {
-    fn key(&mut self, key: Key) -> Outcome;
+    type Outcome;
+    /// `None` while the question is still open.
+    fn key(&mut self, key: Key) -> Option<Self::Outcome>;
     fn frame(&self, style: Style) -> Frame;
 }
 
+fn settled(outcome: Outcome) -> Option<Outcome> {
+    (outcome != Outcome::Pending).then_some(outcome)
+}
+
 impl Widget for Select {
-    fn key(&mut self, key: Key) -> Outcome {
-        Select::key(self, key)
+    type Outcome = Outcome;
+
+    fn key(&mut self, key: Key) -> Option<Outcome> {
+        settled(Select::key(self, key))
     }
 
     fn frame(&self, style: Style) -> Frame {
@@ -69,12 +79,28 @@ impl Widget for Select {
 }
 
 impl Widget for Review {
-    fn key(&mut self, key: Key) -> Outcome {
-        Review::key(self, key)
+    type Outcome = Outcome;
+
+    fn key(&mut self, key: Key) -> Option<Outcome> {
+        settled(Review::key(self, key))
     }
 
     fn frame(&self, style: Style) -> Frame {
         Review::frame(self, style)
+    }
+}
+
+impl Widget for Multi {
+    type Outcome = multi::Outcome;
+
+    fn key(&mut self, key: Key) -> Option<multi::Outcome> {
+        Some(Multi::key(self, key)).filter(|outcome| *outcome != multi::Outcome::Pending)
+    }
+
+    fn frame(&self, style: Style) -> Frame {
+        let mut body = self.lines(style);
+        body.push(style.dim("↑↓ move · space toggle · enter done · esc cancel"));
+        Frame { body, foot: Vec::new(), focus: Some(1 + self.cursor()) }
     }
 }
 
@@ -112,6 +138,32 @@ pub fn review(tree: Vec<Node>, question: &str, choices: &[Choice], default: usiz
             plain_select(widget.select(), style)
         }
     }
+}
+
+/// Ask `question` with `choices` to check, `checked` checked at first;
+/// the checked indexes, ascending, or `None` on a cancel. Leaves one
+/// summary line on stderr.
+// The caller lands with machine add's allowance question.
+#[allow(dead_code)]
+pub fn multi(question: &str, choices: &[Choice], checked: &[bool]) -> Result<Option<Vec<usize>>> {
+    let style = Style::detect();
+    let mut widget = Multi::new(question, choices.to_vec(), checked);
+    let picked = match interactive(&mut widget, style)? {
+        Some(multi::Outcome::Done(picked)) => Some(picked),
+        Some(_) => None,
+        None => return plain_multi(&widget, style),
+    };
+    let labels = picked.as_deref().map(|picked| checked_labels(choices, picked));
+    eprintln!("{}", summary(question, labels.as_deref(), style));
+    Ok(picked)
+}
+
+/// `a, b`, or `none` for an empty answer.
+fn checked_labels(choices: &[Choice], picked: &[usize]) -> String {
+    if picked.is_empty() {
+        return "none".to_string();
+    }
+    picked.iter().map(|&i| choices[i].label.as_str()).collect::<Vec<_>>().join(", ")
 }
 
 fn answer(outcome: Outcome) -> Answer {
@@ -164,7 +216,7 @@ impl Drop for Raw {
 /// Run `widget` in place; `None` when this isn't an interactive terminal
 /// (the caller falls back to the plain prompt). The widget is erased
 /// before returning.
-fn interactive(widget: &mut impl Widget, style: Style) -> Result<Option<Outcome>> {
+fn interactive<W: Widget>(widget: &mut W, style: Style) -> Result<Option<W::Outcome>> {
     let dumb = std::env::var("TERM").is_ok_and(|t| t == "dumb");
     if dumb || !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         return Ok(None);
@@ -197,11 +249,8 @@ fn interactive(widget: &mut impl Widget, style: Style) -> Result<Option<Outcome>
                 _ => {}
             }
         };
-        if let Some(key) = key {
-            match widget.key(key) {
-                Outcome::Pending => {}
-                done => break done,
-            }
+        if let Some(outcome) = key.and_then(|key| widget.key(key)) {
+            break outcome;
         }
     };
     erase(&mut err, drawn)?;
@@ -288,6 +337,64 @@ fn plain_select(select: &Select, style: Style) -> Result<Answer> {
     parse_plain(&line, choices, select.cursor()).map(Answer::Picked)
 }
 
+/// Asks again after an invalid answer: a typo shouldn't end the command.
+fn plain_multi(multi: &Multi, style: Style) -> Result<Option<Vec<usize>>> {
+    for line in plain_multi_lines(multi, style) {
+        eprintln!("{line}");
+    }
+    loop {
+        eprint!("[numbers or names, comma-separated; empty keeps the checked] > ");
+        std::io::stderr().flush()?;
+        let mut line = String::new();
+        let read = std::io::stdin().lock().read_line(&mut line)?;
+        // A terminal echoed the newline; piped input didn't.
+        if read == 0 || !std::io::stdin().is_terminal() {
+            eprintln!();
+        }
+        if read == 0 {
+            return Ok(None);
+        }
+        match parse_plain_multi(&line, multi.choices(), multi.checked()) {
+            Ok(picked) => return Ok(Some(picked)),
+            Err(err) => eprintln!("{}", style.warn(&err.to_string())),
+        }
+    }
+}
+
+fn plain_multi_lines(multi: &Multi, style: Style) -> Vec<String> {
+    let mut lines = vec![select::question_line(multi.question(), style)];
+    for (i, choice) in multi.choices().iter().enumerate() {
+        let mark = if multi.checked()[i] { "[x]" } else { "[ ]" };
+        lines.push(format!("  {}) {mark} {}", i + 1, select::choice_text(choice, style, false)));
+    }
+    lines
+}
+
+/// Empty keeps `checked`; else exactly the listed set, each item a
+/// 1-based number or a label (case-insensitive), split on commas and
+/// whitespace.
+fn parse_plain_multi(input: &str, choices: &[Choice], checked: &[bool]) -> Result<Vec<usize>> {
+    let items: Vec<&str> = input.split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()).collect();
+    if items.is_empty() {
+        return Ok(multi::checked_indexes(checked));
+    }
+    let mut picked = Vec::new();
+    for item in items {
+        let i = match item.parse::<usize>() {
+            Ok(n) if n == 0 || n > choices.len() => bail!("selection out of range: {item}"),
+            Ok(n) => n - 1,
+            Err(_) => match choices.iter().position(|choice| choice.label.eq_ignore_ascii_case(item)) {
+                Some(i) => i,
+                None => bail!("invalid selection: {item}"),
+            },
+        };
+        picked.push(i);
+    }
+    picked.sort_unstable();
+    picked.dedup();
+    Ok(picked)
+}
+
 fn plain_lines(select: &Select, style: Style) -> Vec<String> {
     let mut lines = vec![select::question_line(select.question(), style)];
     for (i, choice) in select.choices().iter().enumerate() {
@@ -341,6 +448,43 @@ mod tests {
     fn plain_lines_number_the_choices() {
         let select = Select::new("Approve?", choices(), 1);
         assert_eq!(plain_lines(&select, Style::plain()), ["? Approve?", "  1) Approve [a]", "  2) Refuse [r]  safe"]);
+    }
+
+    #[test]
+    fn plain_multi_answers_are_the_listed_set_and_empty_keeps_the_checked() {
+        let c = vec![Choice::new("docker"), Choice::new("host-network"), Choice::new("gpu")];
+        let checked = [false, true, true];
+        assert_eq!(parse_plain_multi(" \n", &c, &checked).unwrap(), [1, 2]);
+        assert_eq!(parse_plain_multi("3, 1\n", &c, &checked).unwrap(), [0, 2]);
+        assert_eq!(parse_plain_multi("Host-Network docker,1", &c, &checked).unwrap(), [0, 1]);
+        assert_eq!(parse_plain_multi("gpu", &c, &checked).unwrap(), [2]);
+        assert_eq!(parse_plain_multi("", &c, &[]).unwrap(), Vec::<usize>::new());
+        assert!(parse_plain_multi("0", &c, &checked).is_err());
+        assert!(parse_plain_multi("4", &c, &checked).is_err());
+        assert!(parse_plain_multi("docker, ssh", &c, &checked).is_err());
+    }
+
+    #[test]
+    fn plain_multi_lines_number_and_mark_the_choices() {
+        let multi = Multi::new("Lend?", vec![Choice::new("docker").hint("containers"), Choice::new("gpu")], &[false, true]);
+        assert_eq!(
+            plain_multi_lines(&multi, Style::plain()),
+            ["? Lend?", "  1) [ ] docker  containers", "  2) [x] gpu"]
+        );
+    }
+
+    #[test]
+    fn checked_labels_join_or_say_none() {
+        let c = choices();
+        assert_eq!(checked_labels(&c, &[0, 1]), "Approve, Refuse");
+        assert_eq!(checked_labels(&c, &[]), "none");
+    }
+
+    #[test]
+    fn multi_frame_ends_with_its_help_line() {
+        let frame = Widget::frame(&Multi::new("q", vec![Choice::new("x")], &[true]), Style::plain());
+        assert_eq!(frame.body, ["? q", "❯ ◉ x", "↑↓ move · space toggle · enter done · esc cancel"]);
+        assert_eq!(frame.focus, Some(1));
     }
 
     #[test]
