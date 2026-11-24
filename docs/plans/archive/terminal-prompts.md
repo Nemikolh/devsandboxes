@@ -1,3 +1,7 @@
+> Archived 2026-11-24. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/cli-prompts.md](../../architecture/cli-prompts.md),
+> [reference/credentials-cli.md](../../reference/credentials-cli.md)
+
 # Terminal prompts
 
 Interactive CLI questions and reviews that read well on a TTY: color and

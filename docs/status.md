@@ -12,8 +12,7 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- Terminal prompts: styled, foldable, pick-from-list TTY prompts
-  ([plan](plans/active/terminal-prompts.md)).
+Nothing.
 
 ## Planned
 
@@ -128,6 +127,9 @@ is frozen: no new work on it.
 
 ## Parked
 
+- **cli**: styled report output (`ls`, `inbox ls`, `status`) like the
+  prompts' (`ask::style`); `render.rs` colors tables on stdout today.
+  → [cli prompts](architecture/cli-prompts.md)
 - **credentials**: GitHub App installation tokens (`as = "app"`,
   `login github --app`; github-and-sentry-access steps 3-4): most users
   work in orgs where they can't install an app, so a narrow fine-grained
@@ -251,6 +253,10 @@ is frozen: no new work on it.
 
 ## Known limitations
 
+- A prompt's plain fallback (`TERM=dumb`, stderr not a terminal) fails
+  the command on an answer that is neither a number, a hotkey nor empty,
+  rather than asking again (`ask::parse_plain`).
+  → [cli prompts](architecture/cli-prompts.md)
 - A command on a machine with several roots and no default (no signed
   copy, no `~/.devsandboxes`) is refused: the CLI has no way to name a
   root on a machine, and the dashboard's remote rows still take the
