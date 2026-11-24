@@ -367,6 +367,9 @@ first:
 | `listing` | container statuses, drift, `runtime_version` | tens of ms |
 | `full` (absent) | `cpu`/`mem` | about 1.5 s on docker (a stats sample) |
 
+The result's top-level `depth` says how far it went (`disk`, `listing`,
+`full`): the asked one, `disk` on a host with no runtime.
+
 Each instance row carries `profile` (absent when it has none) and
 `profile_disallowed` (`true` when its sandbox no longer allows that
 profile; `false` when the sandbox doesn't resolve)
@@ -418,8 +421,11 @@ runs every 2 s (otherwise on container events and a timer, see
 `instances.changed`) and joins every watched root against its
 one listing; stats (`cpu`/`mem`) are asked at most every 7 s, and at once
 for a root that hasn't had them yet. A snapshot between stats passes
-carries each running container's last `cpu`/`mem` over, so every pushed
-snapshot is complete. With nothing watched, nothing is collected.
+carries each running container's last `cpu`/`mem` over and says `depth`
+`full` like a stats pass: a push's `depth` is how complete it is (`disk`:
+statuses `unknown`; `listing`: statuses, no `cpu`/`mem` yet; `full`:
+both), what a one-shot reader like `ps` waits on. With nothing watched,
+nothing is collected.
 
 The first snapshot comes at once: the cached one when another watcher
 keeps the root fresh, else one at `disk` depth (no runtime call), then a
@@ -1656,7 +1662,7 @@ remote `thread_children` aren't merged. Plus, top-level:
 
 | field | |
 |---|---|
-| `machines` | every machine (registered, and the inbound neighbors up now), by name, then those seen through this host's control plane: `{"name", "kind", "target", "command", "state", "error", "behind", "behind_here", "version", "runtime", "agent", "capacity", "via", "exposed_by"}`; `kind` and `target` as `machines.list`'s, `command` the remote devsandbox (`null`: `devsandbox`), `runtime` its `runtime_name` once a snapshot came (`null` for one with `no_runtime`), `agent` this host's grant (as `machines.list`'s), `capacity` its [capacity](#capacity) from its last push (`null` before one carried it), `via` `null`, `exposed_by` as `machines.list`'s (this host's graph, on a lifted entry too), `behind` and `behind_here` as `machines.list`'s (a lifted entry's `behind` the control plane's view's while the control plane is connected, its `behind_here` `null`) |
+| `machines` | every machine (registered, and the inbound neighbors up now), by name, then those seen through this host's control plane: `{"name", "kind", "target", "command", "state", "error", "behind", "behind_here", "version", "runtime", "depth", "agent", "capacity", "via", "exposed_by"}`; `kind` and `target` as `machines.list`'s, `command` the remote devsandbox (`null`: `devsandbox`), `runtime` its `runtime_name` once a snapshot came (`null` for one with `no_runtime`), `depth` the shallowest `depth` of its roots' last pushes once every root it listed has pushed (`full` for one with no roots, `null` before), `agent` this host's grant (as `machines.list`'s), `capacity` its [capacity](#capacity) from its last push (`null` before one carried it), `via` `null`, `exposed_by` as `machines.list`'s (this host's graph, on a lifted entry too), `behind` and `behind_here` as `machines.list`'s (a lifted entry's `behind` the control plane's view's while the control plane is connected, its `behind_here` `null`) |
 
 On a fleet member, the machines its control plane sees (the control plane's federated push to
 this host's watch of it, this host left out) follow, each one `via` the

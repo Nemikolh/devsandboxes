@@ -316,7 +316,7 @@ mod tests {
         }
         app.set_snapshot(full);
         let mut next = snapshot_with_status(2, running());
-        next.stats = false;
+        next.depth = crate::snapshot::Depth::Listing;
         next.instances[0].cpu = Some("2%".into());
         next.instances[1].status = ContainerStatus::Exited("Exited (0)".into());
         app.set_snapshot(next);
@@ -482,7 +482,7 @@ mod tests {
             runtime_name: "docker".into(),
             runtime_version: None,
             collected_at: std::time::Instant::now(),
-            stats: true,
+            depth: crate::snapshot::Depth::Full,
             error: None,
             no_runtime: false,
         };
@@ -639,7 +639,7 @@ mod tests {
             runtime_name: "docker".into(),
             runtime_version: None,
             collected_at: std::time::Instant::now(),
-            stats: true,
+            depth: crate::snapshot::Depth::Full,
             error: None,
             no_runtime: false,
         });

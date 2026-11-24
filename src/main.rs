@@ -1031,10 +1031,7 @@ fn main() -> Result<()> {
 
     match command {
         Command::Ls { json } => commands::ls::ls(&cli.dir, json),
-        #[cfg(unix)]
-        Command::Ps { all, json } => commands::ps::ps(&cli.dir, all, json, !machines.is_empty()),
-        #[cfg(not(unix))]
-        Command::Ps { all, json } => commands::ps::ps(&cli.dir, all, json, false),
+        Command::Ps { all, json } => commands::ps::ps(&cli.dir, all, json),
         // Placement is the daemon's: here, `--place` can only say it isn't.
         Command::Run { sandbox, name, branch, base, profile, env, dispatcher, json, reprobe, detach, place, fail_on_ask } => {
             if detach {

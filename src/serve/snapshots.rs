@@ -134,13 +134,17 @@ impl Snapshots {
             // watch reads the cache through.
             let prev = self.lock().roots.get(dir).map(|r| r.usage.clone()).unwrap_or_default();
             let mut list = join(dir, view);
+            let stats = list.snapshot.depth == Depth::Full;
+            let had = self.lock().roots.get(dir).is_some_and(|r| r.stats);
             carry_over(&mut list.snapshot, &prev);
+            if had && list.snapshot.depth == Depth::Listing {
+                // Its cpu/mem are in, carried over: as complete as a stats pass.
+                list.snapshot.depth = Depth::Full;
+            }
             let usage = usage(&list.snapshot);
-            let stats = list.snapshot.stats;
             let capacity = self.lock().capacity.clone();
             let Some(pushed) = params_with(dir, &list, capacity) else { continue };
             let mut inner = self.lock();
-            let had = inner.roots.get(dir).is_some_and(|r| r.stats);
             inner.roots.insert(dir.clone(), Root { pushed: Arc::clone(&pushed), usage, stats: had || stats });
             out.push((dir.clone(), pushed));
         }
@@ -386,6 +390,11 @@ pub struct SnapshotMachine {
     pub version: Option<String>,
     /// The remote's runtime (`runtime_name`), once a snapshot came.
     pub runtime: Option<String>,
+    /// The shallowest `depth` of its roots' last pushes, once every root
+    /// it listed has pushed one (`None` before; a machine with no roots,
+    /// once listed, `full`): what a reader waits on for its rows.
+    #[serde(default)]
+    pub depth: Option<Depth>,
     /// The remote devsandbox (`None`: `devsandbox`), as the registry has it.
     pub command: Option<String>,
     /// This host grants its agent to this member, at its current key
@@ -629,6 +638,7 @@ fn snapshot_machine(m: &Machine) -> SnapshotMachine {
         row.get("runtime_name")?.as_str().map(str::to_string)
     });
     SnapshotMachine {
+        depth: machine_depth(m),
         capacity: m.capacity(),
         name: m.name.clone(),
         kind: m.kind,
@@ -644,6 +654,16 @@ fn snapshot_machine(m: &Machine) -> SnapshotMachine {
         via: None,
         exposed_by: None,
     }
+}
+
+fn machine_depth(m: &Machine) -> Option<Depth> {
+    if !m.listed {
+        return None;
+    }
+    m.roots.iter().try_fold(Depth::Full, |shallowest, root| {
+        let depth = m.rows.get(root)?.get("depth").cloned().and_then(|d| serde_json::from_value(d).ok()).unwrap_or_default();
+        Some(shallowest.min(depth))
+    })
 }
 
 fn take_array(obj: &mut Map<String, Value>, key: &str) -> Vec<Value> {
@@ -698,7 +718,7 @@ pub fn carry_remote_status(prev: &Value, next: &mut Value) {
 /// A snapshot without stats keeps the last cpu/mem of containers still
 /// running, so the columns don't blank between stats passes.
 fn carry_over(snapshot: &mut Snapshot, prev: &Usage) {
-    if snapshot.stats {
+    if snapshot.depth == Depth::Full {
         return;
     }
     for row in &mut snapshot.instances {
@@ -756,7 +776,7 @@ pub(crate) mod tests {
             "runtime_name": "docker", "runtime_version": null, "error": null,
         });
         let mut s: Snapshot = serde_json::from_value(json).unwrap();
-        s.stats = stats;
+        s.depth = if stats { Depth::Full } else { Depth::Listing };
         s
     }
 
@@ -856,10 +876,10 @@ pub(crate) mod tests {
         assert_eq!(
             merged["machines"],
             serde_json::json!([
-                {"name": "a", "kind": "ssh", "target": "me@a", "state": "connected", "error": null, "behind": "its why", "behind_here": "here why", "version": "0.6.1", "runtime": "podman", "command": null, "agent": false, "capacity": cap, "via": null, "exposed_by": null},
-                {"name": "b", "kind": "ssh", "target": "me@b", "state": "unreachable", "behind": null, "behind_here": null, "error": "b: Connection refused", "version": null, "runtime": "podman", "command": null, "agent": false, "capacity": null, "via": null, "exposed_by": null},
-                {"name": "c", "kind": "ssh", "target": "me@c", "state": "unreachable", "behind": null, "behind_here": null, "error": "c: Permission denied", "version": null, "runtime": null, "command": "~/bin/devsandbox", "agent": false, "capacity": null, "via": null, "exposed_by": null},
-                {"name": "w", "kind": "inbound", "target": null, "state": "idle", "error": null, "behind": null, "behind_here": null, "version": null, "runtime": null, "command": null, "agent": false, "capacity": null, "via": null, "exposed_by": null},
+                {"name": "a", "kind": "ssh", "target": "me@a", "state": "connected", "error": null, "behind": "its why", "behind_here": "here why", "version": "0.6.1", "runtime": "podman", "depth": null, "command": null, "agent": false, "capacity": cap, "via": null, "exposed_by": null},
+                {"name": "b", "kind": "ssh", "target": "me@b", "state": "unreachable", "behind": null, "behind_here": null, "error": "b: Connection refused", "version": null, "runtime": "podman", "depth": null, "command": null, "agent": false, "capacity": null, "via": null, "exposed_by": null},
+                {"name": "c", "kind": "ssh", "target": "me@c", "state": "unreachable", "behind": null, "behind_here": null, "error": "c: Permission denied", "version": null, "runtime": null, "depth": null, "command": "~/bin/devsandbox", "agent": false, "capacity": null, "via": null, "exposed_by": null},
+                {"name": "w", "kind": "inbound", "target": null, "state": "idle", "error": null, "behind": null, "behind_here": null, "version": null, "runtime": null, "depth": null, "command": null, "agent": false, "capacity": null, "via": null, "exposed_by": null},
             ])
         );
         crate::serve::dts::assert_matches("SnapshotMachine", &merged["machines"][0]);
@@ -870,6 +890,32 @@ pub(crate) mod tests {
         want["machines"] = serde_json::json!([]);
         want["sandbox_count"] = serde_json::json!(want["sandboxes"].as_array().unwrap().len());
         assert_eq!(alone, want);
+    }
+
+    /// A machine's `depth`: none until it listed and every root pushed, then
+    /// the shallowest of them (a push without one is `disk`).
+    #[test]
+    fn a_machines_depth_is_its_shallowest_roots() {
+        let with = |depth: Option<&str>| {
+            let mut p = (*remote("/r/x", &[])).clone();
+            if let Some(d) = depth {
+                p["depth"] = d.into();
+            }
+            Arc::new(p)
+        };
+        let mut a = machine("a", &["/r/one", "/r/two"], LinkState::Connected);
+        a.rows.insert("/r/one".into(), with(Some("full")));
+        assert_eq!(machine_depth(&a), None, "not listed");
+        a.listed = true;
+        assert_eq!(machine_depth(&a), None, "/r/two hasn't pushed");
+        a.rows.insert("/r/two".into(), with(Some("listing")));
+        assert_eq!(machine_depth(&a), Some(Depth::Listing));
+        a.rows.insert("/r/two".into(), with(None));
+        assert_eq!(machine_depth(&a), Some(Depth::Disk));
+        a.rows.insert("/r/two".into(), with(Some("full")));
+        assert_eq!(snapshot_machine(&a).depth, Some(Depth::Full));
+        let none = Machine { listed: true, ..machine("n", &[], LinkState::Connected) };
+        assert_eq!(machine_depth(&none), Some(Depth::Full), "no roots: nothing to wait for");
     }
 
     /// An instance whose root isn't listed comes from the machine's default
@@ -1127,6 +1173,7 @@ pub(crate) mod tests {
         assert_eq!(pushed.len(), 2);
         assert_eq!(pushed[1].1["instances"][0]["cpu"], "5%");
         assert_eq!(cache.cached(&b).unwrap()["instances"][0]["cpu"], "5%");
+        assert_eq!(pushed[1].1["depth"], "full", "carried over: complete");
         for (_, p) in &pushed {
             assert_eq!(p["capacity"], serde_json::to_value(&capacity).unwrap());
         }
@@ -1140,6 +1187,7 @@ pub(crate) mod tests {
         assert_eq!(cache.uncached(&three), [c.clone()].into());
         cache.prune(&three);
         cache.collect(&view(Depth::Listing), &three, &join);
+        assert_eq!(cache.cached(&c).unwrap()["depth"], "listing", "never had stats");
         assert!(cache.cached(&b).is_none());
         assert!(cache.cached(&c).is_some());
         cache.prune(&BTreeSet::new());

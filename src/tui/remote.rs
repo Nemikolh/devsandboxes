@@ -329,6 +329,7 @@ pub(crate) mod tests {
             error: None,
             version: None,
             runtime: None,
+            depth: None,
             command: None,
             agent: false,
             capacity: None,

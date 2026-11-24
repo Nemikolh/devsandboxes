@@ -1923,7 +1923,7 @@ mod tests {
             runtime_name: "docker".into(),
             runtime_version: None,
             collected_at: std::time::Instant::now(),
-            stats: false,
+            depth: crate::snapshot::Depth::Disk,
             error: None,
             no_runtime: false,
         }

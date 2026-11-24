@@ -267,8 +267,8 @@ pub struct ServiceRow {
 
 /// A point-in-time view of instances plus any collection error (docker/config
 /// unavailable). Rows are always present from state even when docker is down.
-/// Deserializes too (the dashboard reads `instances.snapshot` pushes): the
-/// skipped fields then say when it arrived and no stats; the daemon already
+/// Deserializes too (the dashboard and `ps` read `instances.snapshot`
+/// pushes): the skipped field then says when it arrived; the daemon already
 /// carried cpu/mem over, so the reader installs it as is.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -290,11 +290,12 @@ pub struct Snapshot {
     /// off-process; a JSON consumer prints at collection time itself.
     #[serde(skip, default = "Instant::now")]
     pub collected_at: Instant,
-    /// Whether cpu/mem were collected ([`Depth::Full`]). The daemon's poll
-    /// collects them on a slower cadence and carries the last values over
-    /// otherwise.
-    #[serde(skip)]
-    pub stats: bool,
+    /// How far the runtime was asked for it: what a reader can wait on
+    /// (`ps` waits for `full`). The daemon's poll collects cpu/mem on a
+    /// slower cadence and carries the last values over in between, so its
+    /// listing-only pass on a root that has had stats says `full` too.
+    #[serde(default)]
+    pub depth: Depth,
     pub error: Option<String>,
     /// This host has no container runtime (its binary isn't on `PATH`,
     /// `runtime::installed`): a driver. Nothing was asked of a runtime and
@@ -728,10 +729,12 @@ pub fn identity_notes(
 /// walks all three for a newly watched root (a disk snapshot at once, then its
 /// poll's passes) so the tree renders at once and the runtime data fills in
 /// as it arrives.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Depth {
     /// State + config only, no runtime calls: every container status is
     /// [`ContainerStatus::Unknown`], no drift, cpu/mem or runtime version.
+    #[default]
     Disk,
     /// Plus the listing + version (tens of ms): statuses and drift, no cpu/mem.
     Listing,
@@ -883,7 +886,7 @@ fn join(dir: &Path, state: anyhow::Result<State>, view: &RuntimeView) -> Snapsho
                 runtime_name: view.runtime_name.clone(),
                 runtime_version: None,
                 collected_at,
-                stats: false,
+                depth: view.depth,
                 error: Some(format!("state: {e:#}")),
                 no_runtime: view.no_runtime,
             };
@@ -986,7 +989,7 @@ fn join(dir: &Path, state: anyhow::Result<State>, view: &RuntimeView) -> Snapsho
         runtime_name: view.runtime_name.clone(),
         runtime_version: view.runtime_version.clone(),
         collected_at,
-        stats: view.depth == Depth::Full,
+        depth: view.depth,
         error: if errors.is_empty() { None } else { Some(errors.join("; ")) },
         no_runtime: view.no_runtime,
     }
@@ -1333,14 +1336,14 @@ extends = "does-not-exist"
             runtime_name: "docker".into(),
             runtime_version: Some("24.0.7".into()),
             collected_at: Instant::now(),
-            stats: true,
+            depth: crate::snapshot::Depth::Full,
             error: Some("e".into()),
             no_runtime: false,
         };
         let json = serde_json::to_value(&snapshot).unwrap();
         let back: Snapshot = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(serde_json::to_value(&back).unwrap(), json);
-        assert!(!back.stats, "set by the reader from the depth it asked");
+        assert_eq!(json["depth"], "full", "on the wire: what a reader waits on");
         assert_eq!(json["sandboxes"][1]["worktree_branch"], "agent/${instance}");
         assert_eq!(json["sandboxes"][0]["worktree_branch"], serde_json::Value::Null, "unresolved");
         assert_eq!(json["sandboxes"][1]["dispatcher"], false);
@@ -1667,16 +1670,16 @@ extends = "does-not-exist"
 
         let disk = join(&dir, Ok(load()), &view(Depth::Disk));
         assert_eq!(disk.instances[0].status, ContainerStatus::Unknown);
-        assert!(!disk.stats && disk.runtime_version.is_none());
+        assert!(disk.depth == Depth::Disk && disk.runtime_version.is_none());
 
         let listing = join(&dir, Ok(load()), &view(Depth::Listing));
         assert_eq!(listing.instances[0].status, ContainerStatus::Running("Up 1s".into()));
-        assert_eq!((listing.instances[0].cpu.as_deref(), listing.stats), (None, false));
+        assert_eq!((listing.instances[0].cpu.as_deref(), listing.depth), (None, Depth::Listing));
         assert_eq!(listing.runtime_version.as_deref(), Some("27.0"));
 
         let full = join(&dir, Ok(load()), &view(Depth::Full));
         assert_eq!((full.instances[0].cpu.as_deref(), full.instances[0].mem.as_deref()), (Some("1%"), Some("2MiB")));
-        assert!(full.stats);
+        assert_eq!(full.depth, Depth::Full);
 
         let mut down = view(Depth::Listing);
         down.ps.clear();

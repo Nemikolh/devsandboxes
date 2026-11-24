@@ -46,7 +46,11 @@ state and `Snapshot.error` says why.
 - Header data: `sandbox_count`, `runtime_name`, `runtime_version`,
   `no_runtime` (no runtime installed here: `RuntimeView::driver`, nothing
   asked, no runtime `error`).
-  `collected_at` and `stats` are `#[serde(skip)]`.
+  `collected_at` is `#[serde(skip)]`.
+- `depth`: how far the runtime was asked (`disk`, `listing`, `full`).
+  The daemon's poll says `full` for a listing pass on a root that has had
+  stats (`serve::snapshots::Snapshots::collect`: its cpu/mem are carried
+  over), so `full` means the cpu/mem are in.
 
 `root` is the config root a row came from; `machine` is set only on a
 federated snapshot's remote rows.
@@ -61,8 +65,8 @@ and drift), `Full` (plus `stats`, which dominates collection time).
 which is how the daemon's one poll serves every watched root
 ([../daemon/host-poll.md](../daemon/host-poll.md)).
 
-Callers: `ps` (`RuntimeView::gather(Full)` + `collect_from`, so it
-warns on the runtime's own errors only), the daemon's poll
+Callers: `ps`'s local fallback (`RuntimeView::gather(Full)` +
+`collect_from`, so it warns on the runtime's own errors only), the daemon's poll
 (`collect_from`, pushed as `instances.snapshot`), `instances.list`
 (`collect_with` at the requested `depth`). The dashboard collects nothing
 itself.
@@ -87,16 +91,28 @@ one with `-a`), this host's first, then by machine, each by name.
 `InstanceRow::status_label` (` (done)` added for a done instance),
 UPTIME `render::humanize_secs` for a running one; then PROFILE when some
 row has a profile (`<p> (not allowed)` when flagged), and MACHINE when
-machines exist (`LOCAL_MACHINE`, `@`, for this host's rows). Services
-are `service ls`'s.
+the snapshot has `machines` entries (`LOCAL_MACHINE`, `@`, for this
+host's rows). Services are `service ls`'s.
 
-With machines (`machines::cli::machine_names` not empty), `ps` asks the
-daemon (started on demand) for `machines.list`, then one full
-`instances.list` per machine at its first root
-(`machines::cli::calls::machines_rows`), each row tagged `machine`. A
-machine that fails, or no daemon, is one `warning:` line on stderr; this
-host's rows still print. `--machine m ps` is one `instances.list` on `m`
-rendered by the same `ps::render`.
+The rows are what the dashboard's tree reads: `ps` connects to the daemon
+(`serve::client::connect`, started on demand), `subscribe`s to
+`instances`, sends `instances.watch {dir, machines: true}` and reads the
+`instances.snapshot` pushes (`ps::watch_once`, over the `ps::Watcher`
+trait) until one is `ps::complete` or `ps::WAIT` (5 s, connecting
+included) passes, then `instances.unwatch`es and prints the last one.
+Complete: this host's `depth` is `full` (or nothing more comes: no
+runtime, or a listing that failed with the runtime down), and every
+`machines` entry is settled (`ps::settled`: it has an `error`, or it's
+`connected` with its `depth` at least `listing`). Each machine with an
+`error` or not settled is one `warning: machine `<name>`: …` line on
+stderr (`ps::machine_warnings`); its rows show as the merge left them
+(last known). A push still at `disk` warns that statuses are unknown.
+
+Under `--in-process` (`serve::client::in_process`), off unix, or when
+the daemon can't be reached or no push came, `ps` collects this host
+itself (no machines), after one `warning:` naming why (none for
+`--in-process` or off unix). `--machine m ps` is one `instances.list` on
+`m` rendered by the same `ps::render`.
 
 ## JSON output
 
@@ -105,7 +121,7 @@ number, a breaking change bumps it. Pretty-printed to stdout.
 
 | verb | `data` |
 |---|---|
-| `ps --json` | `Snapshot`, `instances` cut as the table's (`-a`: all), machines' rows merged |
+| `ps --json` | `Snapshot`, `instances` cut as the table's (`-a`: all), machines' rows merged, plus the push's `machines` when there are any |
 | `ls --json` | `SandboxRow`s (`sandbox_rows`, no runtime call) |
 | `service ls --json` | `ServiceRow`s (`service_rows`) |
 | `run --json` | `RunRecord` |

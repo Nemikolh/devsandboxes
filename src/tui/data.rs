@@ -425,7 +425,7 @@ mod tests {
             runtime_name: "docker".into(),
             runtime_version: runtime_version.map(str::to_string),
             collected_at: Instant::now(),
-            stats: true,
+            depth: crate::snapshot::Depth::Full,
             error: None,
             no_runtime: false,
         }

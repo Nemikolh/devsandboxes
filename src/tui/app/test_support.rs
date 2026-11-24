@@ -93,7 +93,7 @@ pub(super) fn snapshot_with(n: usize) -> Snapshot {
         runtime_name: "docker".into(),
         runtime_version: None,
         collected_at: std::time::Instant::now(),
-        stats: true,
+        depth: crate::snapshot::Depth::Full,
         error: None,
         no_runtime: false,
     }
@@ -198,7 +198,7 @@ pub(super) fn orphan_snapshot() -> Snapshot {
         runtime_name: "docker".into(),
         runtime_version: None,
         collected_at: std::time::Instant::now(),
-        stats: true,
+        depth: crate::snapshot::Depth::Full,
         error: None,
         no_runtime: false,
     }
@@ -324,7 +324,7 @@ pub(super) fn service_snapshot(containers: Vec<(String, ContainerStatus)>) -> Sn
         runtime_name: "docker".into(),
         runtime_version: None,
         collected_at: std::time::Instant::now(),
-        stats: true,
+        depth: crate::snapshot::Depth::Full,
         error: None,
         no_runtime: false,
     }

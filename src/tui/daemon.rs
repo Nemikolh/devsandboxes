@@ -1846,7 +1846,7 @@ mod tests {
         let DaemonUpdate::Snapshot(list, machines) = snapshot_update(wire) else { panic!("not parsed") };
         assert!(machines.is_empty());
         assert_eq!(list.snapshot.sandbox_count, 2);
-        assert!(!list.snapshot.stats);
+        assert_eq!(list.snapshot.depth, crate::snapshot::Depth::Disk, "absent: disk");
         assert_eq!(list.thread_children["d-id"]["k"], "web-k");
         let DaemonUpdate::Status(line) = snapshot_update(json!([1])) else { panic!("parsed") };
         assert!(line.starts_with("bad instances.snapshot"), "{line}");

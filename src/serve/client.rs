@@ -277,6 +277,10 @@ pub fn set_in_process() {
     IN_PROCESS.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+pub fn in_process() -> bool {
+    IN_PROCESS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How long [`attach_hold`] waits for the hello, then for the answer.
 const ATTACH_WAIT: Duration = Duration::from_millis(500);
 

@@ -143,10 +143,22 @@ export interface Snapshot {
   error: string | null;
   /** No container runtime is installed on this host (a driver): nothing was asked of one, `error` says nothing about it. */
   no_runtime: boolean;
+  /**
+   * How far the runtime was asked: `disk` (statuses `unknown`), `listing` (statuses, no cpu/mem), `full`
+   * (cpu/mem too). A watched root's `listing` pass says `full` once the root has had stats: its cpu/mem are
+   * carried over.
+   */
+  depth: SnapshotDepth;
 }
 
 /** How much of the runtime `instances.list` asks: `full` (the default) adds cpu/mem. */
 export type SnapshotDepth = 'disk' | 'listing' | 'full';
+
+/** `ps --json`'s data (`ps()`): the {@link Snapshot}, plus the machines when any is registered. */
+export interface PsSnapshot extends Snapshot {
+  /** As {@link InstancesSnapshot.machines}; absent with none. @experimental */
+  machines?: SnapshotMachine[];
+}
 
 /** `instances.list`: the {@link Snapshot} plus the dispatchers' children. */
 export interface InstancesList extends Snapshot {
@@ -202,6 +214,8 @@ export interface SnapshotMachine {
   version: string | null;
   /** Its runtime (`runtime_name`), once a snapshot came; `null` for a host with none installed (`no_runtime`). */
   runtime: string | null;
+  /** The shallowest {@link Snapshot.depth} of its roots' last snapshots, once every root it listed sent one (`full` for a machine with no roots); `null` before. */
+  depth: SnapshotDepth | null;
   /** The remote devsandbox as shell text; `null` is `devsandbox` on its `PATH` (for an ssh argv). */
   command: string | null;
   /** This host grants its ssh-agent to this member, at its current key (`machines.set {agent}`, `member.toml`'s `[[agent]]`), whatever its kind. */
@@ -406,7 +420,7 @@ export declare function ls(opts?: CommonOptions): Promise<SandboxRow[]>;
  * Sandboxes, instances, and services in one snapshot (`ps --json`): `instances` the running ones
  * (and those being created), every one with `all`; with machines registered, theirs too (`machine` set).
  */
-export declare function ps(opts?: CommonOptions & { all?: boolean }): Promise<Snapshot>;
+export declare function ps(opts?: CommonOptions & { all?: boolean }): Promise<PsSnapshot>;
 /** The runtime's own inspect document (docker/podman: an array of containers). */
 export declare function inspect<T = unknown>(name: string, opts?: CommonOptions): Promise<T>;
 

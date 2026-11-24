@@ -515,7 +515,8 @@ array carries each machine's `name`, `kind` (`ssh` |
 `inbound` | `routed`, fleet plan decisions 29, 60), `target` (`null` for an inbound one), `state`,
 `error`, `behind`, `behind_here` (as `machines.list`'s, [Held links](#held-links-machines); a
 lifted entry's `behind_here` is `null`, the control plane's own word), `version`, `command`,
-`runtime`, `agent` (this host's grant, [Agent](#agent)), `capacity` (its host's
+`runtime`, `depth` (the shallowest of its roots' last pushes, `snapshots::machine_depth`),
+`agent` (this host's grant, [Agent](#agent)), `capacity` (its host's
 [capacity report](fleet.md#capacity), from its last push), `via`,
 `exposed_by` ([exposure](fleet.md#exposure)). A machine's push or state change re-publishes those
 watchers' roots from the last local params. Details:
@@ -725,10 +726,11 @@ API calls and `PTY` and `TUNNEL` streams within its trust, never a
   one full `instances.list` at the machine's default root, else its first
   (`calls::listing`; a snapshot lists every instance the trust admits,
   whatever its `dir`), rendered by `ps::render` without a MACHINE column.
-  A bare `ps` with machines adds every machine's rows the same way
-  (`calls::machines_rows`: `machines.list`, then one `instances.list` per
-  machine at its first root, rows tagged `machine`; a failure is a
-  `warning:` line, [snapshot-and-json](../dashboard/snapshot-and-json.md#ps)).
+  A bare `ps` reads the federated snapshot instead, as the dashboard
+  does: one `instances.watch {machines: true}` push, waited on until
+  every machine is settled or 5 s pass, its machines' rows as `merge`
+  left them and each unsettled or failing machine a `warning:` line
+  ([snapshot-and-json](../dashboard/snapshot-and-json.md#ps)).
 - **An `exec`** is `PTY` streams to the machine from this process
   (`fleet::pty_client::dial`, over `route::connect`; [fleet](fleet.md#pty)), at the
   instance's root there (the match's, else the machine's default); a dial's

@@ -297,44 +297,8 @@ pub(crate) fn follow_build_log(
 pub(crate) fn listing(call: &mut Call, u: &Use, m: &str, root: &Path, out: &mut dyn Write) -> Result<i32> {
     let Use::Ps { all, json } = u else { bail!("not a listing re-run") };
     let snapshot = list(call, m, root, None)?.snapshot;
-    write!(out, "{}", crate::commands::ps::render(snapshot, *all, *json, false)?)?;
+    write!(out, "{}", crate::commands::ps::render(snapshot, &[], *all, *json)?)?;
     Ok(0)
-}
-
-/// Bare `ps`'s rows of every machine `machines.list` names, each tagged
-/// with its `machine`: one `instances.list` per machine at its first root
-/// (as [`listing`]). A machine without roots or whose call fails is one
-/// `warning:` line on `err`, its rows left out.
-pub(crate) fn machines_rows(call: &mut Call, err: &mut dyn Write) -> Result<Vec<InstanceRow>> {
-    let r = call("machines.list", Value::Null)?;
-    if let Some(e) = r.error {
-        bail!("{}", e.message);
-    }
-    let machines: Vec<crate::serve::machines::api::MachineRow> =
-        serde_json::from_value(r.result.unwrap_or(Value::Null)).context("bad machines.list result from devsandbox serve")?;
-    let mut rows = Vec::new();
-    for m in machines {
-        let Some(root) = m.roots.first() else {
-            writeln!(err, "warning: machine `{}` has no config roots listed (devsandbox machine ls)", m.name)?;
-            continue;
-        };
-        match list(call, &m.name, root, None) {
-            Ok(list) => rows.extend(list.snapshot.instances.into_iter().map(|mut r| {
-                r.machine = Some(m.name.clone());
-                r
-            })),
-            Err(e) => {
-                let e = format!("{e:#}");
-                // A trust refusal names the machine already (`answer_error`).
-                if e.starts_with("machine `") {
-                    writeln!(err, "warning: {e}")?;
-                } else {
-                    writeln!(err, "warning: machine `{}`: {e}", m.name)?;
-                }
-            }
-        }
-    }
-    Ok(rows)
 }
 
 /// The config roots a machine root `at` stands for, from a listing of it:
@@ -768,7 +732,7 @@ mod tests {
         };
         for (all, json) in [(false, false), (true, false), (false, true), (true, true)] {
             let (code, out, calls) = run(all, json);
-            let want = crate::commands::ps::render(list_of(answer.clone()).snapshot, all, json, false).unwrap();
+            let want = crate::commands::ps::render(list_of(answer.clone()).snapshot, &[], all, json).unwrap();
             assert_eq!((code, out), (0, want));
             assert_eq!(calls, [("instances.list".into(), json!({"dir": "/f/cfg", "machine": "lap"}))]);
         }
@@ -780,36 +744,6 @@ mod tests {
         let mut f = fake(|_: &str, _: &Value| Err(("denied", denied.into())));
         let r = super::listing(&mut |m, p| f.call(m, p), &Use::Ps { all: false, json: false }, "lap", Path::new("/x"), &mut Vec::new());
         assert_eq!(r.unwrap_err().to_string(), format!("machine `lap`: {denied}"));
-    }
-
-    /// Bare `ps`'s machine rows: each machine's at its first root, tagged;
-    /// one that can't answer, or has no roots, a warning.
-    #[test]
-    fn machines_rows_tag_each_machines_and_warn_for_the_rest() {
-        let machine = |name: &str, roots: &[&str]| {
-            json!({"name": name, "kind": "ssh", "target": name, "roots": roots, "command": null, "agent": false,
-                "state": "connected", "error": null, "version": null})
-        };
-        let machines = json!([machine("lap", &["/l/a", "/l/b"]), machine("box", &["/b"]), machine("new", &[]), machine("cp", &["/c"])]);
-        let mut f = fake(|m: &str, p: &Value| match (m, p["machine"].as_str()) {
-            ("machines.list", _) => Ok(machines.clone()),
-            (_, Some("lap")) => Ok(listing(vec![row("w", "c", "/l/a", false)], vec![], None)),
-            (_, Some("box")) => Err(("unavailable", "machine `box` is down".to_string())),
-            _ => Err(("denied", "`/c` isn't one of this member's roots".to_string())),
-        });
-        let mut err = Vec::new();
-        let rows = machines_rows(&mut |m, p| f.call(m, p), &mut err).unwrap();
-        let got: Vec<(&str, Option<&str>)> = rows.iter().map(|r| (r.name.as_str(), r.machine.as_deref())).collect();
-        assert_eq!(got, [("w", Some("lap"))]);
-        assert_eq!(f.calls[1], ("instances.list".into(), json!({"dir": "/l/a", "machine": "lap"})));
-        assert_eq!(
-            String::from_utf8(err).unwrap(),
-            "warning: machine `box` is down\n\
-             warning: machine `new` has no config roots listed (devsandbox machine ls)\n\
-             warning: machine `cp`: `/c` isn't one of this member's roots\n"
-        );
-        let mut f = fake(|_: &str, _: &Value| Err(("internal", "boom".to_string())));
-        assert_eq!(machines_rows(&mut |m, p| f.call(m, p), &mut Vec::new()).unwrap_err().to_string(), "boom");
     }
 
     /// `service ls` prints the listing's service rows as the local one
