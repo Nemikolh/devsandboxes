@@ -12,8 +12,7 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-- machine add prompts: allowances as a checkbox list, styled notes
-  ([plan](plans/active/machine-add-prompts.md)).
+Nothing.
 
 ## Planned
 

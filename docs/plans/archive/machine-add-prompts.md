@@ -1,3 +1,7 @@
+> Archived 2026-11-24. Historical, may be wrong; do not use as a reference.
+> Current: [architecture/cli-prompts.md](../../architecture/cli-prompts.md),
+> [architecture/daemon/machines.md](../../architecture/daemon/machines.md)
+
 # machine add prompts
 
 `machine add`'s yes/no questions already use the list prompt
