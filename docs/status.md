@@ -12,7 +12,8 @@ limitation means editing this file in the same commit.
 
 ## In progress
 
-Nothing.
+- Terminal prompts: styled, foldable, pick-from-list TTY prompts
+  ([plan](plans/active/terminal-prompts.md)).
 
 ## Planned
 
